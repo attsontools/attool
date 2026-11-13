@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from 'vue';
+import { invoke } from '@tauri-apps/api/core';
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 
 import { createPluginHostSession, type PluginHostSession } from './pluginHost';
+import { buildPluginFrameDocument, pluginAssetBaseUrl } from './pluginFrameDocument';
 import { createPluginProbeConfig } from './pluginProbe';
 import type { PluginOperationSnapshot } from './types';
 
@@ -15,17 +17,10 @@ const emit = defineEmits<{
 }>();
 
 const frame = ref<HTMLIFrameElement | null>(null);
+const frameHtml = ref('');
 let session: PluginHostSession | null = null;
 let timer: ReturnType<typeof setTimeout> | null = null;
 let settled = false;
-
-const source = computed(() => {
-  const entry = (props.operation.entry ?? '')
-    .split('/')
-    .map((segment) => encodeURIComponent(segment))
-    .join('/');
-  return `attool-plugin-probe://${props.operation.operationId}/${entry}`;
-});
 
 const config = computed(() => createPluginProbeConfig(props.operation));
 
@@ -77,16 +72,35 @@ function handleLoad() {
   timer = setTimeout(fail, 8_000);
 }
 
+onMounted(async () => {
+  try {
+    const html = await invoke<string>('plugin_read_probe_entry_html', {
+      operationId: props.operation.operationId
+    });
+    frameHtml.value = buildPluginFrameDocument(
+      html,
+      pluginAssetBaseUrl(
+        'attool-plugin-probe',
+        props.operation.operationId,
+        props.operation.entry ?? ''
+      )
+    );
+  } catch {
+    fail();
+  }
+});
+
 onBeforeUnmount(clear);
 </script>
 
 <template>
   <iframe
+    v-if="frameHtml"
     ref="frame"
     class="probe-frame"
-    :src="source"
+    :srcdoc="frameHtml"
     :title="`${operation.name} 安装检查`"
-    sandbox="allow-scripts allow-same-origin"
+    sandbox="allow-scripts"
     referrerpolicy="no-referrer"
     @load="handleLoad"
     @error="fail"

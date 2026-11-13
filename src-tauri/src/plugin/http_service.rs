@@ -636,6 +636,19 @@ fn required_permission(method: &str) -> Result<&'static str, NativeServiceError>
         | "download.tasks.openFolder"
         | "download.tasks.clearCompleted"
         | "download.tasks.delete" => Ok("host.download.tasks"),
+        "template.templates.list"
+        | "template.templates.load"
+        | "template.templates.save"
+        | "template.templates.rename"
+        | "template.templates.delete"
+        | "template.psd.import"
+        | "template.assets.import"
+        | "template.assets.save"
+        | "template.assets.list"
+        | "template.assets.delete"
+        | "template.batch.sources.register"
+        | "template.batch.run"
+        | "template.batch.save" => Ok("host.template.project"),
         _ => Err(NativeServiceError::new(
             "NATIVE_SERVICE_METHOD_NOT_FOUND",
             "Native service method is not exposed by the host",
@@ -657,6 +670,7 @@ fn data_directory_for(app_data_root: &Path, app_id: &str) -> Result<PathBuf, Nat
     Ok(match app_id {
         "com.attson.http" => app_data_root.join("http"),
         "com.attson.aria2" => app_data_root.join("aria2"),
+        "com.attson.template" => app_data_root.join("ecommerce"),
         _ => app_data_root.join("native-services").join(app_id),
     })
 }
@@ -1287,6 +1301,32 @@ mod tests {
     }
 
     #[test]
+    fn maps_only_declared_template_service_methods_to_permissions() {
+        for method in [
+            "template.templates.list",
+            "template.templates.load",
+            "template.templates.save",
+            "template.templates.rename",
+            "template.templates.delete",
+            "template.psd.import",
+            "template.assets.import",
+            "template.assets.save",
+            "template.assets.list",
+            "template.assets.delete",
+            "template.batch.sources.register",
+            "template.batch.run",
+            "template.batch.save",
+        ] {
+            assert_eq!(
+                required_permission(method).unwrap(),
+                "host.template.project"
+            );
+        }
+        assert!(required_permission("template.process.spawn").is_err());
+        assert!(required_permission("template.batch.unknown").is_err());
+    }
+
+    #[test]
     fn maps_native_service_data_directories_without_moving_http_data() {
         let root = Path::new("/tmp/attool-data");
         assert_eq!(
@@ -1296,6 +1336,10 @@ mod tests {
         assert_eq!(
             data_directory_for(root, "com.attson.aria2").unwrap(),
             root.join("aria2")
+        );
+        assert_eq!(
+            data_directory_for(root, "com.attson.template").unwrap(),
+            root.join("ecommerce")
         );
         assert_eq!(
             data_directory_for(root, "com.example.service").unwrap(),

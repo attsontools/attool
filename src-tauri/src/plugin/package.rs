@@ -358,6 +358,7 @@ fn validate_manifest(
                 | "host.http.stream"
                 | "host.http.data"
                 | "host.download.tasks"
+                | "host.template.project"
         )
     }) {
         return Err(PackageError::new(
@@ -411,12 +412,11 @@ fn validate_manifest(
             ));
         }
     }
-    let requests_native_service = manifest
-        .permissions
-        .iter()
-        .any(|permission| {
-            permission.starts_with("host.http.") || permission == "host.download.tasks"
-        });
+    let requests_native_service = manifest.permissions.iter().any(|permission| {
+        permission.starts_with("host.http.")
+            || permission == "host.download.tasks"
+            || permission == "host.template.project"
+    });
     if (manifest.native_service.is_some() && host_min.major != 2)
         || (requests_native_service && manifest.native_service.is_none())
     {
@@ -769,6 +769,22 @@ mod tests {
         let package = inspect_package(&path, &HostEnvironment::current("2.0.0"), &keys).unwrap();
 
         assert_eq!(package.permissions, ["host.download.tasks"]);
+    }
+
+    #[test]
+    fn accepts_template_permissions_for_a_host_api_two_native_service() {
+        let (_directory, path, signing_key) = native_service_package(
+            "0.1.0-alpha.0",
+            1,
+            None,
+            "2.0.0",
+            serde_json::json!(["host.template.project"]),
+        );
+        let keys = HashMap::from([("attool-p0-test".to_string(), signing_key.verifying_key())]);
+
+        let package = inspect_package(&path, &HostEnvironment::current("2.0.0"), &keys).unwrap();
+
+        assert_eq!(package.permissions, ["host.template.project"]);
     }
 
     #[test]

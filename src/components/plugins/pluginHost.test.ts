@@ -57,6 +57,19 @@ const aria2: InstalledPlugin = {
   }
 };
 
+const template: InstalledPlugin = {
+  ...codec,
+  appId: 'com.attson.template',
+  name: '主图模板',
+  permissions: ['host.template.project'],
+  nativeService: {
+    entry: 'native/attemplate-service',
+    version: '0.1.0-alpha.0',
+    sha256: 'c'.repeat(64),
+    protocolVersion: 1
+  }
+};
+
 function request(id: string, method: string, params: unknown = {}): HostRpcMessage {
   return {
     jsonrpc: '2.0',
@@ -73,6 +86,324 @@ async function flush() {
 }
 
 describe('plugin host session', () => {
+  it('exposes PSD selections as one-use template tokens', async () => {
+    const port = new FakePort();
+    const requestService = vi.fn(async () => ({ id: 'template-1' }));
+    const pickTemplateFiles = vi.fn(async () => [
+      { path: '/home/user/private/source.psd', name: 'source.psd' }
+    ]);
+    createPluginHostSession({
+      app: template,
+      port,
+      theme: () => 'dark',
+      notify: vi.fn(),
+      saveFile: vi.fn(),
+      pickTemplateFiles,
+      requestNativeService: requestService
+    });
+    const templateRequest = (id: string, method: string, params: unknown = {}): HostRpcMessage => ({
+      jsonrpc: '2.0', id, apiVersion: '2.0', appId: template.appId, method, params
+    });
+
+    port.receive(templateRequest('1', 'host.handshake'));
+    await flush();
+    port.receive(templateRequest('2', 'host.template.pickFiles', {
+      kind: 'psd', multiple: false
+    }));
+    await flush();
+
+    expect(pickTemplateFiles).toHaveBeenCalledWith({ kind: 'psd', multiple: false });
+    const selection = (port.sent[1] as {
+      result: { cancelled: false; files: Array<{ token: string; name: string }> }
+    }).result.files[0]!;
+    expect(selection.name).toBe('source.psd');
+    expect(selection.token).not.toContain('/home/user');
+    expect(JSON.stringify(port.sent[1])).not.toContain('/home/user');
+
+    port.receive(templateRequest('3', 'host.template.project', {
+      method: 'template.psd.import', params: { fileToken: selection.token }
+    }));
+    await flush();
+    expect(requestService).toHaveBeenCalledWith('template.psd.import', {
+      sourcePath: '/home/user/private/source.psd'
+    });
+
+    port.receive(templateRequest('4', 'host.template.project', {
+      method: 'template.psd.import', params: { fileToken: selection.token }
+    }));
+    await flush();
+    expect(port.sent.at(-1)).toMatchObject({
+      id: '4', error: { data: { code: 'HOST_TEMPLATE_TOKEN_CONSUMED' } }
+    });
+    expect(requestService).toHaveBeenCalledTimes(1);
+  });
+
+  it('resolves image and directory tokens only for their declared template fields', async () => {
+    const port = new FakePort();
+    const requestService = vi.fn(async () => ({ ok: true }));
+    createPluginHostSession({
+      app: template,
+      port,
+      theme: () => 'dark',
+      notify: vi.fn(),
+      saveFile: vi.fn(),
+      pickTemplateFiles: vi.fn(async () => [
+        { path: '/home/user/a.png', name: 'a.png' },
+        { path: '/home/user/b.jpg', name: 'b.jpg' }
+      ]),
+      pickTemplateDirectory: vi.fn(async () => ({
+        path: '/home/user/Exports', name: 'Exports'
+      })),
+      requestNativeService: requestService
+    });
+    const templateRequest = (id: string, method: string, params: unknown = {}): HostRpcMessage => ({
+      jsonrpc: '2.0', id, apiVersion: '2.0', appId: template.appId, method, params
+    });
+
+    port.receive(templateRequest('1', 'host.handshake'));
+    await flush();
+    port.receive(templateRequest('2', 'host.template.pickFiles', {
+      kind: 'image', multiple: true
+    }));
+    await flush();
+    const files = (port.sent[1] as {
+      result: { files: Array<{ token: string; name: string }> }
+    }).result.files;
+
+    port.receive(templateRequest('3', 'host.template.project', {
+      method: 'template.psd.import', params: { fileToken: files[0]!.token }
+    }));
+    await flush();
+    expect(port.sent.at(-1)).toMatchObject({
+      id: '3', error: { data: { code: 'HOST_TEMPLATE_TOKEN_TYPE_MISMATCH' } }
+    });
+
+    port.receive(templateRequest('4', 'host.template.project', {
+      method: 'template.batch.sources.register',
+      params: { fileTokens: files.map((file) => file.token) }
+    }));
+    await flush();
+    expect(requestService).toHaveBeenLastCalledWith('template.batch.sources.register', {
+      sourcePaths: ['/home/user/a.png', '/home/user/b.jpg']
+    });
+
+    port.receive(templateRequest('5', 'host.template.pickDirectory'));
+    await flush();
+    const directory = (port.sent.at(-1) as {
+      result: { token: string; name: string }
+    }).result;
+    expect(directory).toMatchObject({ name: 'Exports' });
+    expect(JSON.stringify(directory)).not.toContain('/home/user');
+
+    port.receive(templateRequest('6', 'host.template.project', {
+      method: 'template.batch.save',
+      params: { outputIds: ['output-1'], directoryToken: directory.token }
+    }));
+    await flush();
+    expect(requestService).toHaveBeenLastCalledWith('template.batch.save', {
+      outputIds: ['output-1'], targetDirectory: '/home/user/Exports'
+    });
+  });
+
+  it.each([
+    { result: { outputs: [{ id: 'output-1', filePath: '/tmp/private/output.png' }] } },
+    { result: { outputs: [{ id: 'output-1', url: '/tmp/private/output.png' }] } },
+    { result: { outputs: [{ id: 'output-1', url: 'C:\\Users\\private\\output.png' }] } },
+    { result: { outputs: [{ id: 'output-1', url: '\\\\server\\private\\output.png' }] } },
+    { result: { outputs: [{ id: 'output-1', url: 'file:///tmp/private/output.png' }] } }
+  ])('rejects local paths returned by template batch methods: $result', async ({ result }) => {
+    const port = new FakePort();
+    createPluginHostSession({
+      app: template,
+      port,
+      theme: () => 'dark',
+      notify: vi.fn(),
+      saveFile: vi.fn(),
+      requestNativeService: vi.fn(async () => result)
+    });
+    const templateRequest = (id: string, method: string, params: unknown = {}): HostRpcMessage => ({
+      jsonrpc: '2.0', id, apiVersion: '2.0', appId: template.appId, method, params
+    });
+
+    port.receive(templateRequest('1', 'host.handshake'));
+    await flush();
+    port.receive(templateRequest('2', 'host.template.project', {
+      method: 'template.batch.run', params: { templateId: 'template-1', tasks: [] }
+    }));
+    await flush();
+
+    expect(port.sent.at(-1)).toMatchObject({
+      id: '2', error: { data: { code: 'HOST_TEMPLATE_PATH_EXPOSED' } }
+    });
+    expect(JSON.stringify(port.sent.at(-1))).not.toContain('private');
+  });
+
+  it('does not expose Native Service error paths to template plugins', async () => {
+    const port = new FakePort();
+    createPluginHostSession({
+      app: template,
+      port,
+      theme: () => 'dark',
+      notify: vi.fn(),
+      saveFile: vi.fn(),
+      requestNativeService: vi.fn(async () => {
+        throw {
+          code: 'TEMPLATE_PSD_PARSE_FAILED',
+          message: 'Cannot parse /home/user/private/source.psd'
+        };
+      })
+    });
+    const templateRequest = (id: string, method: string, params: unknown = {}): HostRpcMessage => ({
+      jsonrpc: '2.0', id, apiVersion: '2.0', appId: template.appId, method, params
+    });
+
+    port.receive(templateRequest('1', 'host.handshake'));
+    await flush();
+    port.receive(templateRequest('2', 'host.template.project', {
+      method: 'template.templates.list', params: {}
+    }));
+    await flush();
+
+    expect(port.sent.at(-1)).toMatchObject({
+      id: '2',
+      error: {
+        message: 'Template service request failed',
+        data: { code: 'TEMPLATE_PSD_PARSE_FAILED' }
+      }
+    });
+    expect(JSON.stringify(port.sent.at(-1))).not.toContain('/home/user/private');
+  });
+
+  it('does not expose paths disguised as template service error codes', async () => {
+    const port = new FakePort();
+    createPluginHostSession({
+      app: template,
+      port,
+      theme: () => 'dark',
+      notify: vi.fn(),
+      saveFile: vi.fn(),
+      requestNativeService: vi.fn(async () => {
+        throw { code: '/home/user/private.psd', message: 'Import failed' };
+      })
+    });
+    const templateRequest = (id: string, method: string, params: unknown = {}): HostRpcMessage => ({
+      jsonrpc: '2.0', id, apiVersion: '2.0', appId: template.appId, method, params
+    });
+
+    port.receive(templateRequest('1', 'host.handshake'));
+    await flush();
+    port.receive(templateRequest('2', 'host.template.project', {
+      method: 'template.templates.list', params: {}
+    }));
+    await flush();
+
+    expect(port.sent.at(-1)).toMatchObject({
+      id: '2', error: { data: { code: 'NATIVE_SERVICE_REQUEST_FAILED' } }
+    });
+    expect(JSON.stringify(port.sent.at(-1))).not.toContain('/home/user');
+  });
+
+  it('rejects template picker results outside the declared file kind', async () => {
+    const port = new FakePort();
+    createPluginHostSession({
+      app: template,
+      port,
+      theme: () => 'dark',
+      notify: vi.fn(),
+      saveFile: vi.fn(),
+      pickTemplateFiles: vi.fn(async () => [
+        { path: '/home/user/private.txt', name: 'private.txt' }
+      ]),
+      requestNativeService: vi.fn()
+    });
+    const templateRequest = (id: string, method: string, params: unknown = {}): HostRpcMessage => ({
+      jsonrpc: '2.0', id, apiVersion: '2.0', appId: template.appId, method, params
+    });
+
+    port.receive(templateRequest('1', 'host.handshake'));
+    await flush();
+    port.receive(templateRequest('2', 'host.template.pickFiles', {
+      kind: 'image', multiple: false
+    }));
+    await flush();
+
+    expect(port.sent.at(-1)).toMatchObject({
+      id: '2', error: { data: { code: 'HOST_TEMPLATE_FILE_TYPE_INVALID' } }
+    });
+    expect(JSON.stringify(port.sent.at(-1))).not.toContain('/home/user');
+  });
+
+  it('cancels template selections and rejects unscoped or unauthorized requests', async () => {
+    const port = new FakePort();
+    const requestService = vi.fn();
+    createPluginHostSession({
+      app: template,
+      port,
+      theme: () => 'dark',
+      notify: vi.fn(),
+      saveFile: vi.fn(),
+      pickTemplateFiles: vi.fn(async () => null),
+      pickTemplateDirectory: vi.fn(async () => null),
+      requestNativeService: requestService
+    });
+    const templateRequest = (id: string, method: string, params: unknown = {}): HostRpcMessage => ({
+      jsonrpc: '2.0', id, apiVersion: '2.0', appId: template.appId, method, params
+    });
+
+    port.receive(templateRequest('1', 'host.handshake'));
+    await flush();
+    port.receive(templateRequest('2', 'host.template.pickFiles', {
+      kind: 'image', multiple: true
+    }));
+    await flush();
+    expect(port.sent.at(-1)).toMatchObject({
+      id: '2', result: { cancelled: true, files: [] }
+    });
+    port.receive(templateRequest('3', 'host.template.pickDirectory'));
+    await flush();
+    expect(port.sent.at(-1)).toMatchObject({ id: '3', result: { cancelled: true } });
+
+    port.receive(templateRequest('4', 'host.template.project', {
+      method: 'template.assets.import', params: { fileToken: '/etc/passwd' }
+    }));
+    await flush();
+    expect(port.sent.at(-1)).toMatchObject({
+      id: '4', error: { data: { code: 'HOST_TEMPLATE_TOKEN_REQUIRED' } }
+    });
+    port.receive(templateRequest('5', 'host.template.project', {
+      method: 'template.process.spawn', params: {}
+    }));
+    await flush();
+    expect(port.sent.at(-1)).toMatchObject({
+      id: '5', error: { data: { code: 'HOST_TEMPLATE_METHOD_DENIED' } }
+    });
+    expect(requestService).not.toHaveBeenCalled();
+
+    const deniedPort = new FakePort();
+    createPluginHostSession({
+      app: { ...template, permissions: [] },
+      port: deniedPort,
+      theme: () => 'dark',
+      notify: vi.fn(),
+      saveFile: vi.fn(),
+      pickTemplateFiles: vi.fn(async () => null),
+      requestNativeService: requestService
+    });
+    deniedPort.receive({
+      jsonrpc: '2.0', id: '1', apiVersion: '2.0', appId: template.appId,
+      method: 'host.handshake', params: {}
+    });
+    await flush();
+    deniedPort.receive({
+      jsonrpc: '2.0', id: '2', apiVersion: '2.0', appId: template.appId,
+      method: 'host.template.pickFiles', params: { kind: 'psd', multiple: false }
+    });
+    await flush();
+    expect(deniedPort.sent.at(-1)).toMatchObject({
+      id: '2', error: { data: { code: 'HOST_PERMISSION_DENIED' } }
+    });
+  });
+
   it('routes only declared download task methods and pushes task events', async () => {
     const port = new FakePort();
     const requestService = vi.fn(async (_method: string, _params: unknown) => ({ id: 'dl-1' }));

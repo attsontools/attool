@@ -947,6 +947,13 @@ impl PluginStore {
         })
     }
 
+    pub fn read_prepared_entry(
+        &self,
+        prepared: &PreparedPlugin,
+    ) -> Result<PluginAsset, InstallError> {
+        self.read_prepared_asset(prepared, &prepared.package.entry)
+    }
+
     pub fn list(&self) -> Result<Vec<InstalledPlugin>, InstallError> {
         let connection = self.connection()?;
         let mut statement = connection
@@ -1067,6 +1074,16 @@ impl PluginStore {
             bytes,
             content_type: content_type(relative),
         })
+    }
+
+    pub fn read_entry(&self, app_id: &str) -> Result<PluginAsset, InstallError> {
+        let entry = self
+            .find(app_id)?
+            .ok_or_else(|| {
+                InstallError::new("PLUGIN_NOT_FOUND", "Installed plugin was not found")
+            })?
+            .entry;
+        self.read_asset(app_id, &entry)
     }
 
     pub fn set_enabled(&self, app_id: &str, enabled: bool) -> Result<(), InstallError> {
@@ -2422,6 +2439,10 @@ mod tests {
                 .bytes,
             b"<!doctype html><title>Codec</title>"
         );
+        assert_eq!(
+            store.read_prepared_entry(&prepared).unwrap().bytes,
+            b"<!doctype html><title>Codec</title>"
+        );
 
         let installed = store.activate_prepared(prepared).unwrap();
         assert_eq!(installed.app_id, "com.attson.codec");
@@ -2485,6 +2506,10 @@ mod tests {
             .unwrap();
         assert_eq!(asset.bytes, b"<!doctype html><title>Codec</title>");
         assert_eq!(asset.content_type, "text/html; charset=utf-8");
+
+        let entry = store.read_entry("com.attson.codec").unwrap();
+        assert_eq!(entry.bytes, b"<!doctype html><title>Codec</title>");
+        assert_eq!(entry.content_type, "text/html; charset=utf-8");
 
         let undeclared = store
             .read_asset("com.attson.codec", "ui/other.js")

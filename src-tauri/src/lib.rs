@@ -1554,6 +1554,8 @@ pub fn run() {
             plugin::commands::plugin_inspect_package,
             plugin::commands::plugin_install_package,
             plugin::commands::plugin_list_installed,
+            plugin::commands::plugin_read_entry_html,
+            plugin::commands::plugin_read_probe_entry_html,
             plugin::commands::plugin_list_history,
             plugin::commands::plugin_set_enabled,
             plugin::commands::plugin_uninstall,

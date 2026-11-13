@@ -152,6 +152,17 @@ impl PluginRuntime {
             .map_err(Into::into)
     }
 
+    fn read_entry_html(&self, app_id: &str) -> Result<String, PluginCommandError> {
+        let asset = self
+            .store
+            .lock()
+            .map_err(|_| {
+                PluginCommandError::new("PLUGIN_STORE_LOCK_FAILED", "Plugin store lock failed")
+            })?
+            .read_entry(app_id)?;
+        entry_html(asset)
+    }
+
     pub(super) fn read_probe_asset(
         &self,
         operation_id: &str,
@@ -176,6 +187,29 @@ impl PluginRuntime {
             })?
             .read_prepared_asset(&operation.prepared, relative)
             .map_err(Into::into)
+    }
+
+    fn read_probe_entry_html(&self, operation_id: &str) -> Result<String, PluginCommandError> {
+        let pending = self.pending.lock().map_err(|_| {
+            PluginCommandError::new(
+                "PLUGIN_OPERATION_LOCK_FAILED",
+                "Plugin operation lock failed",
+            )
+        })?;
+        let operation = pending.get(operation_id).ok_or_else(|| {
+            PluginCommandError::new(
+                "PLUGIN_OPERATION_NOT_FOUND",
+                "Plugin operation was not found",
+            )
+        })?;
+        let asset = self
+            .store
+            .lock()
+            .map_err(|_| {
+                PluginCommandError::new("PLUGIN_STORE_LOCK_FAILED", "Plugin store lock failed")
+            })?
+            .read_prepared_entry(&operation.prepared)?;
+        entry_html(asset)
     }
 
     async fn start_catalog_install(
@@ -855,6 +889,21 @@ fn join_error(error: tauri::Error) -> PluginCommandError {
     )
 }
 
+fn entry_html(asset: PluginAsset) -> Result<String, PluginCommandError> {
+    if asset.content_type != "text/html; charset=utf-8" {
+        return Err(PluginCommandError::new(
+            "PLUGIN_ENTRY_NOT_HTML",
+            "Plugin UI entry must be an HTML document",
+        ));
+    }
+    String::from_utf8(asset.bytes).map_err(|_| {
+        PluginCommandError::new(
+            "PLUGIN_ENTRY_ENCODING_INVALID",
+            "Plugin UI entry must be valid UTF-8",
+        )
+    })
+}
+
 #[tauri::command]
 pub async fn plugin_inspect_package(
     path: String,
@@ -883,6 +932,28 @@ pub async fn plugin_list_installed(
 ) -> Result<Vec<InstalledPlugin>, PluginCommandError> {
     let runtime = runtime.inner().clone();
     tauri::async_runtime::spawn_blocking(move || runtime.list())
+        .await
+        .map_err(join_error)?
+}
+
+#[tauri::command]
+pub async fn plugin_read_entry_html(
+    app_id: String,
+    runtime: State<'_, PluginRuntime>,
+) -> Result<String, PluginCommandError> {
+    let runtime = runtime.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || runtime.read_entry_html(&app_id))
+        .await
+        .map_err(join_error)?
+}
+
+#[tauri::command]
+pub async fn plugin_read_probe_entry_html(
+    operation_id: String,
+    runtime: State<'_, PluginRuntime>,
+) -> Result<String, PluginCommandError> {
+    let runtime = runtime.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || runtime.read_probe_entry_html(&operation_id))
         .await
         .map_err(join_error)?
 }

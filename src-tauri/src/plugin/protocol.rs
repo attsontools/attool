@@ -3,7 +3,7 @@ use tauri::http::{header, Method, Request, Response, StatusCode};
 
 use super::commands::{PluginCommandError, PluginRuntime};
 
-const PLUGIN_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; media-src 'self'; connect-src 'none'; object-src 'none'; frame-ancestors tauri://localhost http://tauri.localhost https://tauri.localhost http://127.0.0.1:1420; base-uri 'none'; form-action 'none'";
+const PLUGIN_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; media-src 'self'; connect-src 'none'; object-src 'none'; frame-ancestors tauri://localhost http://tauri.localhost https://tauri.localhost http://127.0.0.1:1420; base-uri 'none'; form-action 'none'; sandbox";
 
 #[derive(Debug, PartialEq, Eq)]
 struct PluginUri {
@@ -38,6 +38,7 @@ pub fn handle_plugin_request(
                 .header(header::CONTENT_SECURITY_POLICY, PLUGIN_CSP)
                 .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
                 .header(header::CACHE_CONTROL, "no-store")
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                 .body(body)
                 .expect("valid plugin asset response")
         }
@@ -91,6 +92,7 @@ pub fn handle_probe_request(
                 .header(header::CONTENT_SECURITY_POLICY, PLUGIN_CSP)
                 .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
                 .header(header::CACHE_CONTROL, "no-store")
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                 .body(body)
                 .expect("valid plugin probe response")
         }
@@ -182,7 +184,12 @@ fn error_response(status: StatusCode, code: &str) -> Response<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_plugin_uri;
+    use super::{parse_plugin_uri, PLUGIN_CSP};
+
+    #[test]
+    fn direct_plugin_protocol_documents_are_inert() {
+        assert!(PLUGIN_CSP.split("; ").any(|directive| directive == "sandbox"));
+    }
 
     #[test]
     fn parses_per_application_origins_and_rejects_traversal() {

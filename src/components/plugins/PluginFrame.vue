@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { writeText } from '@tauri-apps/plugin-clipboard-manager';
@@ -7,7 +7,13 @@ import { open, save } from '@tauri-apps/plugin-dialog';
 import { NButton, NSpin, useMessage } from 'naive-ui';
 
 import type { ThemeName } from '../../composables/useTheme';
-import { createPluginHostSession, type HostFileSaveRequest, type PluginHostSession } from './pluginHost';
+import {
+  createPluginHostSession,
+  type HostFileSaveRequest,
+  type HostTemplateFilePickRequest,
+  type PluginHostSession
+} from './pluginHost';
+import { buildPluginFrameDocument, pluginAssetBaseUrl } from './pluginFrameDocument';
 import type { InstalledPlugin } from './types';
 
 const props = defineProps<{
@@ -26,20 +32,13 @@ const frame = ref<HTMLIFrameElement | null>(null);
 const state = ref<FrameState>('loading');
 const errorMessage = ref('');
 const reloadRevision = ref(0);
-const serviceReady = ref(!props.app.nativeService);
+const serviceReady = ref(false);
+const frameHtml = ref('');
 let session: PluginHostSession | null = null;
 let handshakeTimer: ReturnType<typeof setTimeout> | null = null;
 let handlingFailure = false;
 let nativeServiceEventUnlisten: UnlistenFn | null = null;
 let disposed = false;
-
-const source = computed(() => {
-  const entry = props.app.entry
-    .split('/')
-    .map((segment) => encodeURIComponent(segment))
-    .join('/');
-  return `attool-plugin://${props.app.appId}/${entry}?revision=${reloadRevision.value}`;
-});
 
 function clearSession() {
   session?.terminate();
@@ -67,15 +66,33 @@ async function pickPluginDirectory(defaultPath?: string) {
   return typeof path === 'string' ? path : null;
 }
 
+async function pickTemplateFiles(input: HostTemplateFilePickRequest) {
+  const selected = await open({
+    multiple: input.multiple,
+    filters: input.kind === 'psd'
+      ? [{ name: 'PSD', extensions: ['psd'] }]
+      : [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp'] }]
+  });
+  const paths = typeof selected === 'string' ? [selected] : selected;
+  if (!paths?.length) return null;
+  return paths.map((path) => ({ path, name: pathName(path) }));
+}
+
+async function pickTemplateDirectory() {
+  const path = await open({ directory: true, multiple: false });
+  return typeof path === 'string' ? { path, name: pathName(path) } : null;
+}
+
+function pathName(path: string) {
+  return path.split(/[\\/]/).filter(Boolean).pop() || 'file';
+}
+
 async function prepareFrame() {
-  if (!props.app.nativeService) {
-    serviceReady.value = true;
-    return;
-  }
-  state.value = 'connecting';
+  serviceReady.value = false;
+  state.value = props.app.nativeService ? 'connecting' : 'loading';
   errorMessage.value = '';
   try {
-    if (!nativeServiceEventUnlisten) {
+    if (props.app.nativeService && !nativeServiceEventUnlisten) {
       const unlisten = await listen<{ appId: string; event: unknown }>(
         'plugin://native-service-event',
         ({ payload }) => {
@@ -88,8 +105,15 @@ async function prepareFrame() {
       }
       nativeServiceEventUnlisten = unlisten;
     }
-    await invoke('plugin_connect_native_service', { appId: props.app.appId });
+    if (props.app.nativeService) {
+      await invoke('plugin_connect_native_service', { appId: props.app.appId });
+    }
+    const html = await invoke<string>('plugin_read_entry_html', { appId: props.app.appId });
     if (disposed) return;
+    frameHtml.value = `${buildPluginFrameDocument(
+      html,
+      pluginAssetBaseUrl('attool-plugin', props.app.appId, props.app.entry)
+    )}\n<!-- reload:${reloadRevision.value} -->`;
     state.value = 'loading';
     serviceReady.value = true;
   } catch (reason) {
@@ -118,6 +142,8 @@ function handleLoad() {
     saveFile: savePluginFile,
     pickFile: pickPluginFile,
     pickDirectory: pickPluginDirectory,
+    pickTemplateFiles,
+    pickTemplateDirectory,
     copyText: writeText,
     requestNativeService: props.app.nativeService
       ? (method, params) => invoke('plugin_native_service_request', {
@@ -190,7 +216,8 @@ function reload() {
   state.value = 'loading';
   errorMessage.value = '';
   handlingFailure = false;
-  serviceReady.value = !props.app.nativeService;
+  serviceReady.value = false;
+  frameHtml.value = '';
   reloadRevision.value += 1;
   void prepareFrame();
 }
@@ -232,9 +259,9 @@ onBeforeUnmount(() => {
     <iframe
       v-if="serviceReady"
       ref="frame"
-      :src="source"
+      :srcdoc="frameHtml"
       :title="app.name"
-      sandbox="allow-scripts allow-same-origin"
+      sandbox="allow-scripts"
       referrerpolicy="no-referrer"
       @load="handleLoad"
       @error="handleLaunchFailure('应用资源加载失败')"
