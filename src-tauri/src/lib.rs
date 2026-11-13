@@ -10,7 +10,6 @@ mod embedded_runtime;
 mod gpu_linux;
 pub mod ai;
 pub mod ecommerce;
-pub mod http;
 pub mod imaging;
 pub mod network;
 mod recording;
@@ -1249,21 +1248,6 @@ pub fn run() {
             app.manage(shortcut_errors);
             app.manage(clipboard_store);
 
-            let http_dir = app
-                .path()
-                .app_data_dir()
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?
-                .join("http");
-            let http_store = http::storage::HttpStore::new(http_dir)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            if let Err(error) = http_store.cleanup_history(now_ms) {
-                eprintln!("清理 http 历史失败：{error}");
-            }
-            app.manage(http_store);
-            app.manage(http::cancel::HttpCancelState::new());
-            app.manage(std::sync::Arc::new(http::stream::session::HttpStreamState::new()));
-
             let ai_dir = app
                 .path()
                 .app_data_dir()
@@ -1376,37 +1360,6 @@ pub fn run() {
             recording::resume_native_recording,
             recording::stop_native_recording,
             recording::cancel_native_recording,
-            http::commands::send_http,
-            http::commands::cancel_http,
-            http::commands::list_http_tabs,
-            http::commands::upsert_http_tab,
-            http::commands::delete_http_tab,
-            http::commands::set_active_http_tab,
-            http::commands::list_http_history,
-            http::commands::insert_http_history,
-            http::commands::delete_http_history,
-            http::commands::clear_http_history,
-            http::commands::list_http_envs,
-            http::commands::upsert_http_env,
-            http::commands::delete_http_env,
-            http::commands::set_active_http_env,
-            http::commands::list_http_env_vars,
-            http::commands::upsert_http_env_var,
-            http::commands::delete_http_env_var,
-            http::commands::list_http_collections,
-            http::commands::list_http_collection_folders,
-            http::commands::list_http_collection_requests,
-            http::commands::upsert_http_collection,
-            http::commands::upsert_http_collection_folder,
-            http::commands::upsert_http_collection_request,
-            http::commands::delete_http_collection,
-            http::commands::delete_http_collection_request,
-            http::commands::delete_http_collection_folder,
-            http::openapi_fetch::fetch_openapi_url,
-            http::stream::commands::open_stream,
-            http::stream::commands::close_stream,
-            http::stream::commands::send_ws_message,
-            http::stream::commands::list_stream_messages,
             ai::commands::ai_list_providers,
             ai::commands::ai_upsert_provider,
             ai::commands::ai_delete_provider,

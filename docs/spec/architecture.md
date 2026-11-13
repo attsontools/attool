@@ -10,12 +10,13 @@
 │  │                   Dashboard / SettingsModal /           │
 │  │                   UpdateBanner / ...                    │
 │  ├─ ui/*             Panel / TaskRow / StatPill / Kbd     │
-│  ├─ <7 工具>/*       clipboard / image / network / http / │
+│  ├─ <6 工具>/*       clipboard / image / network /        │
 │  │                   douyin / ecommerce / ai              │
 │  │                   （懒加载）                             │
 │  ├─ composables/*    useTheme / useSidebarState /         │
 │  │                   useUpdater / useClipboardHistory /    │
-│  │                   useHttpStore（HTTP 单例）...          │
+│  │                   usePluginStore...                     │
+│  ├─ plugins/*        应用管理 / PluginFrame / Host API     │
 │  ├─ theme/index.ts   Naive UI overrides（dark + light）    │
 │  ├─ styles/*.css     tokens + reset + template-editor     │
 │  ├─ types/*          Tool / DownloadTask / Clipboard...   │
@@ -32,14 +33,10 @@
 │  ├─ recording.rs    录屏分块缓存 / 保存 / 清理             │
 │  ├─ ecommerce/       模板 render / storage / psd_bridge   │
 │  ├─ network/         ping / port / dns                    │
-│  ├─ http/            HTTP：send + storage(4 表 + kind 列)  │
-│  │  └─ stream/       SSE / WebSocket 长连接（v0.8.9+）：    │
-│  │                   session + parser + buffer + sse + ws   │
-│  │                   + commands                             │
 │  ├─ updater/         自研更新：check / verify / download / │
 │  │                   apply/{mac,win,linux} + embed scripts │
 │  ├─ plugin/          .atpkg 验签 / 安装 registry /         │
-│  │                   自定义协议 / 应用管理命令              │
+│  │                   自定义协议 / Host API / service 代理   │
 │  └─ *.rs             douyin·bili·xhs·yt                   │
 │                                                          │
 │           ↕ Command::new / xcap / reqwest                │
@@ -59,7 +56,7 @@
 
 - **请求-响应：** `invoke<T>('command_name', { arg })` （`@tauri-apps/api/core`）
 - **流式事件：** Rust `app_handle.emit("event-name", payload)` → 前端 `listen<T>('event-name', cb)`
-  - `download-progress`（aria2 输出解析后推送）、`clipboard-history-updated`（剪贴板监听）、`capture-overlay-init` / `capture-failed`（统一捕获浮层）、`capture-overlay-recording-toggle`（录屏快捷键切换 / 停止）、`recording://completed` / `recording://native-error`（录屏结果与原生错误）、`updater://state`（自研 updater 状态机推送）、`http-stream-message-{sessionId}`（HTTP 工具 SSE / WS 长连接的消息 envelope，一 session 一 channel）等
+  - `download-progress`（aria2 输出解析后推送）、`clipboard-history-updated`（剪贴板监听）、`capture-overlay-init` / `capture-failed`（统一捕获浮层）、`capture-overlay-recording-toggle`（录屏快捷键切换 / 停止）、`recording://completed` / `recording://native-error`（录屏结果与原生错误）、`updater://state`（自研 updater 状态机推送）、`plugin://http-service-event`（Native Service 事件统一转发）等
 - **错误：** Rust 命令返回 `Result<T, String>`，前端 `try { await invoke(...) } catch (e)` 捕获
 
 ## 状态分层
@@ -68,22 +65,15 @@
 |---|---|---|
 | UI session | Vue ref | 当前选中工具、表单值、loading flags（应用退出即清） |
 | 浏览器持久 | `localStorage` | sidebar 折叠状态、上次打开工具、主题、属性面板折叠 |
-| 应用持久 | rusqlite（Tauri data dir） | 下载任务历史、剪贴板历史、模板项目 / 素材库、**HTTP 工具的 tabs / history / envs / env_vars / collections**、插件 registry 与管理历史 |
+| 应用持久 | rusqlite（Tauri data dir） | 下载任务历史、剪贴板历史、模板项目 / 素材库、插件 registry 与管理历史 |
 | updater 缓存 | 文件（`app_cache_dir/updater/`） | 已下载但未 apply 的 archive stage |
-| 临时 | Tauri runtime State | 进行中的下载子进程句柄（`DownloadTasks`）、录屏分块文件 / Wayland 原生录制 session（`RecordingStore`）、HTTP cancel token 表、Updater 状态机 `UpdaterState`、**HTTP 工具的 SSE / WS 长连接 session 表**（`HttpStreamState`：`HashMap<sessionId, SessionHandle>`，每个 session 持有 cancel oneshot、send mpsc（仅 WS）、消息 buffer `Arc<Mutex<SessionBuffer>>`；带 generation 计数器防重连 race） |
+| 临时 | Tauri runtime State | 进行中的下载子进程句柄（`DownloadTasks`）、录屏分块文件 / Wayland 原生录制 session（`RecordingStore`）、Updater 状态机 `UpdaterState`、插件 registry/runtime 与 HTTP service supervisor |
 
-HTTP 工具的持久层存在独立 `http.sqlite3`：
-- `http_tabs` —— 每 tab 一行，spec 序列化 JSON 存 `spec_json`；`is_active` 单例约束；**v0.8.9 起加了 `kind TEXT NOT NULL DEFAULT 'http'` 列**区分 http / sse / ws（老库启动时用 `PRAGMA table_info` 探测 → `ALTER TABLE ADD COLUMN` 迁移）
-- `http_history` —— 每次发送插一条，500 条上限 + 30 天 TTL，响应体只存前 4KB 到 `resp_summary`（仅 http kind 使用；SSE / WS 消息**不入库**）
-- `http_envs` —— 环境集合，`is_active` 单例
-- `http_env_vars` —— 变量条目，`env_id=''` 表示全局作用域
-- `http_collections` / `http_collection_folders` / `http_collection_requests` —— 请求集合树；request 节点保存完整 `HttpRequestSpec` JSON，OpenAPI 导入直接写入这三张表
-
-SSE / WS 的长连接会话不持久化：session 与消息 buffer 都只在后端 `HttpStreamState` 内存里。关闭 App 或 tab 即清；关闭 tab 前，前端 `useHttpStore.closeTab` 会先调 `close_stream` 让后端优雅关掉 task。
+HTTP 数据仍位于 `${app_data_dir}/http/http.sqlite3`，但不属于宿主 rusqlite 状态。`com.attson.http` 的 Native/Data Service 独占数据库、迁移、历史清理、请求取消和 SSE/WS session；平台只把同一数据目录交给已验签 service。停用或卸载插件默认保留该目录，平台启动不打开、改写或删除数据库。
 
 ## 可插拔应用
 
-平台支持从本地包或官方 Catalog 安装签名 `.atpkg`。应用可以由独立仓库发布独立桌面安装包，也可以用同一版本和 `appId` 发布平台插件包；`atcodec`、`attext`、`atgenerator`、`attime` 与 `atjson` 已验证纯前端应用的双制品、生产 Catalog 远程发现和生命周期闭环。`athttp` 已验证携带原生 service 的本地测试包以及独立版/插件版共享数据，正式 Publisher、Catalog 与生产 Release 留在后续阶段。
+平台支持从本地包或官方 Catalog 安装签名 `.atpkg`。应用可以由独立仓库发布独立桌面安装包，也可以用同一版本和 `appId` 发布平台插件包；`atcodec`、`attext`、`atgenerator`、`attime`、`atjson` 与带原生 service 的 `athttp` 均已完成生产 Catalog 远程发现和生命周期闭环。
 
 ### 包与安装状态
 
@@ -105,14 +95,14 @@ SSE / WS 的长连接会话不持久化：session 与消息 buffer 都只在后�
 - 平台 supervisor 从已安装且签名校验通过的插件版本启动或复用 service；并发启动者通过 `service.lock` 和 endpoint 竞争收敛到同一实例，过期租约只在确认进程已失效后清理。Host 保留自己启动的子进程句柄，插件版本切换时只终止该 owned service 再启动新版本；独立版或其他外部进程不被越权终止，版本不匹配时明确失败。service 事件只发往 `main` 窗口。
 - service 对新客户端独占 `${app_data_dir}/http/http.sqlite3`，首次接管任何已有非空数据库时创建 `http.sqlite3.pre-service-v1.bak`，再执行 schema 迁移和完整性检查。迁移失败返回稳定错误，不回退到宿主内置 HTTP。
 - 同一客户端连接允许请求并发分派，因此 `http.cancel` 可以中断仍在执行的 `http.send`；响应写入仍串行化，SSE/WS 保持 2000 条、5 MiB buffer 和 generation 语义。`stream.open` response 前到达的事件由客户端按 generation 暂存并在响应后交付，不能因 RPC/event 时序丢失首帧。
-- P1 过渡期仍保留宿主内置 HTTP，其旧 `HttpStore` 会在平台启动时打开同一数据库。独立版与插件版共享数据已按单一 service owner 验证，但内置入口与 service 并发写不属于受支持路径；P3 删除内置入口、旧命令和该额外数据库连接。
+- 宿主不包含 HTTP UI、Store、网络命令或数据库连接。停用/卸载插件不会恢复隐藏的内置实现；历史 `lastTool=http` 只映射到已启用的动态应用入口。
 
 ### 前端装配与应用外置
 
 - `usePluginStore` 从 Tauri registry 加载插件并生成动态 `Tool`；“应用管理”固定在侧栏平台分组，负责本地包预览、权限确认、安装、启停、卸载、筛选和历史查看。
-- 平台不再内置 `codec`、`text`、`generator`、`time` 与 `json`；对应插件分别是编码转换、文本工具、生成器、时间工具与 JSON 工具在平台中的唯一入口。停用或卸载插件后，平台不提供回退版内置工具。
+- 平台不再内置 `codec`、`text`、`generator`、`time`、`json` 与 `http`；对应插件是这些工具在平台中的唯一入口。停用或卸载插件后，平台不提供回退版内置工具。
 - `@attson/plugin-sdk` 定义 manifest、签名 canonical JSON、浏览器 Host bridge 和稳定错误；`atcodec`、`attext`、`atgenerator`、`attime` 与 `atjson` 通过 Vite host alias 在 Standalone Adapter 与 Plugin Adapter 间切换，各自共享独立版和插件版的 Vue UI 与核心逻辑。
-- `athttp` 同样通过 Vite adapter 复用 UI：独立版直接连接本地 service，插件版经 Host API 2.x 转发到相同 service。本地 `.atpkg` 已验证安装、启动、数据共享和签名/hash 契约；生产 Catalog 生命周期属于后续阶段。
+- `athttp` 同样通过 Vite adapter 复用 UI：独立版直接连接本地 service，插件版经 Host API 2.x 转发到相同 service。生产 `0.1.0-alpha.2` 已通过五目标 Release、Catalog 安装/升级/回滚和真实 Tauri 验收。
 
 ### 官方 Catalog、升级与回滚
 
@@ -208,7 +198,7 @@ export function useTheme(
 
 测试时传入 fake storage / fake root，断言行为与持久化结果。
 
-**HTTP 工具的 `useHttpStore` 是单例 composable**（模块级 `reactive`），全局共享 tabs / history / envs / active 环境 / collections；`_resetHttpStoreForTest(api)` 提供注入点便于单测。
+`usePluginStore` 负责加载已安装应用、合并 Catalog、生成动态导航和驱动安装/升级/停启/卸载；独立应用自己的业务状态不进入宿主 composable。
 
 ### `src/components/ecommerce/TemplateTool.vue`
 
@@ -222,21 +212,12 @@ export function useTheme(
 
 状态全部在 `TemplateTool.vue` 顶层 `project: ref<TemplateProject>`，下传不下推 —— 子组件只 emit 修改意图，由 `TemplateTool` 调用 `src/utils/ecommerceTemplate.ts` 中的纯函数返回新 project。
 
-### `src/components/http/HttpTool.vue`
+### `src/components/plugins/`
 
-HTTP 工具主容器（三栏）。组合子组件 + 纯函数模块，**按 `activeTab.kind` 分支渲染** http / sse / ws 三种编辑器：
-
-- `HttpSidebar` —— 左侧集合 / 历史切换；集合树支持 OpenAPI JSON 导入、请求回填 / 新 tab 打开、删除集合或请求；历史列表支持搜索 + 右键菜单（仅 http kind 写历史；sse / ws 不写历史）
-- `HttpTabBar` —— 中上多 tab 条，方法字段按 kind 分色显示（HTTP 方法名默认色 / `SSE` 紫 / `WS` 青）；`+` 按钮为 NDropdown，可新建 HTTP / SSE / WS
-- `HttpRequestEditor` + `HttpResponseView` —— http kind 的编辑器 + 响应视图（Params / Auth / Headers / Body / Settings 子 tabs；响应视图分 Body Pretty/Raw/Preview + Headers + Cookies）
-- `SseTool` —— sse kind：`SseRequestEditor`（URL + Params + Headers + Auth + Settings 含 lastEventId）+ 连接控制条 + `StreamMessageList`
-- `WsTool` —— ws kind：`WsRequestEditor`（URL + Params + Headers + Auth + Protocol 含 subprotocols）+ 连接控制条 + `StreamMessageList` + 发送框 + 发送模板选择
-- `StreamMessageList` —— sse / ws 共享的消息流视图：按 `messageTone` 分色（Open / Closed / Error / BufferTruncated / WsBinary / SseEvent · WsText），自动滚动到底部
-- `HttpEnvModal` —— 环境 + 变量 CRUD 弹窗（共用），变量名输入提供 `baseUrl` / `token` / `apiKey` 建议并保留自由输入
-- `HttpOpenApiImportModal` + `openapiImport.ts` + OpenAPI Worker —— 使用通用 Monaco 读取和格式化 OAS 3.x JSON，按 path 首段生成集合目录，支持 base URL 覆盖为真实 URL 或 `{{baseUrl}}`
-- `curl.ts` / `variables.ts` / `httpApi.ts` / `streamApi.ts` / `streamMessageTone.ts` / `types.ts` —— 纯函数与类型；`variables.ts` 统一展开变量并在执行副本中用有效 `baseUrl` 补全 HTTP / SSE / WS 相对 URL，WS 基址同步转换协议；vitest 覆盖 OpenAPI 导入、集合 store、URL 解析、SSE / WS store 与 tone 分色
-
-状态全部走 `useHttpStore` 单例；子组件通过 props 拿 spec（union：`HttpRequestSpec | SseSpec | WsSpec`），通过 emit 触发修改；`useHttpStore` 用 300ms debounce 把 tabs 写回 SQLite（关闭 / 发送 / 拖拽即时 flush）。HTTP `send` 与 SSE / WS `openStream` 都在调后端前生成已展开、已补全 URL 的执行副本；解析失败会复位发送 / 连接状态且不调用底层 API。`sendWsMessage` 走 `resolveVars`，原始 tab spec 始终保留用户输入。
+- `ApplicationManager.vue` 展示内置工具、Catalog 应用、已安装应用和操作记录，并驱动远程安装、升级、停启与卸载。
+- `PluginFrame.vue` 建立隔离 iframe 与 Host API session；带 `nativeService` 的应用先连接 supervisor，再通过 `plugin_http_service_request` 转发请求和 `plugin://http-service-event` 接收事件。
+- `pluginHost.ts` 校验 JSON-RPC、权限、超时和消息大小；`pluginProbe.ts` 根据 manifest 选择 Host API 1.x 或 2.x。
+- HTTP 编辑器 UI 与业务逻辑位于 `attsontools/athttp`，宿主不复制其组件或 Store。
 
 ### 后端模块概览
 
@@ -250,10 +231,8 @@ HTTP 工具主容器（三栏）。组合子组件 + 纯函数模块，**按 `ac
 | `recording.rs` / `recording_preview.rs` | 录屏快捷键、Web 分块缓存、Wayland 来源准备 / 区域裁剪 / 编码控制、完成结果交接、只读 Range 预览、保存与清理 | `get·set_recording_shortcut` / `prepare·start·pause·resume·stop·cancel_native_recording` / `begin·append·finish_recording_file` / `present_recording_result` / `recording_preview_url` / `save·discard_recording_file` / `default_recording_path` |
 | `ecommerce/` | 主图模板：PSD 导入 / 图层渲染 / 批量替换 | `import_psd_template` / `save·load·list·delete_ecommerce_template` / `run_batch_replace_tasks` |
 | `network/` | 网络诊断 | `ping_host` / `check_ports` / `resolve_dns` |
-| `http/` | HTTP 工具后端：请求发送（含 multipart + cancel）+ tabs/history/envs/env_vars/collections CRUD（tabs 有 `kind` 列） | `send_http` / `cancel_http` / `list·upsert·delete·set_active_http_{tab,env}` / `list·insert·delete·clear_http_history` / `list·upsert·delete_http_env_var` / `list·upsert·delete_http_collection*` |
-| `http/stream/` | SSE / WebSocket 长连接会话（v0.8.9+）：`HttpStreamState` 管理 sessions、消息 buffer、cancel 与发送通道；SSE 用 reqwest bytes_stream + 自写 UTF-8 安全帧解析；WS 用 tokio-tungstenite | `open_stream` / `close_stream` / `send_ws_message` / `list_stream_messages` |
 | `updater/` | 自研更新：check / verify / download / apply | `updater_get_state` / `updater_check` / `updater_download` / `updater_apply` / `updater_cancel` |
-| `plugin/` | 签名包校验、staging/registry 状态机、自定义资源协议 | `plugin_inspect_package` / `plugin_install_package` / `plugin_list_installed` / `plugin_list_history` / `plugin_set_enabled` / `plugin_uninstall` |
+| `plugin/` | 签名包校验、staging/registry、Catalog、隔离资源协议、Host API 与 HTTP Native Service supervisor | `plugin_inspect_package` / `plugin_install_package` / `plugin_list_installed` / `plugin_set_enabled` / `plugin_uninstall` / `plugin_connect_http_service` / `plugin_http_service_request` |
 | `douyin.rs` / `bilibili.rs` / `xhs.rs` / `youtube.rs` | 视频链接解析；YouTube 通过共享 Python sidecar 调用内置 yt-dlp / EJS / QuickJS | `extract_douyin_video` / `extract_bilibili_video` / `extract_youtube_video` / `resolve_douyin_url` |
 
 ### 内置运行时
@@ -281,26 +260,12 @@ HTTP 工具主容器（三栏）。组合子组件 + 纯函数模块，**按 `ac
 - `render.rs` —— 把 `TemplateProject` 渲染成 PNG（用于批量导出）
 - `storage.rs` —— rusqlite 表创建 / CRUD
 
-### `src-tauri/src/http/`
+### `src-tauri/src/plugin/http_service.rs`
 
-- `mod.rs` —— 模块声明
-- `models.rs` —— `HttpRequestSpec` / `HttpResponseInfo` / `KeyValue` / `MultipartField` / `HttpAuth` / 4 张表的 Row 结构（`HttpTabRow` 带 `kind: String`）+ `Direction` / `StreamMessage`（7 variants：Open / SseEvent / WsText / WsBinary / Closed / Error / BufferTruncated）/ `SseSpec` / `WsSpec` / `WsTemplate`
-- `send.rs` —— reqwest 组装（含 auth inject、multipart 组装、cancel token 集成）
-- `cancel.rs` —— `HttpCancelState`：`Mutex<HashMap<String, oneshot::Sender<()>>>`
-- `storage.rs` —— tabs/history/envs/env_vars/collections 表的 init + CRUD + history TTL 清理（启动时跑一次）；启动时 `PRAGMA table_info` 探测 → 老库自动 `ALTER TABLE http_tabs ADD COLUMN kind`
-- `commands.rs` —— 一次请求 / 历史 / 环境 / 变量的全部 tauri 命令
-
-### `src-tauri/src/http/stream/`（v0.8.9+）
-
-SSE / WebSocket 长连接。所有 session 共享 `HttpStreamState`（通过 `.manage(Arc::new(HttpStreamState::new()))` 注册为 Tauri State）。
-
-- `mod.rs` —— 模块声明
-- `parser.rs` —— 纯函数 SSE 帧解析器（`SseParser::feed(&[u8]) -> Vec<SseFrame>`）；支持 LF / CRLF 边界、chunk 中间断裂、多行 `data:` 用 `\n` 拼接、单空格 trim、`:` 注释；`data` 长度上限 `MAX_DATA_BYTES = 1 MB`，超限用 `floor_char_boundary` 按 UTF-8 char boundary 截断并置 `truncated = true`
-- `buffer.rs` —— `SessionBuffer`：`VecDeque<StreamMessage>`，上限 `MAX_MESSAGES = 2000` 或 `MAX_BYTES = 5 MB`；超上限从队首 pop 并计数；`take_truncated_meta(at_ms)` 消费计数返回一条 `BufferTruncated` meta 消息
-- `session.rs` —— `HttpStreamState { inner: Mutex<HashMap<String, SessionHandle>>, next_generation: AtomicU64 }`；`SessionHandle { cancel_tx: oneshot::Sender, send_tx: Option<mpsc::UnboundedSender<String>>, buffer: Arc<Mutex<SessionBuffer>>, generation: u64 }`；`insert / cancel / send / snapshot / buffer_for / remove / next_generation / remove_if_generation`
-- `sse.rs` —— `run_sse<R: tauri::Runtime>(session_id, spec: SseSpec, state, app: AppHandle<R>, cancel_rx, buffer)`；构造 header（Accept: text/event-stream / Cache-Control / 可选 Last-Event-ID / 用户 header + Auth）→ tokio::select! 抢先 cancel → reqwest.get.send → 非 2xx emit Error + Closed 直接结束 → 否则 emit Open → loop select! bytes_stream.next 与 cancel_rx；每次 `push_and_emit` 之后调 `take_truncated_meta`；退出前 `state.remove_if_generation`
-- `ws.rs` —— `run_ws<R: tauri::Runtime>(session_id, spec: WsSpec, state, app, cancel_rx, send_rx, buffer)`；构造 tungstenite `Request` + header + Auth + 可选 `Sec-WebSocket-Protocol` → cancel-races `connect_async` → emit Open → split sink/stream → select! 三向（`stream.next` 收 Text / Binary / Close / Ping / Pong / Frame，`send_rx.recv` 发 Text 并 emit `direction: Out`，`cancel_rx` 发 Close(1000) 后 emit Closed）；WS text / binary 各有 UTF-8 安全截断（`floor_char_boundary`）与 4 KB base64 预览；退出前 `state.remove_if_generation`
-- `commands.rs` —— 4 个 Tauri 命令：`open_stream(sessionId, kind, spec)`（cancel 旧 session → next_generation → 同步校验 URL scheme → insert handle → spawn `run_sse / run_ws`）/ `close_stream(sessionId)`（幂等 cancel）/ `send_ws_message(sessionId, text)`（走 `SessionHandle.send_tx`）/ `list_stream_messages(sessionId) -> Vec<StreamMessage>`（返回 buffer 快照，session 不存在返回空 vec）
+- 只为已安装、已启用、带合法 `nativeService` 的应用启动或连接 service；入口文件仍由安装 registry 的 hash 契约约束。
+- 使用 `${app_data_dir}/http` 作为共享数据目录，管理 endpoint/lease、并发启动、owned child 生命周期、版本协商、请求超时和稳定错误码。
+- `plugin_connect_http_service` 建立连接，`plugin_http_service_request` 代理 Host API 2.x 请求；service 事件统一转发给 `PluginFrame`。
+- 不实现 HTTP 业务、SQLite schema 或 SSE/WS buffer；这些均由版本化的 `athttp-service` 拥有。
 
 ### `src-tauri/src/updater/`
 
@@ -326,11 +291,11 @@ SSE / WebSocket 长连接。所有 session 共享 `HttpStreamState`（通过 `.m
 
 ## 测试策略
 
-- **逻辑模块** —— Vitest，colocated `*.test.ts`：composable / theme / utils / HTTP 工具的 `variables.ts` `curl.ts` `openapiImport.ts` `httpApi.ts` / `streamMessageTone.ts` / `useHttpStore.stream.test.ts` / `useHttpStore.collections.test.ts`
+- **逻辑模块** —— Vitest，colocated `*.test.ts`：composable / theme / utils / 插件 Host API、Catalog 与应用管理状态
 - **Vue SFC** —— 不写单元测试（不引 jsdom）；改动后人工目视回归
-- **后端 Rust** —— 模板模块、updater 模块（`updater::verify` + `updater::check` 单测覆盖签名 / SHA256SUMS lookup / semver 比较）、HTTP stream 模块（`stream::parser` 9 条 / `stream::buffer` 5 条 / `stream::session` 6 条 / `stream::ws::tests` 2 条 UTF-8 截断测试）
-- **插件** —— Vitest 覆盖动态导航、store 状态和 Host API；Rust 单测覆盖签名、target、路径、hash、原子激活、停启、卸载与历史；真实 Tauri 窗口已验证 Codec、Text、Generator、Time 与 JSON 的远程发现、安装、Host API、主题、停启和卸载
-- **集成** —— HTTP stream 有 `src-tauri/tests/stream_it.rs` 起本地 TCP server 模拟 SSE 200 / SSE 401 / WS echo；其余依赖 `pnpm tauri:dev` + 手动操作验收
+- **后端 Rust** —— 模板模块、updater 模块，以及插件签名、target、路径、hash、原子激活、HTTP service supervisor 与协议测试
+- **插件** —— Vitest 覆盖动态导航、store 状态和 Host API；真实 Tauri 窗口已验证 Catalog HTTP 的唯一入口、Host API 2.x、停用和重新启用
+- **集成** —— HTTP 业务集成测试位于 `athttp`；宿主依赖 `cargo test --lib` 和真实 `pnpm tauri:dev` 流程验证桥接
 
 ## 构建与发布
 
@@ -380,9 +345,8 @@ macOS app bundle 使用 `signingIdentity: "-"` 做 ad-hoc 签名，确保 `.app`
 
 ## 性能 / 包大小现状
 
-- 前端 bundle：~630 kB minified（180 kB gzip）—— Naive UI + Monaco 占大头（Monaco 单独 chunk 惰加载）
-- HTTP 工具 chunk：~63 kB minified（20 kB gzip），惰加载
-- Rust 二进制：未优化体积；`bundle/macos/AT Tool.app` 约 30 MB（含 webview2 / 系统 webkit 链接）
+- 前端 bundle 不再包含 Monaco 或 HTTP 业务 chunk；独立应用资源只在安装后由自定义协议加载
+- Rust 二进制不再包含宿主 HTTP/SSE/WebSocket 实现或 `tokio-tungstenite`
 - 已知优化空间：vite 代码分割（命令面板等惰加载）、删除未引用 Naive UI 组件、调整 Rust LTO
 
 ## 扩展指南
@@ -402,3 +366,7 @@ Root 私钥保持离线，日常 Catalog 只使用 Root 授权的独立 Signing 
 ### 2026-11-13 HTTP 共享数据由单一原生 Service 持有
 
 `athttp` 独立版和平台插件统一作为客户端连接同一 Native/Data Service，由 service 独占 SQLite、请求取消和 SSE/WS session；插件通过受权限控制的 Host API 代理访问。该方案增加了 service 分发、版本协商和 supervisor 复杂度，但避免依赖 SQLite WAL 让多个 UI 进程共享数据所有权，也避免把任意网络和本地文件权限交给 iframe。
+
+### 2026-11-14 HTTP 仅保留独立应用入口
+
+生产 Catalog 与 Host API 2.x 生命周期验证完成后，平台完整删除内置 HTTP UI、Store、commands 和数据库连接，只保留动态应用入口与 service 桥接。相比隐藏旧入口或保留只读兼容命令，完整退场避免恢复双数据 owner，也确保停用或卸载插件不会触发不可见回退。

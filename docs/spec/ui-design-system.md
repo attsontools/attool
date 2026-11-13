@@ -77,7 +77,6 @@
 - Composable：`src/composables/useTheme.ts`，注入 `KVStorage` + `ThemeRoot`，默认 `localStorage` + `document.documentElement`
 - 状态持久化：`localStorage.attool.theme = 'dark' | 'light'`，默认 `dark`
 - Naive UI：`<n-config-provider :theme="..." :theme-overrides="...">` 在 `darkTheme + darkOverrides` 与 `null + lightOverrides` 之间切换
-- Monaco：普通编辑器与差异编辑器只读取 `<html data-theme>`；首次挂载和运行时主题切换分别应用 `vs-dark` / `vs`，组件卸载时断开监听并释放 editor / model
 - 入口：sidebar 底栏的太阳/月亮按钮（折叠态隐藏）
 
 ## 外壳骨架
@@ -136,32 +135,7 @@
 - **快捷键录制**：图片截图页、剪贴板页提供"修改 / 恢复默认"按钮 + 键盘录制框（`keydown` 捕获组合键），注册失败时就地红色 alert 提示。
 - **预览弹窗**：剪贴板图片用 `NImage` 预览层（缩放 / 旋转 / 复制工具栏），文本用 `NModal` 全文弹窗；均以悬浮图标触发，不劫持卡片点击。
 - **多窗口**：统一捕获浮层（`capture-overlay`，透明全屏，顶部切换截图 / 录屏；截图支持选区 + 标注，录屏支持区域 / 窗口 / 全屏与区域调整）、截图钉图窗（`capture-pin-*`）、剪贴板历史独立浮窗（`clipboard-history`）都是独立 Tauri 窗口，共用同一套 token / 主题。
-- **多 tab 工作区**（HTTP 工具的做法）：浏览器风格 tab 条 + 中键关闭 + 拖拽排序 + 每个 tab 自动持久化（无显式"保存"按钮，也无未保存状态）；左侧栏在请求集合树和历史列表之间切换，集合可从 OpenAPI JSON 导入，历史按时间倒序搜索 / 右键回填 / 新 tab 打开。v0.8.9 起 tab 分 http / sse / ws 三种类型，`+` 按钮为 NDropdown（新建 HTTP / SSE / WebSocket），tab 方法字段按类型分色（HTTP 方法名默认色 / `SSE` 紫 `#8b5cf6` / `WS` 青 `#06b6d4`）。
-- **变量高亮**：URL / KV 输入 里的 `{{var}}` 用 `<VarText>` / `<VarInput>` 组件在文本上方叠一层 span，命中的变量画 emerald `--accent-soft` 底纹，未定义画 `--error` 底纹（透明度 22%）；不引 Monaco，只靠 CSS + 一层 overlay 实现。
-- **长连接消息流**（SSE / WS）：`StreamMessageList` 时间戳 mono 字体 + 消息内容 `<pre>` `whitespace: pre-wrap`；按 `messageTone(msg)` 分色：Open `rgba(16,185,129,.06)` 淡绿、BufferTruncated `rgba(245,158,11,.08)` 淡黄、Error `rgba(239,68,68,.08)` 淡红、WsBinary `rgba(59,130,246,.06)` 淡蓝、Closed 走 `--text-muted`、SseEvent / WsText 默认；顶部横条显示条数 + "自动滚动"复选框；发送 / 接收方向用 `↑` / `↓` 前缀标记。
-
-## HTTP 工具三栏骨架
-
-```
-┌────────┬────────────────────────────────────────────────────┐
-│ 集合/历史 │ [☰] 环境: [prod ▾]                    [{{}} 变量]  │  ← HttpTopBar
-│ 🔍      ├────────────────────────────────────────────────────┤
-│ • GET  │ [GET /users] [SSE /stream] [WS /ws]        [+ ▾]  │  ← HttpTabBar
-│ • POST ├────────────────────────────────────────────────────┤
-│ • ...  │ HTTP kind：地址栏 + 子 tabs + 响应视图              │  ← http/sse/ws
-│        │ SSE kind：地址栏 + 子 tabs + 连接/断开 + 消息流     │      分支渲染
-│        │ WS kind：地址栏 + 子 tabs + 连接/断开 + 消息流 +    │
-│        │           发送框 + 模板选择                        │
-└────────┴────────────────────────────────────────────────────┘
-```
-
-左侧栏 240px（可折叠 32px），可在集合树和发送历史之间切换；集合树支持 OpenAPI JSON 导入、请求回填当前 tab、新 tab 打开和删除。tab 条永远置顶。**内容区按 `activeTab.kind` 分支渲染**：
-
-- `kind='http'`：`HttpRequestEditor`（地址栏 + Params/Auth/Headers/Body/Settings 子 tabs）+ `HttpResponseView`（状态行 + Body/Headers/Cookies，Body 有 Pretty/Raw/Preview 切换）；状态色走 token —— `--accent` 2xx、`--info` 3xx、`--warning` 4xx、`--error` 5xx；数字用 `--font-mono` 对齐
-- `kind='sse'`：`SseRequestEditor`（URL + Params/Headers/Auth/Settings 子 tabs，Settings 含超时 / SSL / Last-Event-ID）+ 连接控制条（状态徽标 `IDLE / CONNECTING / OPEN / CLOSED / ERROR` 分色）+ `StreamMessageList`
-- `kind='ws'`：`WsRequestEditor`（URL + Params/Headers/Auth/Protocol 子 tabs，Protocol 含 Sec-WebSocket-Protocol + SSL）+ 连接控制条 + `StreamMessageList` + 底部发送区（模板下拉 + 模板名录入 + 保存 / 删除按钮 + 发送 textarea + 发送按钮）
-
-tab 方法字段按 kind 分色：HTTP 方法名走默认色、`SSE` 走 `#8b5cf6` 紫、`WS` 走 `#06b6d4` 青。SSE / WS 的侧栏保留集合与历史入口（仅 HTTP 请求写历史），SSE / WS 消息只在当前 tab 的 `StreamMessageList` 里，不入历史。
+- **插件应用容器**：`PluginFrame` 填满宿主工具内容区，不额外套卡片；loading、连接和错误状态由宿主统一呈现。插件内部设计由对应应用仓库维护，但必须通过 Host API 主题通知跟随当前 dark / light 主题。
 
 ## 模板编辑器画布
 
@@ -185,17 +159,7 @@ tab 方法字段按 kind 分色：HTTP 方法名走默认色、`SSE` 走 `#8b5cf
 | 键位 | 行为 |
 |---|---|
 | `⌘\` / `Ctrl\` | 切换 sidebar 折叠 |
-| `⌘K` / `CtrlK` | 命令面板：搜工具、HTTP 环境、HTTP 历史、HTTP 集合请求和常用动作 |
-
-**应用内 · HTTP 工具聚焦时**（`HttpTool.vue` 在 `onMounted` 挂 window keydown）：
-
-| 键位 | 行为 |
-|---|---|
-| `⌘Enter` | HTTP 发送 / 取消当前 tab；SSE / WS 场景当前不做（长连接靠面板按钮） |
-| `⌘T` | 新建 tab（默认 HTTP kind） |
-| `⌘W` | 关闭当前 tab（stream tab 先自动断开长连接；最后一个关闭则新建空 tab） |
-| `⌘B` | 折叠 / 展开历史侧栏 |
-| `⌘E` | 打开环境弹窗（变量 tab） |
+| `⌘K` / `CtrlK` | 命令面板：搜索内置工具与已启用的独立应用 |
 
 **系统全局**（任意窗口，`tauri-plugin-global-shortcut`，用户可在对应工具页改）：
 
