@@ -30,7 +30,7 @@ const serviceReady = ref(!props.app.nativeService);
 let session: PluginHostSession | null = null;
 let handshakeTimer: ReturnType<typeof setTimeout> | null = null;
 let handlingFailure = false;
-let httpEventUnlisten: UnlistenFn | null = null;
+let nativeServiceEventUnlisten: UnlistenFn | null = null;
 let disposed = false;
 
 const source = computed(() => {
@@ -62,6 +62,11 @@ async function pickPluginFile() {
   return { path, name: path.split(/[\\/]/).pop() || 'file' };
 }
 
+async function pickPluginDirectory(defaultPath?: string) {
+  const path = await open({ directory: true, multiple: false, defaultPath });
+  return typeof path === 'string' ? path : null;
+}
+
 async function prepareFrame() {
   if (!props.app.nativeService) {
     serviceReady.value = true;
@@ -70,20 +75,20 @@ async function prepareFrame() {
   state.value = 'connecting';
   errorMessage.value = '';
   try {
-    if (!httpEventUnlisten) {
+    if (!nativeServiceEventUnlisten) {
       const unlisten = await listen<{ appId: string; event: unknown }>(
-        'plugin://http-service-event',
+        'plugin://native-service-event',
         ({ payload }) => {
-          if (payload.appId === props.app.appId) session?.notifyHttpEvent(payload.event);
+          if (payload.appId === props.app.appId) session?.notifyNativeServiceEvent(payload.event);
         }
       );
       if (disposed) {
         unlisten();
         return;
       }
-      httpEventUnlisten = unlisten;
+      nativeServiceEventUnlisten = unlisten;
     }
-    await invoke('plugin_connect_http_service', { appId: props.app.appId });
+    await invoke('plugin_connect_native_service', { appId: props.app.appId });
     if (disposed) return;
     state.value = 'loading';
     serviceReady.value = true;
@@ -112,9 +117,10 @@ function handleLoad() {
     },
     saveFile: savePluginFile,
     pickFile: pickPluginFile,
+    pickDirectory: pickPluginDirectory,
     copyText: writeText,
-    requestHttpService: props.app.nativeService
-      ? (method, params) => invoke('plugin_http_service_request', {
+    requestNativeService: props.app.nativeService
+      ? (method, params) => invoke('plugin_native_service_request', {
           appId: props.app.appId,
           method,
           params
@@ -216,8 +222,8 @@ onMounted(() => void prepareFrame());
 onBeforeUnmount(() => {
   disposed = true;
   clearSession();
-  httpEventUnlisten?.();
-  httpEventUnlisten = null;
+  nativeServiceEventUnlisten?.();
+  nativeServiceEventUnlisten = null;
 });
 </script>
 

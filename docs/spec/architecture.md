@@ -56,7 +56,7 @@
 
 - **请求-响应：** `invoke<T>('command_name', { arg })` （`@tauri-apps/api/core`）
 - **流式事件：** Rust `app_handle.emit("event-name", payload)` → 前端 `listen<T>('event-name', cb)`
-  - `download-progress`（aria2 输出解析后推送）、`clipboard-history-updated`（剪贴板监听）、`capture-overlay-init` / `capture-failed`（统一捕获浮层）、`capture-overlay-recording-toggle`（录屏快捷键切换 / 停止）、`recording://completed` / `recording://native-error`（录屏结果与原生错误）、`updater://state`（自研 updater 状态机推送）、`plugin://http-service-event`（Native Service 事件统一转发）等
+  - `download-progress`（aria2 输出解析后推送）、`clipboard-history-updated`（剪贴板监听）、`capture-overlay-init` / `capture-failed`（统一捕获浮层）、`capture-overlay-recording-toggle`（录屏快捷键切换 / 停止）、`recording://completed` / `recording://native-error`（录屏结果与原生错误）、`updater://state`（自研 updater 状态机推送）、`plugin://native-service-event`（Native Service 事件统一转发）等
 - **错误：** Rust 命令返回 `Result<T, String>`，前端 `try { await invoke(...) } catch (e)` 捕获
 
 ## 状态分层
@@ -67,7 +67,7 @@
 | 浏览器持久 | `localStorage` | sidebar 折叠状态、上次打开工具、主题、属性面板折叠 |
 | 应用持久 | rusqlite（Tauri data dir） | 下载任务历史、剪贴板历史、模板项目 / 素材库、插件 registry 与管理历史 |
 | updater 缓存 | 文件（`app_cache_dir/updater/`） | 已下载但未 apply 的 archive stage |
-| 临时 | Tauri runtime State | 进行中的下载子进程句柄（`DownloadTasks`）、录屏分块文件 / Wayland 原生录制 session（`RecordingStore`）、Updater 状态机 `UpdaterState`、插件 registry/runtime 与 HTTP service supervisor |
+| 临时 | Tauri runtime State | 进行中的下载子进程句柄（`DownloadTasks`）、录屏分块文件 / Wayland 原生录制 session（`RecordingStore`）、Updater 状态机 `UpdaterState`、插件 registry/runtime 与 Native Service supervisor |
 
 HTTP 数据仍位于 `${app_data_dir}/http/http.sqlite3`，但不属于宿主 rusqlite 状态。`com.attson.http` 的 Native/Data Service 独占数据库、迁移、历史清理、请求取消和 SSE/WS session；平台只把同一数据目录交给已验签 service。停用或卸载插件默认保留该目录，平台启动不打开、改写或删除数据库。
 
@@ -215,7 +215,7 @@ export function useTheme(
 ### `src/components/plugins/`
 
 - `ApplicationManager.vue` 展示内置工具、Catalog 应用、已安装应用和操作记录，并驱动远程安装、升级、停启与卸载。
-- `PluginFrame.vue` 建立隔离 iframe 与 Host API session；带 `nativeService` 的应用先连接 supervisor，再通过 `plugin_http_service_request` 转发请求和 `plugin://http-service-event` 接收事件。
+- `PluginFrame.vue` 建立隔离 iframe 与 Host API session；带 `nativeService` 的应用先连接 supervisor，再通过 `plugin_native_service_request` 转发请求和 `plugin://native-service-event` 接收事件。
 - `pluginHost.ts` 校验 JSON-RPC、权限、超时和消息大小；`pluginProbe.ts` 根据 manifest 选择 Host API 1.x 或 2.x。
 - HTTP 编辑器 UI 与业务逻辑位于 `attsontools/athttp`，宿主不复制其组件或 Store。
 
@@ -232,7 +232,7 @@ export function useTheme(
 | `ecommerce/` | 主图模板：PSD 导入 / 图层渲染 / 批量替换 | `import_psd_template` / `save·load·list·delete_ecommerce_template` / `run_batch_replace_tasks` |
 | `network/` | 网络诊断 | `ping_host` / `check_ports` / `resolve_dns` |
 | `updater/` | 自研更新：check / verify / download / apply | `updater_get_state` / `updater_check` / `updater_download` / `updater_apply` / `updater_cancel` |
-| `plugin/` | 签名包校验、staging/registry、Catalog、隔离资源协议、Host API 与 HTTP Native Service supervisor | `plugin_inspect_package` / `plugin_install_package` / `plugin_list_installed` / `plugin_set_enabled` / `plugin_uninstall` / `plugin_connect_http_service` / `plugin_http_service_request` |
+| `plugin/` | 签名包校验、staging/registry、Catalog、隔离资源协议、Host API 与 Native Service supervisor | `plugin_inspect_package` / `plugin_install_package` / `plugin_list_installed` / `plugin_set_enabled` / `plugin_uninstall` / `plugin_connect_native_service` / `plugin_native_service_request` |
 | `douyin.rs` / `bilibili.rs` / `xhs.rs` / `youtube.rs` | 视频链接解析；YouTube 通过共享 Python sidecar 调用内置 yt-dlp / EJS / QuickJS | `extract_douyin_video` / `extract_bilibili_video` / `extract_youtube_video` / `resolve_douyin_url` |
 
 ### 内置运行时
@@ -263,9 +263,10 @@ export function useTheme(
 ### `src-tauri/src/plugin/http_service.rs`
 
 - 只为已安装、已启用、带合法 `nativeService` 的应用启动或连接 service；入口文件仍由安装 registry 的 hash 契约约束。
-- 使用 `${app_data_dir}/http` 作为共享数据目录，管理 endpoint/lease、并发启动、owned child 生命周期、版本协商、请求超时和稳定错误码。
-- `plugin_connect_http_service` 建立连接，`plugin_http_service_request` 代理 Host API 2.x 请求；service 事件统一转发给 `PluginFrame`。
-- 不实现 HTTP 业务、SQLite schema 或 SSE/WS buffer；这些均由版本化的 `athttp-service` 拥有。
+- 按 app 解析受控数据目录：HTTP 保持 `${app_data_dir}/http`，Aria2 使用 `${app_data_dir}/aria2`，其他应用使用 `${app_data_dir}/native-services/<appId>`；runtime 管理 endpoint/lease、并发启动、owned child 生命周期、版本协商、请求超时和稳定错误码。
+- `plugin_connect_native_service` 建立连接，`plugin_native_service_request` 代理 Host API 2.x 请求；service 事件带 `appId` 统一转发给 `PluginFrame`。
+- transport 只开放显式领域方法：HTTP 继续映射三项 `host.http.*` 权限，下载七个方法映射到 `host.download.tasks`；不提供任意 native service call。
+- 不实现 HTTP、下载或其他应用业务，也不持有业务 SQLite schema；业务状态均由各自版本化 service 拥有。
 
 ### `src-tauri/src/updater/`
 
@@ -293,7 +294,7 @@ export function useTheme(
 
 - **逻辑模块** —— Vitest，colocated `*.test.ts`：composable / theme / utils / 插件 Host API、Catalog 与应用管理状态
 - **Vue SFC** —— 不写单元测试（不引 jsdom）；改动后人工目视回归
-- **后端 Rust** —— 模板模块、updater 模块，以及插件签名、target、路径、hash、原子激活、HTTP service supervisor 与协议测试
+- **后端 Rust** —— 模板模块、updater 模块，以及插件签名、target、路径、hash、原子激活、Native Service supervisor 与协议测试
 - **插件** —— Vitest 覆盖动态导航、store 状态和 Host API；真实 Tauri 窗口已验证 Catalog HTTP 的唯一入口、Host API 2.x、停用和重新启用
 - **集成** —— HTTP 业务集成测试位于 `athttp`；宿主依赖 `cargo test --lib` 和真实 `pnpm tauri:dev` 流程验证桥接
 
@@ -370,3 +371,7 @@ Root 私钥保持离线，日常 Catalog 只使用 Root 授权的独立 Signing 
 ### 2026-11-14 HTTP 仅保留独立应用入口
 
 生产 Catalog 与 Host API 2.x 生命周期验证完成后，平台完整删除内置 HTTP UI、Store、commands 和数据库连接，只保留动态应用入口与 service 桥接。相比隐藏旧入口或保留只读兼容命令，完整退场避免恢复双数据 owner，也确保停用或卸载插件不会触发不可见回退。
+
+### 2026-11-14 Native Service transport 与领域权限分离
+
+平台复用 app-scoped supervisor、握手和事件 transport，但 Host API 仍以 HTTP、下载等领域权限和精确方法白名单对外，不开放任意 native service 调用。该方案增加双层权限映射和事件路由维护成本，换取 supervisor 复用，同时避免一个原生应用借通用桥访问其他领域能力。

@@ -44,6 +44,19 @@ const http: InstalledPlugin = {
   }
 };
 
+const aria2: InstalledPlugin = {
+  ...codec,
+  appId: 'com.attson.aria2',
+  name: 'Aria2 下载',
+  permissions: ['host.download.tasks'],
+  nativeService: {
+    entry: 'native/ataria2-service',
+    version: '0.1.0-alpha.0',
+    sha256: 'b'.repeat(64),
+    protocolVersion: 1
+  }
+};
+
 function request(id: string, method: string, params: unknown = {}): HostRpcMessage {
   return {
     jsonrpc: '2.0',
@@ -60,6 +73,94 @@ async function flush() {
 }
 
 describe('plugin host session', () => {
+  it('routes only declared download task methods and pushes task events', async () => {
+    const port = new FakePort();
+    const requestService = vi.fn(async (_method: string, _params: unknown) => ({ id: 'dl-1' }));
+    const pickDirectory = vi.fn(async () => '/home/user/Downloads');
+    const session = createPluginHostSession({
+      app: aria2,
+      port,
+      theme: () => 'dark',
+      notify: vi.fn(),
+      saveFile: vi.fn(),
+      pickDirectory,
+      requestNativeService: requestService
+    });
+    const downloadRequest = (id: string, method: string, params: unknown = {}): HostRpcMessage => ({
+      jsonrpc: '2.0', id, apiVersion: '2.0', appId: aria2.appId, method, params
+    });
+
+    port.receive(downloadRequest('1', 'host.handshake'));
+    await flush();
+    port.receive(downloadRequest('2', 'host.download.pickDirectory', {
+      defaultPath: '/home/user'
+    }));
+    await flush();
+    expect(pickDirectory).toHaveBeenCalledWith('/home/user');
+    expect(port.sent[1]).toMatchObject({
+      id: '2', result: { cancelled: false, path: '/home/user/Downloads' }
+    });
+
+    port.receive(downloadRequest('3', 'host.download.tasks', {
+      method: 'download.tasks.start',
+      params: { request: { url: 'https://example.com/file.zip' } }
+    }));
+    await flush();
+    expect(requestService).toHaveBeenCalledWith('download.tasks.start', {
+      request: { url: 'https://example.com/file.zip' }
+    });
+
+    port.receive(downloadRequest('4', 'host.download.tasks', {
+      method: 'download.process.spawn', params: {}
+    }));
+    await flush();
+    expect(port.sent.at(-1)).toMatchObject({
+      id: '4', error: { data: { code: 'HOST_DOWNLOAD_METHOD_DENIED' } }
+    });
+    expect(requestService).toHaveBeenCalledTimes(1);
+
+    session.notifyNativeServiceEvent({ id: 'dl-1', status: 'running', progress: 25 });
+    expect(port.sent.at(-1)).toMatchObject({
+      apiVersion: '2.0',
+      method: 'host.download.taskEvent',
+      params: { id: 'dl-1', status: 'running', progress: 25 }
+    });
+    session.terminate();
+  });
+
+  it('routes native service events by payload when a plugin declares multiple domains', async () => {
+    const port = new FakePort();
+    const session = createPluginHostSession({
+      app: {
+        ...aria2,
+        permissions: ['host.http.stream', 'host.download.tasks']
+      },
+      port,
+      theme: () => 'dark',
+      notify: vi.fn(),
+      saveFile: vi.fn(),
+      requestNativeService: vi.fn()
+    });
+    const hybridRequest = (id: string, method: string): HostRpcMessage => ({
+      jsonrpc: '2.0', id, apiVersion: '2.0', appId: aria2.appId, method, params: {}
+    });
+
+    port.receive(hybridRequest('1', 'host.handshake'));
+    await flush();
+    session.notifyNativeServiceEvent({
+      sessionId: 'sse-1', generation: 1, message: { kind: 'open' }
+    });
+    expect(port.sent.at(-1)).toMatchObject({ method: 'host.http.streamEvent' });
+
+    session.notifyNativeServiceEvent({ id: 'dl-1', status: 'running', progress: 25 });
+    expect(port.sent.at(-1)).toMatchObject({ method: 'host.download.taskEvent' });
+
+    const sentCount = port.sent.length;
+    session.notifyNativeServiceEvent({});
+    expect(port.sent).toHaveLength(sentCount);
+    session.terminate();
+  });
+
   it('routes HTTP Host API 2.0 methods by declared capability and pushes service events', async () => {
     const port = new FakePort();
     const requestService = vi.fn(async (_method: string, _params: unknown) => ({ ok: true }));
@@ -69,7 +170,7 @@ describe('plugin host session', () => {
       theme: () => 'dark',
       notify: vi.fn(),
       saveFile: vi.fn(),
-      requestHttpService: requestService
+      requestNativeService: requestService
     });
     const httpRequest = (id: string, method: string, params: unknown = {}): HostRpcMessage => ({
       jsonrpc: '2.0',
@@ -103,7 +204,7 @@ describe('plugin host session', () => {
       error: { data: { code: 'HOST_HTTP_METHOD_DENIED' } }
     });
 
-    session.notifyHttpEvent({ sessionId: 'sse-1', generation: 1, message: { kind: 'open' } });
+    session.notifyNativeServiceEvent({ sessionId: 'sse-1', generation: 1, message: { kind: 'open' } });
     expect(port.sent.at(-1)).toMatchObject({
       apiVersion: '2.0',
       method: 'host.http.streamEvent',
@@ -124,7 +225,7 @@ describe('plugin host session', () => {
       saveFile: vi.fn(),
       pickFile: vi.fn(async () => ({ path: '/home/user/private.txt', name: 'private.txt' })),
       copyText,
-      requestHttpService: requestService
+      requestNativeService: requestService
     });
     const httpRequest = (id: string, method: string, params: unknown = {}): HostRpcMessage => ({
       jsonrpc: '2.0',
@@ -189,7 +290,7 @@ describe('plugin host session', () => {
       theme: () => 'dark',
       notify: vi.fn(),
       saveFile: vi.fn(),
-      requestHttpService: vi.fn(async () => ({ body: 'x'.repeat(5 * 1024 * 1024) }))
+      requestNativeService: vi.fn(async () => ({ body: 'x'.repeat(5 * 1024 * 1024) }))
     });
     const httpRequest = (id: string, method: string, params: unknown = {}): HostRpcMessage => ({
       jsonrpc: '2.0', id, apiVersion: '2.0', appId: http.appId, method, params

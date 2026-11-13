@@ -3,6 +3,15 @@ import type { InstalledPlugin } from './types';
 type ApiVersion = '1.0' | '2.0';
 const LEGACY_MAX_MESSAGE_BYTES = 1024 * 1024;
 const HTTP_MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
+const DOWNLOAD_TASK_METHODS = new Set([
+  'download.defaultDirectory',
+  'download.tasks.list',
+  'download.tasks.start',
+  'download.tasks.cancel',
+  'download.tasks.openFolder',
+  'download.tasks.clearCompleted',
+  'download.tasks.delete'
+]);
 
 type RpcBase = {
   jsonrpc: '2.0';
@@ -54,7 +63,7 @@ export interface PluginHostSession {
   readonly sessionId: string;
   readonly correlationId: string;
   notifyTheme(theme: 'dark' | 'light'): void;
-  notifyHttpEvent(event: unknown): void;
+  notifyNativeServiceEvent(event: unknown): void;
   terminate(): void;
 }
 
@@ -67,8 +76,9 @@ type SessionOptions = {
   notify(input: { title?: string; message: string; kind: 'info' | 'success' | 'warning' | 'error' }): Promise<void>;
   saveFile(input: HostFileSaveRequest): Promise<{ cancelled: boolean; path?: string }>;
   pickFile?(): Promise<{ path: string; name: string } | null>;
+  pickDirectory?(defaultPath?: string): Promise<string | null>;
   copyText?(text: string): Promise<void>;
-  requestHttpService?(method: string, params: unknown): Promise<unknown>;
+  requestNativeService?(method: string, params: unknown): Promise<unknown>;
   onHandshake?(): void;
   maxMessageBytes?: number;
 };
@@ -223,6 +233,19 @@ export function createPluginHostSession(options: SessionOptions): PluginHostSess
         await options.copyText(text);
         return { copied: true };
       }
+      case 'host.download.pickDirectory': {
+        requirePermission('host.download.tasks');
+        if (!options.pickDirectory) {
+          throw new RpcDispatchError(
+            'HOST_DIRECTORY_PICK_UNAVAILABLE',
+            'Directory selection is unavailable'
+          );
+        }
+        const params = asRecord(request.params);
+        const defaultPath = optionalString(params.defaultPath, 'defaultPath', 4096);
+        const path = await options.pickDirectory(defaultPath);
+        return path ? { cancelled: false, path } : { cancelled: true };
+      }
       case 'host.http.request':
         return dispatchHttpRequest(request, 'host.http.request', (method) =>
           method === 'http.send' || method === 'http.cancel'
@@ -236,6 +259,8 @@ export function createPluginHostSession(options: SessionOptions): PluginHostSess
         );
       case 'host.http.data':
         return dispatchHttpRequest(request, 'host.http.data', (method) => method.startsWith('data.'));
+      case 'host.download.tasks':
+        return dispatchDownloadRequest(request);
       default:
         throw new RpcDispatchError('HOST_METHOD_NOT_FOUND', 'Host API method was not found', -32601);
     }
@@ -247,8 +272,8 @@ export function createPluginHostSession(options: SessionOptions): PluginHostSess
     allows: (method: string) => boolean
   ) {
     requirePermission(permission);
-    if (!options.requestHttpService) {
-      throw new RpcDispatchError('HTTP_SERVICE_NOT_CONNECTED', 'HTTP service is unavailable');
+    if (!options.requestNativeService) {
+      throw new RpcDispatchError('NATIVE_SERVICE_NOT_CONNECTED', 'Native service is unavailable');
     }
     const params = asRecord(request.params);
     const method = requiredString(params.method, 'method', 128);
@@ -261,13 +286,48 @@ export function createPluginHostSession(options: SessionOptions): PluginHostSess
     }
     if (!Object.prototype.hasOwnProperty.call(params, 'params')) throw invalidParams('params');
     try {
-      return await options.requestHttpService(
+      return await options.requestNativeService(
         method,
         method === 'http.send' ? resolveSelectedFiles(params.params, selectedFiles) : params.params
       );
     } catch (reason) {
       throw serviceError(reason);
     }
+  }
+
+  async function dispatchDownloadRequest(request: RpcRequest) {
+    requirePermission('host.download.tasks');
+    if (!options.requestNativeService) {
+      throw new RpcDispatchError('NATIVE_SERVICE_NOT_CONNECTED', 'Native service is unavailable');
+    }
+    const params = asRecord(request.params);
+    const method = requiredString(params.method, 'method', 128);
+    if (!DOWNLOAD_TASK_METHODS.has(method)) {
+      throw new RpcDispatchError(
+        'HOST_DOWNLOAD_METHOD_DENIED',
+        'Download service method is not allowed for host.download.tasks',
+        -32003
+      );
+    }
+    if (!Object.prototype.hasOwnProperty.call(params, 'params')) throw invalidParams('params');
+    try {
+      return await options.requestNativeService(method, params.params);
+    } catch (reason) {
+      throw serviceError(reason);
+    }
+  }
+
+  function notifyNativeServiceEvent(event: unknown) {
+    if (!handshaken || terminated || apiVersion !== '2.0') return;
+    const method = nativeServiceEventMethod(event, options.app.permissions);
+    if (!method) return;
+    post({
+      jsonrpc: '2.0',
+      apiVersion,
+      appId: options.app.appId,
+      method,
+      params: event
+    });
   }
 
   options.port.onmessage = (event) => {
@@ -334,21 +394,7 @@ export function createPluginHostSession(options: SessionOptions): PluginHostSess
         params: { theme }
       });
     },
-    notifyHttpEvent(event) {
-      if (
-        !handshaken
-        || terminated
-        || apiVersion !== '2.0'
-        || !options.app.permissions.includes('host.http.stream')
-      ) return;
-      post({
-        jsonrpc: '2.0',
-        apiVersion,
-        appId: options.app.appId,
-        method: 'host.http.streamEvent',
-        params: event
-      });
-    },
+    notifyNativeServiceEvent,
     terminate() {
       if (terminated) return;
       terminated = true;
@@ -358,6 +404,29 @@ export function createPluginHostSession(options: SessionOptions): PluginHostSess
       options.port.close();
     }
   };
+}
+
+function nativeServiceEventMethod(event: unknown, permissions: string[]): string | null {
+  if (typeof event !== 'object' || event === null || Array.isArray(event)) return null;
+  const payload = event as Record<string, unknown>;
+  if (
+    permissions.includes('host.http.stream')
+    && typeof payload.sessionId === 'string'
+    && Number.isSafeInteger(payload.generation)
+    && Object.prototype.hasOwnProperty.call(payload, 'message')
+  ) {
+    return 'host.http.streamEvent';
+  }
+  if (
+    permissions.includes('host.download.tasks')
+    && typeof payload.id === 'string'
+    && ['queued', 'running', 'completed', 'failed', 'cancelled'].includes(String(payload.status))
+    && typeof payload.progress === 'number'
+    && Number.isFinite(payload.progress)
+  ) {
+    return 'host.download.taskEvent';
+  }
+  return null;
 }
 
 function resolveSelectedFiles(value: unknown, selectedFiles: Map<string, string>): unknown {
@@ -432,5 +501,5 @@ function serviceError(reason: unknown) {
       return new RpcDispatchError(error.code, error.message);
     }
   }
-  return new RpcDispatchError('HTTP_SERVICE_REQUEST_FAILED', 'HTTP service request failed');
+  return new RpcDispatchError('NATIVE_SERVICE_REQUEST_FAILED', 'Native service request failed');
 }

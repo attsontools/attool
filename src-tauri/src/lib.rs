@@ -1282,15 +1282,14 @@ pub fn run() {
             let plugin_runtime = plugin::commands::PluginRuntime::p0(plugin_store.clone())
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
             app.manage(plugin_runtime);
-            let plugin_http_runtime = plugin::http_service::HttpServiceRuntime::new(
+            let plugin_native_service_runtime = plugin::http_service::NativeServiceRuntime::new(
                 plugin_store,
                 app.path()
                     .app_data_dir()
-                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?
-                    .join("http"),
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?,
                 app.handle().clone(),
             );
-            app.manage(plugin_http_runtime);
+            app.manage(plugin_native_service_runtime);
             let catalog_runtime = plugin::catalog::CatalogRuntime::production(
                 app.path()
                     .app_data_dir()
@@ -1400,8 +1399,8 @@ pub fn run() {
             plugin::commands::plugin_get_latest_operation,
             plugin::commands::plugin_confirm_plugin_launch,
             plugin::commands::plugin_rollback_plugin_launch,
-            plugin::http_service::plugin_connect_http_service,
-            plugin::http_service::plugin_http_service_request,
+            plugin::http_service::plugin_connect_native_service,
+            plugin::http_service::plugin_native_service_request,
             ecommerce::commands::import_psd_template,
             ecommerce::commands::list_ecommerce_templates,
             ecommerce::commands::load_ecommerce_template,
