@@ -79,6 +79,7 @@ HTTP 数据仍位于 `${app_data_dir}/http/http.sqlite3`，但不属于宿主 ru
 
 - `.atpkg` 是目标 OS/CPU 专用 ZIP，包含 `manifest.json`、`manifest.sig`、许可证、`ui/` 静态资源，以及可选的目标平台 `nativeService`；包内不允许目录条目、重复文件、未声明文件或不安全相对路径。
 - manifest schema v1 固定声明 `appId`、SemVer `version`、publisher、target、Host API 范围、UI 入口、权限和每个文件的 SHA-256。原生 service 还必须声明与包版本一致的入口、协议版本和文件 hash，并绑定 Host API 2.x；Unix 安装后入口权限收紧为 `0700`。平台使用与 updater 分离的 Publisher Key 验签，并拒绝未知字段、错误 target、未知权限和不兼容 Host API。
+- 单个普通包文件上限为 100 MiB；声明了 `nativeService` 的包仅对 `native/` 下受 manifest hash 约束的 runtime/service 放宽到 128 MiB，其他路径不随之放宽。
 - `src-tauri/src/plugin/install.rs` 把包解压到随机 staging，完成入口健康检查后 rename 到 `app_data_dir/plugins/apps/<appId>/<version>/`，再用 SQLite 事务写入 registry 和成功历史。健康检查 operation 同时持久化待安装包的 `nativeService` 元数据，前端重载后仍能为原生 service 插件建立 Host API 2.x 探针；registry 写入失败会删除已激活目录。
 - registry 为每个 `appId` 保存不可变版本目录以及 `current / previous / pending` 关系。停用只更新 registry 并隐藏导航；重新启用前校验入口文件 hash；卸载先把程序包和可选数据移入 staging，registry 提交失败时恢复原目录。
 
@@ -96,6 +97,8 @@ HTTP 数据仍位于 `${app_data_dir}/http/http.sqlite3`，但不属于宿主 ru
 - service 对新客户端独占 `${app_data_dir}/http/http.sqlite3`，首次接管任何已有非空数据库时创建 `http.sqlite3.pre-service-v1.bak`，再执行 schema 迁移和完整性检查。迁移失败返回稳定错误，不回退到宿主内置 HTTP。
 - 同一客户端连接允许请求并发分派，因此 `http.cancel` 可以中断仍在执行的 `http.send`；响应写入仍串行化，SSE/WS 保持 2000 条、5 MiB buffer 和 generation 语义。`stream.open` response 前到达的事件由客户端按 generation 暂存并在响应后交付，不能因 RPC/event 时序丢失首帧。
 - 宿主不包含 HTTP UI、Store、网络命令或数据库连接。停用/卸载插件不会恢复隐藏的内置实现；历史 `lastTool=http` 只映射到已启用的动态应用入口。
+
+`com.attson.aria2` 已完成 P1 本地双制品验证：独立 Tauri 与签名 `.atpkg` 复用同一 Vue UI 和 `ataria2-service`，service 通过跨平台文件锁独占 `${app_data_dir}/aria2`、SQLite、固定 aria2 1.37.0 runtime 和取消句柄。首次接管先要求宿主写入 capability，再写 `migrating` marker，并以 SQLite exclusive barrier 等待 marker 前的旧写事务完成；一致快照通过 schema、完整性和行数校验后切换为永久 `owned`。旧库保留只读，宿主旧 owner 的所有读写在 marker 存在时拒绝，写路径取得 SQLite write transaction 后还会再次检查，停用或卸载插件也不恢复旧 owner。当前仅 Linux x86_64 本地测试包通过真实安装、下载和共享历史验证；生产密钥、五目标正式包和 Catalog 生命周期属于下一发布阶段。
 
 ### 前端装配与应用外置
 
@@ -375,3 +378,7 @@ Root 私钥保持离线，日常 Catalog 只使用 Root 授权的独立 Signing 
 ### 2026-11-14 Native Service transport 与领域权限分离
 
 平台复用 app-scoped supervisor、握手和事件 transport，但 Host API 仍以 HTTP、下载等领域权限和精确方法白名单对外，不开放任意 native service 调用。该方案增加双层权限映射和事件路由维护成本，换取 supervisor 复用，同时避免一个原生应用借通用桥访问其他领域能力。
+
+### 2026-11-14 Aria2 接管后永久退权旧 owner
+
+`ataria2-service` 首次验证并迁移旧下载库后写入永久 `owned` marker，AT Tool 的旧命令和事件持久化自此拒绝访问旧库；停用或卸载插件也不自动回退。相比保留可逆双 owner，这一选择要求独立 service 具备完整迁移和恢复能力，但避免两个进程在接管边界后继续写入不同副本而造成历史分叉。

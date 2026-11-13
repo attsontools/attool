@@ -20,7 +20,7 @@ mod youtube;
 
 use ecommerce::EcommerceStore;
 use regex::Regex;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -564,7 +564,11 @@ fn parse_complete_line(line: &str) -> Option<String> {
 
 #[cfg(test)]
 mod parse_complete_line_tests {
-    use super::{ensure_legacy_download_owner, parse_complete_line, DOWNLOAD_TAKEN_OVER};
+    use super::{
+        ensure_legacy_download_owner, init_database, insert_download_task_with_owner_check,
+        parse_complete_line, DOWNLOAD_TAKEN_OVER,
+    };
+    use rusqlite::Connection;
 
     #[test]
     fn extracts_absolute_path_from_standard_notice() {
@@ -618,6 +622,42 @@ mod parse_complete_line_tests {
                 Err(DOWNLOAD_TAKEN_OVER.to_string())
             );
         }
+    }
+
+    #[test]
+    fn legacy_download_insert_rechecks_takeover_after_acquiring_the_write_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("aria2-tasks.sqlite3");
+        let service_directory = directory.path().join("aria2");
+        init_database(&db_path).unwrap();
+
+        let mut checks = 0;
+        let result = insert_download_task_with_owner_check(
+            &db_path,
+            "dl-1",
+            "https://example.com/file.bin",
+            "/tmp",
+            None,
+            |path| {
+                checks += 1;
+                if checks == 2 {
+                    std::fs::create_dir_all(&service_directory).unwrap();
+                    std::fs::write(
+                        service_directory.join("takeover.json"),
+                        r#"{"protocolVersion":1,"state":"migrating"}"#,
+                    )
+                    .unwrap();
+                }
+                ensure_legacy_download_owner(path)
+            },
+        );
+
+        assert_eq!(result, Err(DOWNLOAD_TAKEN_OVER.to_string()));
+        let connection = Connection::open(&db_path).unwrap();
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM download_tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }
 
@@ -774,9 +814,13 @@ fn init_database(db_path: &Path) -> Result<(), String> {
 }
 
 fn mark_interrupted_tasks(db_path: &Path) -> Result<(), String> {
-    let connection =
+    let mut connection =
         Connection::open(db_path).map_err(|error| format!("打开任务数据库失败：{error}"))?;
-    connection
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| format!("锁定任务数据库失败：{error}"))?;
+    ensure_legacy_download_owner(db_path)?;
+    transaction
         .execute(
             r#"
             UPDATE download_tasks
@@ -791,6 +835,9 @@ fn mark_interrupted_tasks(db_path: &Path) -> Result<(), String> {
             [],
         )
         .map_err(|error| format!("更新中断任务失败：{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("提交中断任务更新失败：{error}"))?;
     Ok(())
 }
 
@@ -825,10 +872,35 @@ fn insert_download_task(
     download_dir: &str,
     file_name: Option<&str>,
 ) -> Result<(), String> {
-    ensure_legacy_download_owner(db_path)?;
-    let connection =
+    insert_download_task_with_owner_check(
+        db_path,
+        id,
+        url,
+        download_dir,
+        file_name,
+        ensure_legacy_download_owner,
+    )
+}
+
+fn insert_download_task_with_owner_check<F>(
+    db_path: &Path,
+    id: &str,
+    url: &str,
+    download_dir: &str,
+    file_name: Option<&str>,
+    mut owner_check: F,
+) -> Result<(), String>
+where
+    F: FnMut(&Path) -> Result<(), String>,
+{
+    owner_check(db_path)?;
+    let mut connection =
         Connection::open(db_path).map_err(|error| format!("打开任务数据库失败：{error}"))?;
-    connection
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| format!("锁定任务数据库失败：{error}"))?;
+    owner_check(db_path)?;
+    transaction
         .execute(
             r#"
             INSERT INTO download_tasks (
@@ -839,6 +911,9 @@ fn insert_download_task(
             params![id, url, download_dir, file_name],
         )
         .map_err(|error| format!("保存任务记录失败：{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("提交任务记录失败：{error}"))?;
     Ok(())
 }
 
@@ -888,21 +963,35 @@ fn load_download_tasks(db_path: &Path) -> Result<Vec<DownloadTaskRecord>, String
 
 fn delete_completed_tasks(db_path: &Path) -> Result<u64, String> {
     ensure_legacy_download_owner(db_path)?;
-    let connection =
+    let mut connection =
         Connection::open(db_path).map_err(|error| format!("打开任务数据库失败：{error}"))?;
-    let count = connection
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| format!("锁定任务数据库失败：{error}"))?;
+    ensure_legacy_download_owner(db_path)?;
+    let count = transaction
         .execute("DELETE FROM download_tasks WHERE status = 'completed'", [])
         .map_err(|error| format!("清理已完成任务失败：{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("提交清理任务失败：{error}"))?;
     Ok(count as u64)
 }
 
 fn delete_download_task_by_id(db_path: &Path, id: &str) -> Result<(), String> {
     ensure_legacy_download_owner(db_path)?;
-    let connection =
+    let mut connection =
         Connection::open(db_path).map_err(|error| format!("打开任务数据库失败：{error}"))?;
-    connection
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| format!("锁定任务数据库失败：{error}"))?;
+    ensure_legacy_download_owner(db_path)?;
+    transaction
         .execute("DELETE FROM download_tasks WHERE id = ?1", params![id])
         .map_err(|error| format!("删除任务失败：{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("提交删除任务失败：{error}"))?;
     Ok(())
 }
 
@@ -1116,11 +1205,17 @@ fn persist_download_event(db_path: &Path, payload: &DownloadEventPayload) {
     if ensure_legacy_download_owner(db_path).is_err() {
         return;
     }
-    let Ok(connection) = Connection::open(db_path) else {
+    let Ok(mut connection) = Connection::open(db_path) else {
         return;
     };
-
-    let _ = connection.execute(
+    let Ok(transaction) = connection.transaction_with_behavior(TransactionBehavior::Immediate)
+    else {
+        return;
+    };
+    if ensure_legacy_download_owner(db_path).is_err() {
+        return;
+    }
+    if transaction.execute(
         r#"
         UPDATE download_tasks
         SET status = ?2,
@@ -1155,7 +1250,9 @@ fn persist_download_event(db_path: &Path, payload: &DownloadEventPayload) {
             payload.message,
             payload.local_path
         ],
-    );
+    ).is_ok() {
+        let _ = transaction.commit();
+    }
 }
 
 fn emit_download_event(app: &AppHandle, payload: DownloadEventPayload) {

@@ -16,6 +16,7 @@ use zip::ZipArchive;
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_SIGNATURE_BYTES: u64 = 1024;
 const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_NATIVE_FILE_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct HostEnvironment {
@@ -219,7 +220,11 @@ pub fn extract_package(
             )
         })?;
         for relative in package.files.keys() {
-            let bytes = read_entry(&mut archive, relative, MAX_FILE_BYTES)?;
+            let bytes = read_entry(
+                &mut archive,
+                relative,
+                package_file_limit(relative, package.native_service.is_some()),
+            )?;
             let output = destination.join(relative);
             if let Some(parent) = output.parent() {
                 fs::create_dir_all(parent).map_err(|error| {
@@ -467,7 +472,11 @@ fn verify_signature(
 fn verify_files(archive: &mut ZipArchive<File>, manifest: &Manifest) -> Result<(), PackageError> {
     for (path, expected_hash) in &manifest.files {
         validate_package_path(path)?;
-        let bytes = read_entry(archive, path, MAX_FILE_BYTES)?;
+        let bytes = read_entry(
+            archive,
+            path,
+            package_file_limit(path, manifest.native_service.is_some()),
+        )?;
         let actual_hash = hex::encode(Sha256::digest(&bytes));
         if &actual_hash != expected_hash {
             return Err(PackageError::new(
@@ -477,6 +486,14 @@ fn verify_files(archive: &mut ZipArchive<File>, manifest: &Manifest) -> Result<(
         }
     }
     Ok(())
+}
+
+fn package_file_limit(path: &str, has_native_service: bool) -> u64 {
+    if has_native_service && path.starts_with("native/") {
+        MAX_NATIVE_FILE_BYTES
+    } else {
+        MAX_FILE_BYTES
+    }
 }
 
 fn validate_package_path(path: &str) -> Result<(), PackageError> {
@@ -562,13 +579,23 @@ mod tests {
     use sha2::{Digest, Sha256};
     use zip::{write::SimpleFileOptions, ZipWriter};
 
-    use super::{canonical_json, extract_package, inspect_package, HostEnvironment};
+    use super::{
+        canonical_json, extract_package, inspect_package, package_file_limit, HostEnvironment,
+        MAX_FILE_BYTES, MAX_NATIVE_FILE_BYTES,
+    };
 
     const TEST_KEY_SEED: [u8; 32] = [
         0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
         0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
         0x7f, 0x60,
     ];
+
+    #[test]
+    fn larger_file_limit_is_scoped_to_native_service_payloads() {
+        assert_eq!(package_file_limit("native/aria2c", true), MAX_NATIVE_FILE_BYTES);
+        assert_eq!(package_file_limit("native/aria2c", false), MAX_FILE_BYTES);
+        assert_eq!(package_file_limit("ui/large.bin", true), MAX_FILE_BYTES);
+    }
 
     fn sha256(bytes: &[u8]) -> String {
         hex::encode(Sha256::digest(bytes))

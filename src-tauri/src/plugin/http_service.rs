@@ -1827,6 +1827,106 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires ATARIA2_TEST_PACKAGE"]
+    async fn packaged_aria2_plugin_installs_downloads_and_shares_history() {
+        let package =
+            std::env::var("ATARIA2_TEST_PACKAGE").expect("ATARIA2_TEST_PACKAGE is required");
+        let directory = tempdir().unwrap();
+        let store = PluginStore::open(directory.path().join("plugins")).unwrap();
+        let public_key = VerifyingKey::from_bytes(&[
+            0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64,
+            0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68,
+            0xf7, 0x07, 0x51, 0x1a,
+        ])
+        .unwrap();
+        let keys = HashMap::from([("attool-p0-test".to_string(), public_key)]);
+        let installed = store
+            .install(
+                Path::new(&package),
+                &HostEnvironment::current("2.0.0"),
+                &keys,
+            )
+            .unwrap();
+        assert_eq!(installed.app_id, "com.attson.aria2");
+
+        let runtime = NativeServiceRuntime::with_event_sink(
+            store,
+            directory.path().to_path_buf(),
+            Arc::new(NoopEventSink),
+        );
+        runtime.connect("com.attson.aria2").await.unwrap();
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut request = Vec::new();
+            BufReader::new(&mut stream)
+                .read_until(b'\n', &mut request)
+                .await
+                .unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nataria2-smoke")
+                .await
+                .unwrap();
+        });
+        let output = directory.path().join("downloads");
+        std::fs::create_dir_all(&output).unwrap();
+        let started = runtime
+            .request(
+                "com.attson.aria2",
+                "download.tasks.start",
+                json!({ "request": {
+                    "url": format!("http://{upstream_address}/payload.bin"),
+                    "downloadDir": output,
+                    "fileName": "payload.bin"
+                }}),
+            )
+            .await
+            .unwrap();
+        let id = started["id"].as_str().unwrap().to_string();
+        upstream_task.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let listed = runtime
+                    .request("com.attson.aria2", "download.tasks.list", json!({}))
+                    .await
+                    .unwrap();
+                if listed["tasks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|task| task["id"] == id && task["status"] == "completed")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(output.join("payload.bin")).unwrap(),
+            b"ataria2-smoke"
+        );
+
+        let data_directory = directory.path().join("aria2");
+        let second_client = ServiceClient::connect(
+            &data_directory.join("service.endpoint.json"),
+            &data_directory,
+            "com.attson.aria2",
+            "standalone-test",
+        )
+        .await
+        .unwrap();
+        let listed = second_client
+            .request("download.tasks.list", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(listed["tasks"][0]["id"], id);
+    }
+
+    #[cfg(unix)]
     fn stop_packaged_service(data_directory: &Path) {
         let lease = std::fs::read_to_string(data_directory.join("service.lock")).unwrap();
         let pid = lease.lines().nth(1).unwrap();
