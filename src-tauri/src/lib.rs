@@ -75,6 +75,9 @@ struct DownloadState {
     tasks: Mutex<HashMap<String, oneshot::Sender<()>>>,
 }
 
+const DOWNLOAD_TAKEN_OVER: &str =
+    "DOWNLOAD_SERVICE_TAKEN_OVER: 下载数据已由 Aria2 服务接管";
+
 impl DownloadState {
     fn new(db_path: PathBuf, next_id: u64) -> Self {
         Self {
@@ -204,6 +207,7 @@ fn get_default_download_dir() -> Result<String, String> {
 async fn list_download_tasks(
     state: State<'_, DownloadTasks>,
 ) -> Result<Vec<DownloadTaskRecord>, String> {
+    ensure_legacy_download_owner(&state.db_path)?;
     let db_path = state.db_path.clone();
     tauri::async_runtime::spawn_blocking(move || load_download_tasks(&db_path))
         .await
@@ -216,6 +220,7 @@ async fn start_download(
     app: AppHandle,
     state: State<'_, DownloadTasks>,
 ) -> Result<DownloadStarted, String> {
+    ensure_legacy_download_owner(&state.db_path)?;
     let url = request.url.trim().to_string();
     if url.is_empty() {
         return Err("请输入下载链接".to_string());
@@ -401,6 +406,7 @@ async fn start_download(
 
 #[tauri::command]
 async fn cancel_download(id: String, state: State<'_, DownloadTasks>) -> Result<(), String> {
+    ensure_legacy_download_owner(&state.db_path)?;
     let mut tasks = state.tasks.lock().await;
     if let Some(cancel_tx) = tasks.remove(&id) {
         let _ = cancel_tx.send(());
@@ -412,6 +418,7 @@ async fn cancel_download(id: String, state: State<'_, DownloadTasks>) -> Result<
 
 #[tauri::command]
 async fn open_download_folder(id: String, state: State<'_, DownloadTasks>) -> Result<(), String> {
+    ensure_legacy_download_owner(&state.db_path)?;
     let db_path = state.db_path.clone();
     let folder = tauri::async_runtime::spawn_blocking(move || find_download_dir(&db_path, &id))
         .await
@@ -422,6 +429,7 @@ async fn open_download_folder(id: String, state: State<'_, DownloadTasks>) -> Re
 
 #[tauri::command]
 async fn clear_completed_downloads(state: State<'_, DownloadTasks>) -> Result<u64, String> {
+    ensure_legacy_download_owner(&state.db_path)?;
     let db_path = state.db_path.clone();
     tauri::async_runtime::spawn_blocking(move || delete_completed_tasks(&db_path))
         .await
@@ -433,6 +441,7 @@ async fn delete_download_task(
     id: String,
     state: State<'_, DownloadTasks>,
 ) -> Result<(), String> {
+    ensure_legacy_download_owner(&state.db_path)?;
     // Refuse to delete a task that is still active — cancel first.
     let running = state.tasks.lock().await.contains_key(&id);
     if running {
@@ -555,7 +564,7 @@ fn parse_complete_line(line: &str) -> Option<String> {
 
 #[cfg(test)]
 mod parse_complete_line_tests {
-    use super::parse_complete_line;
+    use super::{ensure_legacy_download_owner, parse_complete_line, DOWNLOAD_TAKEN_OVER};
 
     #[test]
     fn extracts_absolute_path_from_standard_notice() {
@@ -582,6 +591,33 @@ mod parse_complete_line_tests {
     fn returns_none_when_notice_is_not_download_complete() {
         let line = "12/25 15:23:11 [NOTICE] IPv4 dht: listening on UDP port 6881";
         assert!(parse_complete_line(line).is_none());
+    }
+
+    #[test]
+    fn legacy_download_owner_remains_active_without_a_takeover_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("aria2-tasks.sqlite3");
+
+        assert_eq!(ensure_legacy_download_owner(&db_path), Ok(()));
+    }
+
+    #[test]
+    fn legacy_download_owner_rejects_migrating_and_owned_markers() {
+        for state in ["migrating", "owned"] {
+            let directory = tempfile::tempdir().unwrap();
+            let service_directory = directory.path().join("aria2");
+            std::fs::create_dir_all(&service_directory).unwrap();
+            std::fs::write(
+                service_directory.join("takeover.json"),
+                format!(r#"{{"protocolVersion":1,"state":"{state}"}}"#),
+            )
+            .unwrap();
+
+            assert_eq!(
+                ensure_legacy_download_owner(&directory.path().join("aria2-tasks.sqlite3")),
+                Err(DOWNLOAD_TAKEN_OVER.to_string())
+            );
+        }
     }
 }
 
@@ -642,11 +678,38 @@ fn create_download_state(app: &AppHandle) -> Result<DownloadTasks, String> {
     fs::create_dir_all(&app_data_dir).map_err(|error| format!("创建应用数据目录失败：{error}"))?;
 
     let db_path = app_data_dir.join("aria2-tasks.sqlite3");
+    let service_data_dir = app_data_dir.join("aria2");
+    fs::create_dir_all(&service_data_dir)
+        .map_err(|error| format!("创建 Aria2 服务数据目录失败：{error}"))?;
+    fs::write(service_data_dir.join("takeover-capability-v1"), b"1\n")
+        .map_err(|error| format!("写入 Aria2 接管能力标记失败：{error}"))?;
+    if ensure_legacy_download_owner(&db_path).is_err() {
+        return Ok(Arc::new(DownloadState::new(db_path, 1)));
+    }
     init_database(&db_path)?;
     mark_interrupted_tasks(&db_path)?;
     let next_id = next_download_id(&db_path)?;
 
     Ok(Arc::new(DownloadState::new(db_path, next_id)))
+}
+
+fn ensure_legacy_download_owner(db_path: &Path) -> Result<(), String> {
+    let marker = db_path
+        .parent()
+        .ok_or_else(|| "下载数据库路径缺少父目录".to_string())?
+        .join("aria2")
+        .join("takeover.json");
+    if !marker.exists() {
+        return Ok(());
+    }
+    let value: serde_json::Value = serde_json::from_slice(
+        &fs::read(&marker).map_err(|error| format!("读取 Aria2 接管标记失败：{error}"))?,
+    )
+    .map_err(|error| format!("解析 Aria2 接管标记失败：{error}"))?;
+    match value.get("state").and_then(serde_json::Value::as_str) {
+        Some("migrating" | "owned") => Err(DOWNLOAD_TAKEN_OVER.to_string()),
+        _ => Ok(()),
+    }
 }
 
 fn init_database(db_path: &Path) -> Result<(), String> {
@@ -762,6 +825,7 @@ fn insert_download_task(
     download_dir: &str,
     file_name: Option<&str>,
 ) -> Result<(), String> {
+    ensure_legacy_download_owner(db_path)?;
     let connection =
         Connection::open(db_path).map_err(|error| format!("打开任务数据库失败：{error}"))?;
     connection
@@ -779,6 +843,7 @@ fn insert_download_task(
 }
 
 fn load_download_tasks(db_path: &Path) -> Result<Vec<DownloadTaskRecord>, String> {
+    ensure_legacy_download_owner(db_path)?;
     let connection =
         Connection::open(db_path).map_err(|error| format!("打开任务数据库失败：{error}"))?;
     let mut statement = connection
@@ -822,6 +887,7 @@ fn load_download_tasks(db_path: &Path) -> Result<Vec<DownloadTaskRecord>, String
 }
 
 fn delete_completed_tasks(db_path: &Path) -> Result<u64, String> {
+    ensure_legacy_download_owner(db_path)?;
     let connection =
         Connection::open(db_path).map_err(|error| format!("打开任务数据库失败：{error}"))?;
     let count = connection
@@ -831,6 +897,7 @@ fn delete_completed_tasks(db_path: &Path) -> Result<u64, String> {
 }
 
 fn delete_download_task_by_id(db_path: &Path, id: &str) -> Result<(), String> {
+    ensure_legacy_download_owner(db_path)?;
     let connection =
         Connection::open(db_path).map_err(|error| format!("打开任务数据库失败：{error}"))?;
     connection
@@ -840,6 +907,7 @@ fn delete_download_task_by_id(db_path: &Path, id: &str) -> Result<(), String> {
 }
 
 fn find_download_dir(db_path: &Path, id: &str) -> Result<String, String> {
+    ensure_legacy_download_owner(db_path)?;
     let connection =
         Connection::open(db_path).map_err(|error| format!("打开任务数据库失败：{error}"))?;
     connection
@@ -1045,6 +1113,9 @@ fn open_folder(folder: &str) -> Result<(), String> {
 }
 
 fn persist_download_event(db_path: &Path, payload: &DownloadEventPayload) {
+    if ensure_legacy_download_owner(db_path).is_err() {
+        return;
+    }
     let Ok(connection) = Connection::open(db_path) else {
         return;
     };
