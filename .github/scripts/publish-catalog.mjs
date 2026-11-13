@@ -461,6 +461,7 @@ export async function inspectPluginPackage({
     if (!verifyManifestSignature(manifest, signature, publicKeyFromRaw(publisherKey.publicKey))) {
       throw new Error('Plugin manifest signature is invalid');
     }
+    requireApplicationPackageLayout(application, manifest);
 
     const actualFiles = (await collectFiles(extracted))
       .filter((entry) => entry !== 'manifest.json' && entry !== 'manifest.sig');
@@ -486,6 +487,32 @@ export async function inspectPluginPackage({
     };
   } finally {
     await rm(extracted, { recursive: true, force: true });
+  }
+}
+
+function requireApplicationPackageLayout(application, manifest) {
+  if (application.appId !== 'com.attson.aria2') return;
+
+  const windows = manifest.target.os === 'windows';
+  const serviceEntry = `native/ataria2-service${windows ? '.exe' : ''}`;
+  requireEqual(manifest.nativeService?.entry, serviceEntry, 'Aria2 native service entry');
+  const expectedFiles = [
+    'LICENSE',
+    'licenses/aria2-COPYING',
+    ...(windows ? ['licenses/aria2-LICENSE.OpenSSL'] : []),
+    `native/aria2c${windows ? '.exe' : ''}`,
+    serviceEntry,
+    'ui/index.html'
+  ].sort();
+  const actualFiles = Object.keys(manifest.files).sort();
+  const missingFiles = expectedFiles.filter((relative) => !manifest.files[relative]);
+  const unexpectedFiles = actualFiles.filter(
+    (relative) => !expectedFiles.includes(relative) && !relative.startsWith('ui/')
+  );
+  if (missingFiles.length > 0 || unexpectedFiles.length > 0) {
+    throw new Error(
+      `Aria2 package files mismatch: missing ${JSON.stringify(missingFiles)}, unexpected ${JSON.stringify(unexpectedFiles)}`
+    );
   }
 }
 

@@ -115,6 +115,25 @@
         "host.http.stream",
         "host.http.data"
       ]
+    },
+    {
+      "appId": "com.attson.aria2",
+      "slug": "aria2",
+      "repository": "attsontools/ataria2",
+      "artifactPrefix": "AT.Aria2",
+      "name": "Aria2 下载",
+      "description": "多连接下载与任务历史",
+      "publisherId": "com.attson",
+      "publisherKeySecret": "ATARIA2_PUBLISHER_KEY_ID",
+      "icon": "download",
+      "hostApi": {
+        "min": "2.0.0",
+        "max": "2.x"
+      },
+      "permissions": [
+        "host.theme.read",
+        "host.download.tasks"
+      ]
     }
   ]
 }

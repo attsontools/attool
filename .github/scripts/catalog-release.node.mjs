@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash, generateKeyPairSync } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { readdirSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -35,9 +35,11 @@ const catalogKeyId = 'catalog-2026-01';
 const publisherKeyId = 'attson-codec-2026-01';
 const textPublisherKeyId = 'attson-text-2026-01';
 const httpPublisherKeyId = 'attson-http-2026-01';
+const aria2PublisherKeyId = 'attson-aria2-2026-01';
 const codecApplication = await loadCatalogApplication('com.attson.codec');
 const textApplication = await loadCatalogApplication('com.attson.text');
 const httpApplication = await loadCatalogApplication('com.attson.http');
+const aria2Application = await loadCatalogApplication('com.attson.aria2');
 
 const root = {
   schemaVersion: 1,
@@ -51,7 +53,8 @@ const root = {
     keys: [
       trustKey(publisherKeyId),
       trustKey(textPublisherKeyId),
-      trustKey(httpPublisherKeyId)
+      trustKey(httpPublisherKeyId),
+      trustKey(aria2PublisherKeyId)
     ]
   }]
 };
@@ -83,6 +86,17 @@ const previousCatalog = {
 };
 
 describe('Catalog release generation', () => {
+  it('pins the plugin SDK contract used by Catalog to an immutable commit', async () => {
+    const packageJson = JSON.parse(await readFile('package.json', 'utf8'));
+    const lockfile = await readFile('pnpm-lock.yaml', 'utf8');
+    const dependency = packageJson.devDependencies['@attson/plugin-sdk'];
+
+    assert.match(dependency, /^github:attsontools\/attool-plugin-sdk#[0-9a-f]{40}$/);
+    assert.ok(lockfile.includes(
+      `codeload.github.com/attsontools/attool-plugin-sdk/tar.gz/${dependency.split('#')[1]}`
+    ));
+  });
+
   it('loads JSON release policy by app ID and slug', async () => {
     const expected = {
       appId: 'com.attson.json',
@@ -181,6 +195,25 @@ describe('Catalog release generation', () => {
 
     assert.deepEqual(httpApplication, expected);
     assert.deepEqual(await loadCatalogApplicationBySlug('http'), expected);
+  });
+
+  it('loads Aria2 Host API 2.x release policy from the application registry', async () => {
+    const expected = {
+      appId: 'com.attson.aria2',
+      slug: 'aria2',
+      repository: 'attsontools/ataria2',
+      artifactPrefix: 'AT.Aria2',
+      name: 'Aria2 下载',
+      description: '多连接下载与任务历史',
+      publisherId: 'com.attson',
+      publisherKeySecret: 'ATARIA2_PUBLISHER_KEY_ID',
+      icon: 'download',
+      hostApi: { min: '2.0.0', max: '2.x' },
+      permissions: ['host.theme.read', 'host.download.tasks']
+    };
+
+    assert.deepEqual(await loadCatalogApplication('com.attson.aria2'), expected);
+    assert.deepEqual(await loadCatalogApplicationBySlug('aria2'), expected);
   });
 
   it('rejects ambiguous or out-of-scope application registry entries', async () => {
@@ -536,6 +569,124 @@ describe('Catalog release generation', () => {
     }
   });
 
+  it('requires the signed Aria2 service, runtime, and license layout', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'attool-aria2-catalog-test-'));
+    const publisherKeys = generateKeyPairSync('ed25519');
+    const packageRoot = structuredClone(root);
+    packageRoot.publishers[0].keys[3].publicKey = rawPublicKey(publisherKeys.publicKey);
+    try {
+      const packagePath = await createPluginPackage(
+        directory,
+        publisherKeys.privateKey,
+        'linux',
+        'x86_64',
+        {
+          application: aria2Application,
+          publisherKeyId: aria2PublisherKeyId
+        }
+      );
+      const inspected = await inspectPluginPackage({
+        packagePath,
+        application: aria2Application,
+        root: packageRoot,
+        publishedAt: generatedAt,
+        expectedVersion: version,
+        expectedPublisherKeyId: aria2PublisherKeyId
+      });
+
+      assert.equal(inspected.manifest.nativeService.entry, 'native/ataria2-service');
+      assert.deepEqual(Object.keys(inspected.manifest.files).sort(), [
+        'LICENSE',
+        'licenses/aria2-COPYING',
+        'native/aria2c',
+        'native/ataria2-service',
+        'ui/assets/app.js',
+        'ui/index.html'
+      ]);
+
+      const incompletePackage = await createPluginPackage(
+        directory,
+        publisherKeys.privateKey,
+        'linux',
+        'x86_64',
+        {
+          application: aria2Application,
+          publisherKeyId: aria2PublisherKeyId,
+          omitFile: 'licenses/aria2-COPYING'
+        }
+      );
+      await assert.rejects(
+        () => inspectPluginPackage({
+          packagePath: incompletePackage,
+          application: aria2Application,
+          root: packageRoot,
+          publishedAt: generatedAt,
+          expectedVersion: version,
+          expectedPublisherKeyId: aria2PublisherKeyId
+        }),
+        /Aria2 package files/
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('requires Windows Aria2 executables and the OpenSSL notice', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'attool-aria2-windows-catalog-test-'));
+    const publisherKeys = generateKeyPairSync('ed25519');
+    const packageRoot = structuredClone(root);
+    packageRoot.publishers[0].keys[3].publicKey = rawPublicKey(publisherKeys.publicKey);
+    try {
+      const packagePath = await createPluginPackage(
+        directory,
+        publisherKeys.privateKey,
+        'windows',
+        'x86_64',
+        {
+          application: aria2Application,
+          publisherKeyId: aria2PublisherKeyId
+        }
+      );
+      const inspected = await inspectPluginPackage({
+        packagePath,
+        application: aria2Application,
+        root: packageRoot,
+        publishedAt: generatedAt,
+        expectedVersion: version,
+        expectedPublisherKeyId: aria2PublisherKeyId
+      });
+
+      assert.equal(inspected.manifest.nativeService.entry, 'native/ataria2-service.exe');
+      assert.ok(inspected.manifest.files['native/aria2c.exe']);
+      assert.ok(inspected.manifest.files['licenses/aria2-LICENSE.OpenSSL']);
+
+      const incompletePackage = await createPluginPackage(
+        directory,
+        publisherKeys.privateKey,
+        'windows',
+        'x86_64',
+        {
+          application: aria2Application,
+          publisherKeyId: aria2PublisherKeyId,
+          omitFile: 'licenses/aria2-LICENSE.OpenSSL'
+        }
+      );
+      await assert.rejects(
+        () => inspectPluginPackage({
+          packagePath: incompletePackage,
+          application: aria2Application,
+          root: packageRoot,
+          publishedAt: generatedAt,
+          expectedVersion: version,
+          expectedPublisherKeyId: aria2PublisherKeyId
+        }),
+        /Aria2 package files/
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it('verifies the offline Root and previous Catalog before publishing', () => {
     const rootKeys = generateKeyPairSync('ed25519');
     const catalogKeys = generateKeyPairSync('ed25519');
@@ -842,10 +993,12 @@ async function createPluginPackage(
   arch = 'x86_64',
   {
     application = codecApplication,
-    publisherKeyId: manifestPublisherKeyId = publisherKeyId
+    publisherKeyId: manifestPublisherKeyId = publisherKeyId,
+    omitFile
   } = {}
 ) {
   const stage = path.join(directory, 'stage');
+  await rm(stage, { recursive: true, force: true });
   const ui = path.join(stage, 'ui');
   await mkdir(ui, { recursive: true });
   const content = Buffer.from(`<main>${application.name}</main>`);
@@ -855,15 +1008,35 @@ async function createPluginPackage(
   if (application.hostApi.max === '2.x') {
     const native = path.join(stage, 'native');
     const service = Buffer.from(`service-${os}-${arch}-${version}`);
+    const serviceName = application.appId === 'com.attson.aria2'
+      ? `ataria2-service${os === 'windows' ? '.exe' : ''}`
+      : 'athttp-service';
     await mkdir(native, { recursive: true });
-    await writeFile(path.join(native, 'athttp-service'), service);
-    files['native/athttp-service'] = createHash('sha256').update(service).digest('hex');
+    await writeFile(path.join(native, serviceName), service);
+    files[`native/${serviceName}`] = createHash('sha256').update(service).digest('hex');
     nativeService = {
-      entry: 'native/athttp-service',
+      entry: `native/${serviceName}`,
       version,
-      sha256: files['native/athttp-service'],
+      sha256: files[`native/${serviceName}`],
       protocolVersion: 1
     };
+  }
+  if (application.appId === 'com.attson.aria2') {
+    const payloads = {
+      LICENSE: Buffer.from('AT Aria2 license fixture'),
+      'licenses/aria2-COPYING': Buffer.from('aria2 GPL fixture'),
+      ...(os === 'windows'
+        ? { 'licenses/aria2-LICENSE.OpenSSL': Buffer.from('OpenSSL notice fixture') }
+        : {}),
+      [`native/aria2c${os === 'windows' ? '.exe' : ''}`]: Buffer.from(`aria2-${os}-${arch}`),
+      'ui/assets/app.js': Buffer.from('console.log("aria2 fixture")')
+    };
+    for (const [relative, bytes] of Object.entries(payloads)) {
+      if (relative === omitFile) continue;
+      await mkdir(path.dirname(path.join(stage, relative)), { recursive: true });
+      await writeFile(path.join(stage, relative), bytes);
+      files[relative] = createHash('sha256').update(bytes).digest('hex');
+    }
   }
   const manifest = parseManifest({
     schemaVersion: 1,
@@ -884,20 +1057,28 @@ async function createPluginPackage(
     directory,
     `${application.artifactPrefix}_${version}_${os}_${arch}.atpkg`
   );
+  await rm(packagePath, { force: true });
   zipPackage(stage, packagePath);
   return packagePath;
 }
 
 function zipPackage(stage, output) {
-  const entries = ['manifest.json', 'manifest.sig', 'ui/index.html'];
-  if (existsSync(path.join(stage, 'native', 'athttp-service'))) {
-    entries.push('native/athttp-service');
-  }
+  const entries = collectPackageEntries(stage);
   const zipped = spawnSync('zip', ['-X', '-D', '-q', output, ...entries], {
     cwd: stage,
     encoding: 'utf8'
   });
   if (zipped.status !== 0) throw new Error(zipped.stderr || 'zip failed');
+}
+
+function collectPackageEntries(directory, prefix = '') {
+  const entries = [];
+  for (const name of readdirSync(path.join(directory, prefix), { withFileTypes: true })) {
+    const relative = path.posix.join(prefix, name.name);
+    if (name.isDirectory()) entries.push(...collectPackageEntries(directory, relative));
+    else entries.push(relative);
+  }
+  return entries.sort();
 }
 
 function zipPackageWithDuplicate(stage, output) {
