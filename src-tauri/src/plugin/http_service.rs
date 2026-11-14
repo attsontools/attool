@@ -924,6 +924,7 @@ fn data_directory_for(app_data_root: &Path, app_id: &str) -> Result<PathBuf, Nat
         "com.attson.http" => app_data_root.join("http"),
         "com.attson.aria2" => app_data_root.join("aria2"),
         "com.attson.template" => app_data_root.join("ecommerce"),
+        "com.attson.clipboard" => app_data_root.join("clipboard"),
         _ => app_data_root.join("native-services").join(app_id),
     })
 }
@@ -1615,6 +1616,10 @@ mod tests {
         assert_eq!(
             data_directory_for(root, "com.attson.template").unwrap(),
             root.join("ecommerce")
+        );
+        assert_eq!(
+            data_directory_for(root, "com.attson.clipboard").unwrap(),
+            root.join("clipboard")
         );
         assert_eq!(
             data_directory_for(root, "com.example.service").unwrap(),

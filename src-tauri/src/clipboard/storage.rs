@@ -1,4 +1,11 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use chrono::Local;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -6,23 +13,47 @@ use rusqlite::{params, Connection, OptionalExtension};
 use super::models::{
     normalize_clipboard_shortcut, ClipboardHistoryItem, ClipboardHistorySettings, ClipboardItemKind,
 };
+use super::owner::{LegacyClipboardOwner, CLIPBOARD_TAKEN_OVER};
 
 #[derive(Clone, Debug)]
 pub struct ClipboardStore {
     root_dir: PathBuf,
     db_path: PathBuf,
+    initialized: Arc<AtomicBool>,
 }
 
 impl ClipboardStore {
     pub fn new(root_dir: PathBuf) -> Result<Self, String> {
-        fs::create_dir_all(root_dir.join("assets"))
-            .map_err(|error| format!("创建剪贴板目录失败：{error}"))?;
         let store = Self {
             db_path: root_dir.join("clipboard_history.sqlite3"),
             root_dir,
+            initialized: Arc::new(AtomicBool::new(false)),
         };
-        store.init_database()?;
+        store.ensure_initialized()?;
         Ok(store)
+    }
+
+    pub fn new_for_legacy(root_dir: PathBuf, owner: &LegacyClipboardOwner) -> Result<Self, String> {
+        match owner.enter() {
+            Ok(_guard) => Self::new(root_dir),
+            Err(error) if error == CLIPBOARD_TAKEN_OVER => Ok(Self {
+                db_path: root_dir.join("clipboard_history.sqlite3"),
+                root_dir,
+                initialized: Arc::new(AtomicBool::new(false)),
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn ensure_initialized(&self) -> Result<(), String> {
+        if self.initialized.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        fs::create_dir_all(self.root_dir.join("assets"))
+            .map_err(|error| format!("创建剪贴板目录失败：{error}"))?;
+        self.init_database()?;
+        self.initialized.store(true, Ordering::Release);
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -441,7 +472,10 @@ fn fnv1a64_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clipboard::owner::LegacyClipboardOwner;
+    use fs2::FileExt;
     use std::fs;
+    use std::fs::OpenOptions;
 
     fn temp_store() -> ClipboardStore {
         let dir = std::env::temp_dir().join(format!(
@@ -449,6 +483,53 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         ClipboardStore::new(dir).expect("store")
+    }
+
+    #[test]
+    fn legacy_startup_does_not_initialize_data_after_service_takeover() {
+        let dir = std::env::temp_dir().join(format!(
+            "attool-clipboard-owned-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let owner = LegacyClipboardOwner::new(dir.clone()).unwrap();
+        fs::write(
+            dir.join("clipboard-takeover.json"),
+            br#"{"protocolVersion":1,"appId":"com.attson.clipboard","schemaVersion":1,"state":"owned","nonce":"n"}"#,
+        )
+        .unwrap();
+
+        ClipboardStore::new_for_legacy(dir.clone(), &owner).unwrap();
+
+        assert!(!dir.join("clipboard_history.sqlite3").exists());
+        assert!(!dir.join("assets").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_store_initializes_after_an_interrupted_takeover_releases_ownership() {
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("clipboard");
+        let owner = LegacyClipboardOwner::new(dir.clone()).unwrap();
+        let service_lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(dir.join("clipboard-owner.lock"))
+            .unwrap();
+        service_lock.lock_exclusive().unwrap();
+        fs::write(
+            dir.join("clipboard-takeover.json"),
+            br#"{"protocolVersion":1,"appId":"com.attson.clipboard","schemaVersion":1,"state":"migrating","nonce":"service"}"#,
+        )
+        .unwrap();
+        let store = ClipboardStore::new_for_legacy(dir.clone(), &owner).unwrap();
+        drop(service_lock);
+
+        let _guard = owner.enter().unwrap();
+        store.ensure_initialized().unwrap();
+
+        assert!(dir.join("clipboard_history.sqlite3").is_file());
+        assert!(dir.join("assets").is_dir());
     }
 
     #[test]

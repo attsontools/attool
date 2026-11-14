@@ -1381,28 +1381,43 @@ pub fn run() {
                 .app_data_dir()
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?
                 .join("clipboard");
-            let clipboard_store = clipboard::storage::ClipboardStore::new(clipboard_dir)
+            let clipboard_owner = clipboard::owner::LegacyClipboardOwner::new(clipboard_dir.clone())
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+            let clipboard_store = clipboard::storage::ClipboardStore::new_for_legacy(
+                clipboard_dir,
+                &clipboard_owner,
+            )
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
             let clipboard_watcher_state = clipboard::watcher::ClipboardWatcherState::new();
             let clipboard_store_for_watcher = clipboard_store.clone();
             app.manage(clipboard_watcher_state.clone());
-            clipboard::watcher::start_clipboard_watcher(
-                app.handle().clone(),
-                clipboard_store_for_watcher,
-                clipboard_watcher_state,
-            );
+            app.manage(clipboard_owner.clone());
             let shortcut_errors = ShortcutRegisterState::default();
-            let clipboard_shortcut = clipboard_store
-                .load_settings()
-                .map(|s| s.shortcut)
-                .unwrap_or_default();
-            if let Err(error) =
-                clipboard::watcher::register_clipboard_shortcut(app.handle(), &clipboard_shortcut)
-            {
-                eprintln!("{error}");
-                if let Ok(mut slot) = shortcut_errors.clipboard.lock() {
-                    *slot = Some(error);
+            if !clipboard_owner.is_permanently_taken_over() {
+                if let Ok(_owner_guard) = clipboard_owner.enter() {
+                    clipboard_store.ensure_initialized().map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::Other, error)
+                    })?;
+                    let clipboard_shortcut = clipboard_store
+                        .load_settings()
+                        .map(|settings| settings.shortcut)
+                        .unwrap_or_default();
+                    if let Err(error) = clipboard::watcher::register_clipboard_shortcut(
+                        app.handle(),
+                        &clipboard_shortcut,
+                    ) {
+                        eprintln!("{error}");
+                        if let Ok(mut slot) = shortcut_errors.clipboard.lock() {
+                            *slot = Some(error);
+                        }
+                    }
                 }
+                clipboard::watcher::start_clipboard_watcher(
+                    app.handle().clone(),
+                    clipboard_store_for_watcher,
+                    clipboard_watcher_state,
+                    clipboard_owner,
+                );
             }
             if let Err(error) = imaging::capture::register_capture_shortcut(app.handle()) {
                 eprintln!("{error}");
