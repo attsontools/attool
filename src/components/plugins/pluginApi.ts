@@ -7,6 +7,7 @@ import type {
   InspectedPluginPackage,
   PluginApi,
   PluginHistoryRecord,
+  NativeServiceStatus,
   PluginOperationSnapshot,
   CatalogInstallResult
 } from './types';
@@ -18,6 +19,10 @@ export function createPluginApi(): PluginApi {
     installPackage: (path) =>
       invoke<InstalledPlugin>('plugin_install_package', { path }),
     listInstalled: () => invoke<InstalledPlugin[]>('plugin_list_installed'),
+    listNativeServiceStatuses: () =>
+      invoke<NativeServiceStatus[]>('plugin_list_native_service_statuses'),
+    listenNativeServiceStatuses: async (listener) =>
+      listen<NativeServiceStatus>('plugin://native-service-status', (event) => listener(event.payload)),
     listHistory: () => invoke<PluginHistoryRecord[]>('plugin_list_history'),
     listCatalog: () => invoke<CatalogSnapshot | null>('plugin_catalog_list'),
     refreshCatalog: () => invoke<CatalogSnapshot>('plugin_catalog_refresh'),

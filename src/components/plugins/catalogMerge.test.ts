@@ -11,6 +11,7 @@ const installedCodec: InstalledPlugin = {
   publisherName: 'Attson',
   publisherKeyId: 'codec-2026-01',
   entry: 'ui/index.html',
+  windows: {},
   permissions: ['host.theme.read'],
   enabled: true,
   installedAt: '2026-11-10T00:00:00Z'

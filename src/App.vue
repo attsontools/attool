@@ -55,8 +55,18 @@ const ApplicationManager = defineAsyncComponent(
   () => import('./components/plugins/ApplicationManager.vue')
 );
 const PluginFrame = defineAsyncComponent(() => import('./components/plugins/PluginFrame.vue'));
+const PluginAuxiliaryWindow = defineAsyncComponent(
+  () => import('./components/plugins/PluginAuxiliaryWindow.vue')
+);
 
 const currentWindow = getCurrentWindow();
+const pluginAuxiliaryIdentity = (() => {
+  const query = new URLSearchParams(window.location.search);
+  const appId = query.get('pluginAppId');
+  const windowId = query.get('pluginWindowId');
+  return appId && windowId ? { appId, windowId } : null;
+})();
+const isPluginAuxiliaryWindow = pluginAuxiliaryIdentity !== null;
 const isClipboardHistoryWindow = currentWindow.label === 'clipboard-history';
 const isClipboardPreviewWindow = currentWindow.label === 'clipboard-preview';
 const isCaptureOverlayWindow = currentWindow.label === 'capture-overlay';
@@ -123,7 +133,12 @@ let unlistenCaptureFail: Promise<UnlistenFn> | undefined;
 let unlistenRecordingCompleted: Promise<UnlistenFn> | undefined;
 
 onMounted(() => {
-  if (isClipboardHistoryWindow || isCaptureOverlayWindow || isCapturePinWindow) return;
+  if (
+    isPluginAuxiliaryWindow
+    || isClipboardHistoryWindow
+    || isCaptureOverlayWindow
+    || isCapturePinWindow
+  ) return;
 
   void pluginStore.load().then(() => {
     if (!selectedToolId.value && lastToolId.value?.startsWith('plugin:')) {
@@ -433,9 +448,14 @@ async function clearCompleted() {
   <n-config-provider :theme="naiveTheme" :theme-overrides="naiveOverrides">
     <n-message-provider>
       <ShortcutErrorNotifier
-        v-if="!isCaptureOverlayWindow && !isCapturePinWindow && !isClipboardHistoryWindow && !isClipboardPreviewWindow"
+        v-if="!isPluginAuxiliaryWindow && !isCaptureOverlayWindow && !isCapturePinWindow && !isClipboardHistoryWindow && !isClipboardPreviewWindow"
       />
-      <CaptureOverlay v-if="isCaptureOverlayWindow" />
+      <PluginAuxiliaryWindow
+        v-if="pluginAuxiliaryIdentity"
+        :app-id="pluginAuxiliaryIdentity.appId"
+        :window-id="pluginAuxiliaryIdentity.windowId"
+      />
+      <CaptureOverlay v-else-if="isCaptureOverlayWindow" />
       <CapturePinWindow v-else-if="isCapturePinWindow" />
       <ClipboardHistoryWindow v-else-if="isClipboardHistoryWindow" />
       <ClipboardPreviewWindow v-else-if="isClipboardPreviewWindow" />

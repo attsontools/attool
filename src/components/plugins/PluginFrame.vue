@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import { NButton, NSpin, useMessage } from 'naive-ui';
@@ -11,14 +12,19 @@ import {
   createPluginHostSession,
   type HostFileSaveRequest,
   type HostTemplateFilePickRequest,
+  type HostUiOpenRequest,
   type PluginHostSession
 } from './pluginHost';
+import { createLatestActivationDispatcher } from './auxiliaryActivation';
 import { buildPluginFrameDocument, pluginAssetBaseUrl } from './pluginFrameDocument';
 import type { InstalledPlugin } from './types';
 
 const props = defineProps<{
   app: InstalledPlugin;
   theme: ThemeName;
+  entry?: string;
+  windowId?: string;
+  auxiliary?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -34,15 +40,41 @@ const errorMessage = ref('');
 const reloadRevision = ref(0);
 const serviceReady = ref(false);
 const frameHtml = ref('');
+const frameEntry = computed(() => props.entry ?? props.app.entry);
 let session: PluginHostSession | null = null;
 let handshakeTimer: ReturnType<typeof setTimeout> | null = null;
 let handlingFailure = false;
 let nativeServiceEventUnlisten: UnlistenFn | null = null;
+let auxiliaryActivationUnlisten: UnlistenFn | null = null;
 let disposed = false;
+
+type AuxiliaryActivation = {
+  activationId: string;
+  appId: string;
+  windowId: string;
+  payload: unknown;
+};
+
+const activationDispatcher = createLatestActivationDispatcher<AuxiliaryActivation>({
+  fetchLatest: () => invoke<AuxiliaryActivation | null>(
+    'plugin_get_auxiliary_activation',
+    { appId: props.app.appId, windowId: props.windowId }
+  ),
+  deliver: (activation) => session?.notifyActivated(activation.payload),
+  acknowledge: async (activation) => {
+    await invoke<boolean>('plugin_ack_auxiliary_activation', {
+      appId: props.app.appId,
+      windowId: props.windowId,
+      activationId: activation.activationId
+    });
+  },
+  onError: () => message.error('无法同步应用窗口激活状态')
+});
 
 function clearSession() {
   session?.terminate();
   session = null;
+  activationDispatcher.reset();
   if (handshakeTimer) clearTimeout(handshakeTimer);
   handshakeTimer = null;
 }
@@ -105,20 +137,45 @@ async function prepareFrame() {
       }
       nativeServiceEventUnlisten = unlisten;
     }
+    if (props.auxiliary && props.windowId && !auxiliaryActivationUnlisten) {
+      const unlisten = await listen<AuxiliaryActivation>(
+        'plugin://auxiliary-activation',
+        ({ payload }) => {
+          if (payload.appId !== props.app.appId || payload.windowId !== props.windowId) return;
+          activationDispatcher.enqueue(payload);
+        }
+      );
+      if (disposed) {
+        unlisten();
+        return;
+      }
+      auxiliaryActivationUnlisten = unlisten;
+    }
     if (props.app.nativeService) {
       await invoke('plugin_connect_native_service', { appId: props.app.appId });
     }
-    const html = await invoke<string>('plugin_read_entry_html', { appId: props.app.appId });
+    const html = await invoke<string>('plugin_read_entry_html', {
+      appId: props.app.appId,
+      entry: frameEntry.value
+    });
     if (disposed) return;
     frameHtml.value = `${buildPluginFrameDocument(
       html,
-      pluginAssetBaseUrl('attool-plugin', props.app.appId, props.app.entry)
+      pluginAssetBaseUrl('attool-plugin', props.app.appId, frameEntry.value)
     )}\n<!-- reload:${reloadRevision.value} -->`;
     state.value = 'loading';
     serviceReady.value = true;
   } catch (reason) {
     await handleLaunchFailure(serviceErrorMessage(reason));
   }
+}
+
+async function openAuxiliaryWindow(input: HostUiOpenRequest) {
+  return invoke('plugin_open_auxiliary_window', {
+    appId: props.app.appId,
+    windowId: input.windowId,
+    payload: input.payload
+  });
 }
 
 function handleLoad() {
@@ -135,6 +192,7 @@ function handleLoad() {
   session = createPluginHostSession({
     app: props.app,
     port: channel.port1,
+    windowId: props.windowId,
     theme: () => props.theme,
     notify: async ({ title, message: body, kind }) => {
       message[kind](title ? `${title}: ${body}` : body);
@@ -145,6 +203,10 @@ function handleLoad() {
     pickTemplateFiles,
     pickTemplateDirectory,
     copyText: writeText,
+    openAuxiliaryWindow,
+    closeAuxiliaryWindow: props.auxiliary
+      ? () => getCurrentWindow().close()
+      : undefined,
     requestNativeService: props.app.nativeService
       ? (method, params) => invoke('plugin_native_service_request', {
           appId: props.app.appId,
@@ -155,7 +217,12 @@ function handleLoad() {
     onHandshake: () => {
       if (handshakeTimer) clearTimeout(handshakeTimer);
       handshakeTimer = null;
-      void confirmLaunch();
+      if (props.auxiliary) {
+        state.value = 'ready';
+        void activationDispatcher.setReady();
+      } else {
+        void confirmLaunch();
+      }
     }
   });
   contentWindow.postMessage(
@@ -189,6 +256,10 @@ async function confirmLaunch() {
 async function handleLaunchFailure(reason: string) {
   if (handlingFailure) return;
   handlingFailure = true;
+  if (props.auxiliary) {
+    fail(reason);
+    return;
+  }
   try {
     const rolledBack = await invoke<InstalledPlugin | null>('plugin_rollback_plugin_launch', {
       appId: props.app.appId,
@@ -251,16 +322,19 @@ onBeforeUnmount(() => {
   clearSession();
   nativeServiceEventUnlisten?.();
   nativeServiceEventUnlisten = null;
+  auxiliaryActivationUnlisten?.();
+  auxiliaryActivationUnlisten = null;
+  activationDispatcher.dispose();
 });
 </script>
 
 <template>
-  <section class="plugin-frame">
+  <section class="plugin-frame" :class="{ auxiliary }">
     <iframe
       v-if="serviceReady"
       ref="frame"
       :srcdoc="frameHtml"
-      :title="app.name"
+      :title="windowId ? `${app.name} ${windowId}` : app.name"
       sandbox="allow-scripts"
       referrerpolicy="no-referrer"
       @load="handleLoad"
@@ -290,6 +364,13 @@ onBeforeUnmount(() => {
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
   background: var(--bg-elevated);
+}
+
+.plugin-frame.auxiliary,
+.plugin-frame.auxiliary iframe {
+  min-height: 100vh;
+  border: 0;
+  border-radius: 0;
 }
 
 iframe {

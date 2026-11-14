@@ -7,10 +7,12 @@ use std::{
     time::Duration as StdDuration,
 };
 
+use chrono::Utc;
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{tcp::OwnedWriteHalf, TcpStream},
@@ -25,27 +27,70 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 trait NativeServiceEventSink: Send + Sync {
-    fn emit(&self, app_id: &str, event: Value);
+    fn emit(&self, app_id: &str, service_version: &str, event: Value);
+
+    fn emit_status(&self, _status: &NativeServiceStatus) {}
 }
 
 struct TauriEventSink(AppHandle);
 
 impl NativeServiceEventSink for TauriEventSink {
-    fn emit(&self, app_id: &str, event: Value) {
-        let _ = self.0.emit_to(
+    fn emit(&self, app_id: &str, service_version: &str, event: Value) {
+        let Some(native_services) = self.0.try_state::<NativeServiceRuntime>() else {
+            eprintln!("cannot route native service event for {app_id}: runtime is unavailable");
+            return;
+        };
+        if !native_services.accepts_event(app_id, service_version) {
+            return;
+        }
+        if let Some(runtime) = self
+            .0
+            .try_state::<super::auxiliary_window::AuxiliaryWindowRuntime>()
+        {
+            runtime.route_native_event(&self.0, app_id, event);
+            return;
+        }
+        if let Err(error) = self.0.emit_to(
             "main",
             "plugin://native-service-event",
             json!({ "appId": app_id, "event": event }),
-        );
+        ) {
+            eprintln!("cannot emit native service event for {app_id}: {error}");
+        }
+    }
+
+    fn emit_status(&self, status: &NativeServiceStatus) {
+        if let Err(error) = self
+            .0
+            .emit_to("main", "plugin://native-service-status", status)
+        {
+            eprintln!(
+                "cannot emit native service status for {}: {error}",
+                status.app_id
+            );
+        }
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeServiceStatus {
+    pub app_id: String,
+    pub state: String,
+    pub error_code: Option<String>,
+    pub message: Option<String>,
+    pub correlation_id: Option<String>,
+    pub updated_at: i64,
+}
+
+#[derive(Clone)]
 pub struct NativeServiceRuntime {
     store: Arc<Mutex<PluginStore>>,
     app_data_root: PathBuf,
     event_sink: Arc<dyn NativeServiceEventSink>,
     clients: Arc<Mutex<HashMap<String, ConnectedService>>>,
     connect_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    statuses: Arc<Mutex<HashMap<String, NativeServiceStatus>>>,
 }
 
 struct ConnectedService {
@@ -79,10 +124,44 @@ impl NativeServiceRuntime {
             event_sink,
             clients: Arc::new(Mutex::new(HashMap::new())),
             connect_locks: Arc::new(Mutex::new(HashMap::new())),
+            statuses: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub async fn connect(&self, app_id: &str) -> Result<(), NativeServiceError> {
+        let correlation_id = Uuid::new_v4().to_string();
+        self.record_status(NativeServiceStatus {
+            app_id: app_id.to_string(),
+            state: "connecting".to_string(),
+            error_code: None,
+            message: None,
+            correlation_id: Some(correlation_id.clone()),
+            updated_at: Utc::now().timestamp_millis(),
+        });
+        let result = self.connect_inner(app_id).await;
+        let status = match &result {
+            Ok(()) => NativeServiceStatus {
+                app_id: app_id.to_string(),
+                state: "connected".to_string(),
+                error_code: None,
+                message: None,
+                correlation_id: Some(correlation_id),
+                updated_at: Utc::now().timestamp_millis(),
+            },
+            Err(error) => NativeServiceStatus {
+                app_id: app_id.to_string(),
+                state: "unavailable".to_string(),
+                error_code: Some(error.code.clone()),
+                message: Some(error.message.clone()),
+                correlation_id: Some(correlation_id),
+                updated_at: Utc::now().timestamp_millis(),
+            },
+        };
+        self.record_status(status);
+        result
+    }
+
+    async fn connect_inner(&self, app_id: &str) -> Result<(), NativeServiceError> {
         let connect_lock = {
             let mut locks = self.connect_locks.lock().map_err(|_| {
                 NativeServiceError::new(
@@ -179,15 +258,7 @@ impl NativeServiceRuntime {
         let mut events = client.subscribe();
         let event_sink = Arc::clone(&self.event_sink);
         let event_app_id = app_id.to_string();
-        tokio::spawn(async move {
-            loop {
-                match events.recv().await {
-                    Ok(event) => event_sink.emit(&event_app_id, event),
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
+        let event_service_version = plugin.version.clone();
         self.clients
             .lock()
             .map_err(|_| {
@@ -204,7 +275,166 @@ impl NativeServiceRuntime {
                     process,
                 },
             );
+        tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(event) => event_sink.emit(&event_app_id, &event_service_version, event),
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
         Ok(())
+    }
+
+    pub async fn start_background_services(&self) -> Vec<(String, Result<(), NativeServiceError>)> {
+        let app_ids = match self.background_app_ids() {
+            Ok(app_ids) => app_ids,
+            Err(error) => return vec![(String::new(), Err(error))],
+        };
+        join_all(app_ids.into_iter().map(|app_id| async move {
+            let result = self.connect(&app_id).await;
+            (app_id, result)
+        }))
+        .await
+    }
+
+    pub async fn disconnect(&self, app_id: &str) -> Result<(), NativeServiceError> {
+        let connect_lock = {
+            let mut locks = self.connect_locks.lock().map_err(|_| {
+                NativeServiceError::new(
+                    "NATIVE_SERVICE_STATE_LOCK_FAILED",
+                    "Native service state lock failed",
+                )
+            })?;
+            Arc::clone(
+                locks
+                    .entry(app_id.to_string())
+                    .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+            )
+        };
+        let _connect_guard = connect_lock.lock().await;
+        let connected = self
+            .clients
+            .lock()
+            .map_err(|_| {
+                NativeServiceError::new(
+                    "NATIVE_SERVICE_STATE_LOCK_FAILED",
+                    "Native service state lock failed",
+                )
+            })?
+            .remove(app_id);
+        let Some(mut connected) = connected else {
+            self.record_disconnected(app_id);
+            return Ok(());
+        };
+        if let Some(process) = connected.process.as_mut() {
+            if let Err(error) = process.terminate() {
+                self.clients
+                    .lock()
+                    .map_err(|_| {
+                        NativeServiceError::new(
+                            "NATIVE_SERVICE_STATE_LOCK_FAILED",
+                            "Native service state lock failed",
+                        )
+                    })?
+                    .insert(app_id.to_string(), connected);
+                return Err(NativeServiceError::new(
+                    "NATIVE_SERVICE_STOP_FAILED",
+                    format!("Cannot stop native service: {error}"),
+                ));
+            }
+        }
+        self.record_disconnected(app_id);
+        Ok(())
+    }
+
+    pub fn statuses(&self) -> Result<Vec<NativeServiceStatus>, NativeServiceError> {
+        self.statuses
+            .lock()
+            .map(|statuses| statuses.values().cloned().collect())
+            .map_err(|_| {
+                NativeServiceError::new(
+                    "NATIVE_SERVICE_STATE_LOCK_FAILED",
+                    "Native service status lock failed",
+                )
+            })
+    }
+
+    pub(crate) fn status_for(&self, app_id: &str) -> Option<NativeServiceStatus> {
+        self.statuses
+            .lock()
+            .ok()
+            .and_then(|statuses| statuses.get(app_id).cloned())
+    }
+
+    fn record_disconnected(&self, app_id: &str) {
+        self.record_status(NativeServiceStatus {
+            app_id: app_id.to_string(),
+            state: "disconnected".to_string(),
+            error_code: None,
+            message: None,
+            correlation_id: None,
+            updated_at: Utc::now().timestamp_millis(),
+        });
+    }
+
+    fn record_status(&self, mut status: NativeServiceStatus) {
+        if let Ok(mut statuses) = self.statuses.lock() {
+            if let Some(current) = statuses.get(&status.app_id) {
+                status.updated_at = status.updated_at.max(current.updated_at.saturating_add(1));
+            }
+            statuses.insert(status.app_id.clone(), status.clone());
+        }
+        self.event_sink.emit_status(&status);
+    }
+
+    pub(super) fn is_connected(&self, app_id: &str) -> bool {
+        self.clients
+            .lock()
+            .ok()
+            .and_then(|clients| {
+                clients
+                    .get(app_id)
+                    .map(|connected| !connected.client.is_disconnected())
+            })
+            .unwrap_or(false)
+    }
+
+    fn background_app_ids(&self) -> Result<Vec<String>, NativeServiceError> {
+        let plugins = self
+            .store
+            .lock()
+            .map_err(|_| {
+                NativeServiceError::new(
+                    "NATIVE_SERVICE_STORE_LOCK_FAILED",
+                    "Plugin store lock failed",
+                )
+            })?
+            .list_enabled()
+            .map_err(|error| NativeServiceError::new(error.code, error.message))?;
+        Ok(plugins
+            .into_iter()
+            .filter(|plugin| {
+                plugin
+                    .native_service
+                    .as_ref()
+                    .is_some_and(|service| service.lifecycle == "background")
+            })
+            .map(|plugin| plugin.app_id)
+            .collect())
+    }
+
+    fn accepts_event(&self, app_id: &str, service_version: &str) -> bool {
+        self.clients
+            .lock()
+            .ok()
+            .and_then(|clients| {
+                clients.get(app_id).map(|connected| {
+                    connected.version == service_version && !connected.client.is_disconnected()
+                })
+            })
+            .unwrap_or(false)
     }
 
     pub async fn request(
@@ -292,6 +522,21 @@ pub async fn plugin_native_service_request(
     runtime: State<'_, NativeServiceRuntime>,
 ) -> Result<Value, NativeServiceError> {
     runtime.request(&app_id, &method, params).await
+}
+
+#[tauri::command]
+pub async fn plugin_disconnect_native_service(
+    app_id: String,
+    runtime: State<'_, NativeServiceRuntime>,
+) -> Result<(), NativeServiceError> {
+    runtime.disconnect(&app_id).await
+}
+
+#[tauri::command]
+pub fn plugin_list_native_service_statuses(
+    runtime: State<'_, NativeServiceRuntime>,
+) -> Result<Vec<NativeServiceStatus>, NativeServiceError> {
+    runtime.statuses()
 }
 
 #[derive(Debug, Clone)]
@@ -649,6 +894,14 @@ fn required_permission(method: &str) -> Result<&'static str, NativeServiceError>
         | "template.batch.sources.register"
         | "template.batch.run"
         | "template.batch.save" => Ok("host.template.project"),
+        "clipboard.history.list"
+        | "clipboard.history.get"
+        | "clipboard.history.pin"
+        | "clipboard.history.delete"
+        | "clipboard.history.clearUnpinned"
+        | "clipboard.history.restore"
+        | "clipboard.settings.get"
+        | "clipboard.settings.update" => Ok("host.clipboard.history"),
         _ => Err(NativeServiceError::new(
             "NATIVE_SERVICE_METHOD_NOT_FOUND",
             "Native service method is not exposed by the host",
@@ -1047,10 +1300,11 @@ mod tests {
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::TcpListener,
+        sync::Barrier,
     };
 
     use super::{
-        data_directory_for, request_timeout, required_permission, ErrorEnvelope,
+        data_directory_for, request_timeout, required_permission, ConnectedService, ErrorEnvelope,
         NativeServiceError, NativeServiceEventSink, NativeServiceRuntime, ServiceClient,
         ServiceLaunchSpec, ServiceLauncher, ServiceProcess, ServiceReply, ServiceSupervisor,
         DEFAULT_REQUEST_TIMEOUT,
@@ -1064,11 +1318,11 @@ mod tests {
     }
 
     impl NativeServiceEventSink for NoopEventSink {
-        fn emit(&self, _app_id: &str, _event: serde_json::Value) {}
+        fn emit(&self, _app_id: &str, _service_version: &str, _event: serde_json::Value) {}
     }
 
     impl NativeServiceEventSink for RecordingEventSink {
-        fn emit(&self, app_id: &str, event: serde_json::Value) {
+        fn emit(&self, app_id: &str, _service_version: &str, event: serde_json::Value) {
             let _ = self.sender.send((app_id.to_string(), event));
         }
     }
@@ -1324,6 +1578,27 @@ mod tests {
         }
         assert!(required_permission("template.process.spawn").is_err());
         assert!(required_permission("template.batch.unknown").is_err());
+    }
+
+    #[test]
+    fn maps_only_declared_clipboard_service_methods_to_permissions() {
+        for method in [
+            "clipboard.history.list",
+            "clipboard.history.get",
+            "clipboard.history.pin",
+            "clipboard.history.delete",
+            "clipboard.history.clearUnpinned",
+            "clipboard.history.restore",
+            "clipboard.settings.get",
+            "clipboard.settings.update",
+        ] {
+            assert_eq!(
+                required_permission(method).unwrap(),
+                "host.clipboard.history"
+            );
+        }
+        assert!(required_permission("clipboard.history.exportDatabase").is_err());
+        assert!(required_permission("clipboard.settings.reset").is_err());
     }
 
     #[test]
@@ -1694,6 +1969,17 @@ mod tests {
 
         assert_eq!(error.code, "NATIVE_SERVICE_BINARY_HASH_MISMATCH");
         assert!(!directory.path().join("http/service.endpoint.json").exists());
+        let status = runtime.status_for("com.attson.http").unwrap();
+        assert_eq!(status.state, "unavailable");
+        assert_eq!(
+            status.error_code.as_deref(),
+            Some("NATIVE_SERVICE_BINARY_HASH_MISMATCH")
+        );
+        assert!(!status
+            .correlation_id
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1757,6 +2043,8 @@ mod tests {
         );
 
         runtime.connect("com.attson.http").await.unwrap();
+        assert!(runtime.accepts_event("com.attson.http", "0.1.0-alpha.0"));
+        assert!(!runtime.accepts_event("com.attson.http", "0.2.0"));
         let result = runtime
             .request("com.attson.http", "data.tabs.list", json!({}))
             .await
@@ -1766,7 +2054,224 @@ mod tests {
         assert_eq!(result, json!([{"id": "tab-1"}]));
         assert_eq!(app_id, "com.attson.http");
         assert_eq!(event["sessionId"], "session-1");
+        runtime.disconnect("com.attson.http").await.unwrap();
+        assert!(!runtime.accepts_event("com.attson.http", "0.1.0-alpha.0"));
         server.await.unwrap();
+    }
+
+    #[test]
+    fn runtime_selects_only_enabled_background_services() {
+        let directory = tempdir().unwrap();
+        let store_root = directory.path().join("plugins");
+        let store = native_service_store(&store_root, b"signed-service", b"signed-service");
+        let connection = rusqlite::Connection::open(store_root.join("registry.sqlite3")).unwrap();
+        let metadata = json!({
+            "entry": "native/service",
+            "version": "0.1.0-alpha.0",
+            "sha256": hex::encode(Sha256::digest(b"signed-service")),
+            "protocolVersion": 1,
+            "lifecycle": "background"
+        });
+        connection
+            .execute(
+                "UPDATE installed_plugins SET native_service_json = ?1 WHERE app_id = ?2",
+                rusqlite::params![metadata.to_string(), "com.attson.http"],
+            )
+            .unwrap();
+        drop(connection);
+        let runtime = NativeServiceRuntime::with_event_sink(
+            store,
+            directory.path().to_path_buf(),
+            Arc::new(NoopEventSink),
+        );
+
+        assert_eq!(runtime.background_app_ids().unwrap(), ["com.attson.http"]);
+        runtime
+            .store
+            .lock()
+            .unwrap()
+            .set_enabled("com.attson.http", false)
+            .unwrap();
+        assert!(runtime.background_app_ids().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_connects_for_one_app_reuse_one_service_connection() {
+        let directory = tempdir().unwrap();
+        let store_root = directory.path().join("plugins");
+        let store = native_service_store(&store_root, b"signed-service", b"signed-service");
+        let data_directory = directory.path().join("http");
+        std::fs::create_dir_all(&data_directory).unwrap();
+        let endpoint_path = data_directory.join("service.endpoint.json");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        std::fs::write(
+            &endpoint_path,
+            serde_json::to_vec(&json!({
+                "port": listener.local_addr().unwrap().port(),
+                "token": "secret-token",
+                "serviceVersion": "0.1.0-alpha.0"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let server = tokio::spawn(fake_service(
+            listener,
+            data_directory.to_string_lossy().to_string(),
+        ));
+        let runtime = NativeServiceRuntime::with_event_sink(
+            store,
+            directory.path().to_path_buf(),
+            Arc::new(NoopEventSink),
+        );
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (first, second) = tokio::join!(
+                runtime.connect("com.attson.http"),
+                runtime.connect("com.attson.http")
+            );
+            first.unwrap();
+            second.unwrap();
+            runtime
+                .request("com.attson.http", "data.tabs.list", json!({}))
+                .await
+                .unwrap();
+            server.await.unwrap();
+        })
+        .await
+        .expect("same-app connects should complete within the caller budget");
+    }
+
+    #[tokio::test]
+    async fn connects_for_different_apps_reach_their_services_in_parallel() {
+        let directory = tempdir().unwrap();
+        let store_root = directory.path().join("plugins");
+        let _ = native_service_store_for(
+            &store_root,
+            "com.attson.http",
+            &["host.http.request", "host.http.stream", "host.http.data"],
+            b"signed-http-service",
+            b"signed-http-service",
+        );
+        let store = native_service_store_for(
+            &store_root,
+            "com.attson.aria2",
+            &["host.download.tasks"],
+            b"signed-aria2-service",
+            b"signed-aria2-service",
+        );
+        let barrier = Arc::new(Barrier::new(2));
+        let mut servers = Vec::new();
+        for (app_id, data_directory) in [
+            ("com.attson.http", directory.path().join("http")),
+            ("com.attson.aria2", directory.path().join("aria2")),
+        ] {
+            std::fs::create_dir_all(&data_directory).unwrap();
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            std::fs::write(
+                data_directory.join("service.endpoint.json"),
+                serde_json::to_vec(&json!({
+                    "port": listener.local_addr().unwrap().port(),
+                    "token": "secret-token",
+                    "serviceVersion": "0.1.0-alpha.0"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            servers.push(tokio::spawn(fake_service_for_app_with_barrier(
+                listener,
+                data_directory.to_string_lossy().to_string(),
+                app_id,
+                Arc::clone(&barrier),
+            )));
+        }
+        let runtime = NativeServiceRuntime::with_event_sink(
+            store,
+            directory.path().to_path_buf(),
+            Arc::new(NoopEventSink),
+        );
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (http, aria2) = tokio::join!(
+                runtime.connect("com.attson.http"),
+                runtime.connect("com.attson.aria2")
+            );
+            http.unwrap();
+            aria2.unwrap();
+            let (http_result, aria2_result) = tokio::join!(
+                runtime.request("com.attson.http", "data.tabs.list", json!({})),
+                runtime.request("com.attson.aria2", "download.tasks.list", json!({}))
+            );
+            http_result.unwrap();
+            aria2_result.unwrap();
+            for server in servers {
+                server.await.unwrap();
+            }
+        })
+        .await
+        .expect("different apps should not be serialized by a global connect lock");
+    }
+
+    #[tokio::test]
+    async fn disconnect_terminates_only_the_host_owned_process_and_allows_retry() {
+        let directory = tempdir().unwrap();
+        let store_root = directory.path().join("plugins");
+        let store = native_service_store(&store_root, b"signed-service", b"signed-service");
+        let data_directory = directory.path().join("http");
+        std::fs::create_dir_all(&data_directory).unwrap();
+        let endpoint_path = data_directory.join("service.endpoint.json");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        std::fs::write(
+            &endpoint_path,
+            serde_json::to_vec(&json!({
+                "port": listener.local_addr().unwrap().port(),
+                "token": "secret-token",
+                "serviceVersion": "0.1.0-alpha.0"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let server = Arc::new(Mutex::new(Some(tokio::spawn(fake_service(
+            listener,
+            data_directory.to_string_lossy().to_string(),
+        )))));
+        let client = ServiceClient::connect(
+            &endpoint_path,
+            &data_directory,
+            "com.attson.http",
+            "attool-test",
+        )
+        .await
+        .unwrap();
+        let stops = Arc::new(AtomicUsize::new(0));
+        let runtime = NativeServiceRuntime::with_event_sink(
+            store,
+            directory.path().to_path_buf(),
+            Arc::new(NoopEventSink),
+        );
+        runtime.clients.lock().unwrap().insert(
+            "com.attson.http".to_string(),
+            ConnectedService {
+                version: "0.1.0-alpha.0".to_string(),
+                client,
+                process: Some(Box::new(OwnedTestProcess {
+                    server: Arc::clone(&server),
+                    stops: Arc::clone(&stops),
+                })),
+            },
+        );
+        assert!(runtime.is_connected("com.attson.http"));
+
+        runtime.disconnect("com.attson.http").await.unwrap();
+
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        assert!(!runtime.is_connected("com.attson.http"));
+        assert!(runtime.clients.lock().unwrap().is_empty());
+        let error = runtime
+            .request("com.attson.http", "data.tabs.list", json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "NATIVE_SERVICE_NOT_CONNECTED");
+        runtime.disconnect("com.attson.http").await.unwrap();
     }
 
     #[cfg(unix)]
@@ -2054,6 +2559,24 @@ mod tests {
         data_directory: String,
         app_id: &'static str,
     ) {
+        fake_service_for_app_inner(listener, data_directory, app_id, None).await;
+    }
+
+    async fn fake_service_for_app_with_barrier(
+        listener: TcpListener,
+        data_directory: String,
+        app_id: &'static str,
+        barrier: Arc<Barrier>,
+    ) {
+        fake_service_for_app_inner(listener, data_directory, app_id, Some(barrier)).await;
+    }
+
+    async fn fake_service_for_app_inner(
+        listener: TcpListener,
+        data_directory: String,
+        app_id: &'static str,
+        handshake_barrier: Option<Arc<Barrier>>,
+    ) {
         let (stream, _) = listener.accept().await.unwrap();
         let (read, mut write) = stream.into_split();
         let mut reader = BufReader::new(read);
@@ -2065,6 +2588,9 @@ mod tests {
         assert_eq!(handshake["dataDirectory"], data_directory);
         assert_eq!(handshake["appId"], app_id);
         let handshake_id = handshake["requestId"].as_str().unwrap();
+        if let Some(barrier) = handshake_barrier {
+            barrier.wait().await;
+        }
         write
             .write_all(
                 format!(

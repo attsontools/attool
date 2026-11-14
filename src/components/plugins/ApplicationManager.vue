@@ -17,7 +17,7 @@ import {
 } from 'naive-ui';
 
 import type { PluginStoreController } from '../../composables/usePluginStore';
-import type { ManagedCatalogApp, PluginHistoryRecord } from './types';
+import type { ManagedCatalogApp, NativeServiceStatus, PluginHistoryRecord } from './types';
 import type { Tool } from '../../types/tool';
 import PluginInstallProbe from './PluginInstallProbe.vue';
 import { permissionConfirmationComplete } from './catalogMerge';
@@ -34,6 +34,7 @@ type ManagedApp = {
   publisher: string;
   permissions: string[];
   installedAt: string;
+  nativeServiceStatus?: NativeServiceStatus;
   toolId?: string;
 };
 
@@ -90,6 +91,7 @@ const installedApps = computed<ManagedApp[]>(() => [
     publisher: app.publisherName,
     permissions: app.permissions,
     installedAt: app.installedAt,
+    nativeServiceStatus: props.store.nativeServiceStatuses.value.get(app.appId),
     toolId: `plugin:${app.appId}`
   }))
 ]);
@@ -614,7 +616,11 @@ function formatBytes(bytes: number) {
               </span>
               <span class="row-meta">
                 <n-tag size="small" :bordered="false">{{ app.source === 'builtin' ? '内置' : '应用' }}</n-tag>
-                <span :class="['state-dot', { off: !app.enabled }]">{{ app.enabled ? '启用' : '停用' }}</span>
+                <span
+                  :class="['state-dot', { off: !app.enabled || app.nativeServiceStatus?.state === 'unavailable' }]"
+                >
+                  {{ !app.enabled ? '停用' : app.nativeServiceStatus?.state === 'unavailable' ? '服务不可用' : '启用' }}
+                </span>
               </span>
             </button>
           </div>
@@ -639,6 +645,18 @@ function formatBytes(bytes: number) {
             <div><dt>发布者</dt><dd>{{ selectedInstalled.publisher }}</dd></div>
             <div v-if="selectedInstalled.installedAt"><dt>安装时间</dt><dd>{{ new Date(selectedInstalled.installedAt).toLocaleString() }}</dd></div>
           </dl>
+
+          <n-alert
+            v-if="selectedInstalled.nativeServiceStatus?.state === 'unavailable'"
+            type="error"
+            :bordered="false"
+          >
+            <strong>{{ selectedInstalled.nativeServiceStatus.errorCode }}</strong>
+            · {{ selectedInstalled.nativeServiceStatus.message || '后台服务连接失败' }}
+            <span v-if="selectedInstalled.nativeServiceStatus.correlationId" class="correlation">
+              {{ selectedInstalled.nativeServiceStatus.correlationId }}
+            </span>
+          </n-alert>
 
           <section class="detail-section">
             <h4>权限</h4>

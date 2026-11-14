@@ -15,6 +15,7 @@ attool 是一个个人使用的桌面工具集合，运行在 Tauri 2 上。前�
 - Codec、Text、Generator、Time 与 JSON 均为从平台完全外置的双制品应用：`atcodec`、`attext`、`atgenerator`、`attime`、`atjson` 仓库分别生成独立 Tauri 安装包和对应插件包。平台不再包含五者的内置实现，安装的插件是唯一入口。
 - 官方 Catalog 由 AT Tool 主仓维护并签名，平台可按当前 OS/架构远程安装和主动升级多个官方应用；新版本先进入 `pending`，健康检查与原子切换通过后成为 `current`，失败时保留或恢复上一可用版本。
 - HTTP 已完全外置为 `com.attson.http`：`athttp` 独立版和官方 Catalog 插件复用同一 UI、请求核心与 `${app_data_dir}/http/http.sqlite3`，由单一 Native/Data Service 提供请求、长连接和数据 API。平台只保留 Host API 2.x 桥接和 service supervisor，不再包含内置 HTTP UI、Store、Tauri commands 或 SQLite owner。
+- 插件平台支持页面关闭后继续连接的 `background` Native Service，以及由 manifest 声明、宿主隔离承载的底部面板和居中对话框辅助窗口。后台连接失败不会阻止平台启动，应用入口和管理页会显示稳定错误码与关联 ID。
 
 下面详列两个“重后端”内置工具与 HTTP 独立应用，其余见汇总表。
 
@@ -47,7 +48,7 @@ attool 是一个个人使用的桌面工具集合，运行在 Tauri 2 上。前�
 
 | 工具（id） | 能力 | 后端 |
 |---|---|---|
-| 剪贴板（`clipboard`） | 历史记录、图片/文本预览、Paste 风格恢复、快捷键自定义、独立浮窗 | `clipboard/`（SQLite + 系统剪贴板监听） |
+| 剪贴板（`clipboard`） | 历史记录、图片/文本预览、Paste 风格恢复、快捷键自定义、独立浮窗；外置所需后台 service、辅助窗口与受控 DTO 契约已具备，当前数据 owner 仍是内置实现 | `clipboard/`（SQLite + 系统剪贴板监听） |
 | 视频链接抽取（`douyin`） | 抖音 / B站 / 小红书 / YouTube 链接与文案解析；YouTube 使用内置 yt-dlp + EJS + QuickJS | `douyin/bilibili/xhs/youtube.rs` |
 | 图片（`image`） | 统一捕获工作台（截图 / 录屏，截图选区支持标注与快捷 OCR）、压缩、格式转换、EXIF、OCR；OCR 内置 Tesseract 与中英日语言模型 | `imaging/`（含 xcap 截图）+ `recording.rs` |
 | 网络（`network`） | URL 分解、Ping、端口、DNS | `network/` |

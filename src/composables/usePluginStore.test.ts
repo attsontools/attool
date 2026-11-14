@@ -16,6 +16,7 @@ const codec: InstalledPlugin = {
   publisherName: 'Attson',
   publisherKeyId: 'attool-p0-test',
   entry: 'ui/index.html',
+  windows: {},
   permissions: ['host.theme.read'],
   enabled: true,
   installedAt: '2026-11-10T00:00:00Z'
@@ -59,6 +60,8 @@ function fakeApi(): PluginApi {
     inspectPackage: vi.fn(),
     installPackage: vi.fn(),
     listInstalled: vi.fn().mockResolvedValue([{ ...codec }]),
+    listNativeServiceStatuses: vi.fn().mockResolvedValue([]),
+    listenNativeServiceStatuses: vi.fn().mockResolvedValue(() => {}),
     listHistory: vi.fn().mockResolvedValue([]),
     listCatalog: vi.fn().mockResolvedValue({ ...catalog }),
     refreshCatalog: vi.fn().mockResolvedValue({ ...catalog }),
@@ -77,6 +80,55 @@ function fakeApi(): PluginApi {
 }
 
 describe('usePluginStore', () => {
+  it('keeps the newest native service status from snapshots and events', async () => {
+    const api = fakeApi();
+    let statusListener: (status: {
+      appId: string;
+      state: 'connecting' | 'connected' | 'unavailable' | 'disconnected';
+      errorCode: string | null;
+      message: string | null;
+      correlationId: string | null;
+      updatedAt: number;
+    }) => void = () => {};
+    vi.mocked(api.listNativeServiceStatuses).mockResolvedValue([{
+      appId: codec.appId,
+      state: 'unavailable',
+      errorCode: 'NATIVE_SERVICE_START_FAILED',
+      message: 'Native service failed to start',
+      correlationId: 'correlation-old',
+      updatedAt: 10
+    }]);
+    vi.mocked(api.listenNativeServiceStatuses).mockImplementation(async (listener) => {
+      statusListener = listener;
+      return () => {};
+    });
+    const store = usePluginStore(api);
+
+    await store.load();
+    statusListener({
+      appId: codec.appId,
+      state: 'connected',
+      errorCode: null,
+      message: null,
+      correlationId: 'correlation-new',
+      updatedAt: 20
+    });
+    statusListener({
+      appId: codec.appId,
+      state: 'unavailable',
+      errorCode: 'STALE',
+      message: 'stale',
+      correlationId: 'correlation-stale',
+      updatedAt: 15
+    });
+
+    expect(store.nativeServiceStatuses.value.get(codec.appId)).toMatchObject({
+      state: 'connected',
+      correlationId: 'correlation-new',
+      updatedAt: 20
+    });
+  });
+
   it('keeps a disabled plugin in management but removes it from navigation', async () => {
     const api = fakeApi();
     const store = usePluginStore(api);
@@ -164,6 +216,7 @@ describe('usePluginStore', () => {
       publisherName: codec.publisherName,
       publisherKeyId: codec.publisherKeyId,
       entry: codec.entry,
+      windows: {},
       permissions: codec.permissions,
       nativeService: null,
       stage: 'health-check' as const,
@@ -214,6 +267,7 @@ describe('usePluginStore', () => {
       publisherName: codec.publisherName,
       publisherKeyId: codec.publisherKeyId,
       entry: codec.entry,
+      windows: {},
       permissions: codec.permissions,
       nativeService: null,
       stage: 'health-check' as const,
@@ -255,6 +309,7 @@ describe('usePluginStore', () => {
       publisherName: codec.publisherName,
       publisherKeyId: codec.publisherKeyId,
       entry: codec.entry,
+      windows: {},
       permissions: codec.permissions,
       nativeService: null,
       stage: 'health-check' as const,

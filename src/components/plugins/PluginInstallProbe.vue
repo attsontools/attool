@@ -18,6 +18,7 @@ const emit = defineEmits<{
 
 const frame = ref<HTMLIFrameElement | null>(null);
 const frameHtml = ref('');
+const entryIndex = ref(0);
 let session: PluginHostSession | null = null;
 let timer: ReturnType<typeof setTimeout> | null = null;
 let settled = false;
@@ -55,8 +56,13 @@ function handleLoad() {
     saveFile: async () => ({ cancelled: true }),
     onHandshake: () => {
       if (settled) return;
-      settled = true;
       clear();
+      if (entryIndex.value + 1 < config.value.entries.length) {
+        entryIndex.value += 1;
+        void loadEntry();
+        return;
+      }
+      settled = true;
       emit('ready');
     }
   });
@@ -72,23 +78,27 @@ function handleLoad() {
   timer = setTimeout(fail, 8_000);
 }
 
-onMounted(async () => {
+async function loadEntry() {
   try {
+    const entry = config.value.entries[entryIndex.value];
     const html = await invoke<string>('plugin_read_probe_entry_html', {
-      operationId: props.operation.operationId
+      operationId: props.operation.operationId,
+      entry
     });
     frameHtml.value = buildPluginFrameDocument(
       html,
       pluginAssetBaseUrl(
         'attool-plugin-probe',
         props.operation.operationId,
-        props.operation.entry ?? ''
+        entry
       )
     );
   } catch {
     fail();
   }
-});
+}
+
+onMounted(() => void loadEntry());
 
 onBeforeUnmount(clear);
 </script>

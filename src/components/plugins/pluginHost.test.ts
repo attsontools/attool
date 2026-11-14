@@ -26,6 +26,7 @@ const codec: InstalledPlugin = {
   publisherName: 'Attson',
   publisherKeyId: 'attool-p0-test',
   entry: 'ui/index.html',
+  windows: {},
   permissions: ['host.theme.read'],
   enabled: true,
   installedAt: '2026-11-10T00:00:00Z'
@@ -40,7 +41,8 @@ const http: InstalledPlugin = {
     entry: 'native/athttp-service',
     version: '0.1.0-alpha.0',
     sha256: 'a'.repeat(64),
-    protocolVersion: 1
+    protocolVersion: 1,
+    lifecycle: 'onDemand'
   }
 };
 
@@ -53,7 +55,8 @@ const aria2: InstalledPlugin = {
     entry: 'native/ataria2-service',
     version: '0.1.0-alpha.0',
     sha256: 'b'.repeat(64),
-    protocolVersion: 1
+    protocolVersion: 1,
+    lifecycle: 'onDemand'
   }
 };
 
@@ -66,7 +69,26 @@ const template: InstalledPlugin = {
     entry: 'native/attemplate-service',
     version: '0.1.0-alpha.0',
     sha256: 'c'.repeat(64),
-    protocolVersion: 1
+    protocolVersion: 1,
+    lifecycle: 'onDemand'
+  }
+};
+
+const clipboard: InstalledPlugin = {
+  ...codec,
+  appId: 'com.attson.clipboard',
+  name: 'Clipboard',
+  windows: {
+    history: { entry: 'ui/history.html', presentation: 'bottomPanel' },
+    preview: { entry: 'ui/preview.html', presentation: 'centeredDialog' }
+  },
+  permissions: ['host.ui.auxiliary', 'host.clipboard.history'],
+  nativeService: {
+    entry: 'native/atclipboard-service',
+    version: '0.1.0-alpha.0',
+    sha256: 'd'.repeat(64),
+    protocolVersion: 1,
+    lifecycle: 'background'
   }
 };
 
@@ -86,6 +108,192 @@ async function flush() {
 }
 
 describe('plugin host session', () => {
+  it('opens only signed auxiliary windows and delivers activation to the target session', async () => {
+    const port = new FakePort();
+    const openAuxiliaryWindow = vi.fn(async () => ({ opened: true }));
+    const closeAuxiliaryWindow = vi.fn(async () => {});
+    const session = createPluginHostSession({
+      app: clipboard,
+      port,
+      windowId: 'history',
+      theme: () => 'dark',
+      notify: vi.fn(),
+      saveFile: vi.fn(),
+      openAuxiliaryWindow,
+      closeAuxiliaryWindow,
+      requestNativeService: vi.fn()
+    });
+    const clipboardRequest = (id: string, method: string, params: unknown = {}): HostRpcMessage => ({
+      jsonrpc: '2.0', id, apiVersion: '2.0', appId: clipboard.appId, method, params
+    });
+
+    port.receive(clipboardRequest('1', 'host.handshake'));
+    await flush();
+    port.receive(clipboardRequest('2', 'host.ui.open', {
+      windowId: 'preview', payload: { itemId: 'clip-1' }
+    }));
+    await flush();
+
+    expect(openAuxiliaryWindow).toHaveBeenCalledWith({
+      windowId: 'preview', payload: { itemId: 'clip-1' }
+    });
+    expect(port.sent.at(-1)).toMatchObject({ id: '2', result: { opened: true } });
+
+    port.receive(clipboardRequest('3', 'host.ui.close'));
+    await flush();
+    expect(closeAuxiliaryWindow).toHaveBeenCalledOnce();
+    expect(port.sent.at(-1)).toMatchObject({ id: '3', result: { closed: true } });
+
+    session.notifyActivated({ source: 'shortcut' });
+    expect(port.sent.at(-1)).toMatchObject({
+      method: 'host.ui.activated',
+      params: { windowId: 'history', payload: { source: 'shortcut' } }
+    });
+  });
+
+  it('rejects unauthorized, unknown, and oversized auxiliary window requests', async () => {
+    const openAuxiliaryWindow = vi.fn();
+    const invoke = async (app: InstalledPlugin, id: string, params: unknown) => {
+      const port = new FakePort();
+      createPluginHostSession({
+        app,
+        port,
+        theme: () => 'dark',
+        notify: vi.fn(),
+        saveFile: vi.fn(),
+        openAuxiliaryWindow,
+        requestNativeService: vi.fn()
+      });
+      const send = (requestId: string, method: string, requestParams: unknown): HostRpcMessage => ({
+        jsonrpc: '2.0', id: requestId, apiVersion: '2.0', appId: app.appId,
+        method, params: requestParams
+      });
+      port.receive(send('handshake', 'host.handshake', {}));
+      await flush();
+      port.receive(send(id, 'host.ui.open', params));
+      await flush();
+      return port.sent.at(-1);
+    };
+
+    await expect(invoke(
+      { ...clipboard, permissions: ['host.clipboard.history'] },
+      'permission',
+      { windowId: 'history' }
+    )).resolves.toMatchObject({ error: { data: { code: 'HOST_PERMISSION_DENIED' } } });
+    await expect(invoke(clipboard, 'unknown', { windowId: 'settings' }))
+      .resolves.toMatchObject({ error: { data: { code: 'HOST_UI_WINDOW_NOT_DECLARED' } } });
+    await expect(invoke(clipboard, 'large', {
+      windowId: 'history', payload: { value: 'x'.repeat(65 * 1024) }
+    })).resolves.toMatchObject({ error: { data: { code: 'HOST_UI_PAYLOAD_TOO_LARGE' } } });
+    expect(openAuxiliaryWindow).not.toHaveBeenCalled();
+  });
+
+  it('routes only the eight clipboard service methods', async () => {
+    const port = new FakePort();
+    const requestNativeService = vi.fn(async (method: string) => (
+      method === 'clipboard.history.list' ? [] : { ok: true }
+    ));
+    createPluginHostSession({
+      app: clipboard,
+      port,
+      theme: () => 'dark',
+      notify: vi.fn(),
+      saveFile: vi.fn(),
+      requestNativeService
+    });
+    const send = (id: string, method: string, params: unknown = {}): HostRpcMessage => ({
+      jsonrpc: '2.0', id, apiVersion: '2.0', appId: clipboard.appId, method, params
+    });
+    port.receive(send('1', 'host.handshake'));
+    await flush();
+
+    const allowed = [
+      'clipboard.history.list', 'clipboard.history.get', 'clipboard.history.pin',
+      'clipboard.history.delete', 'clipboard.history.clearUnpinned',
+      'clipboard.history.restore', 'clipboard.settings.get', 'clipboard.settings.update'
+    ];
+    for (const [index, method] of allowed.entries()) {
+      port.receive(send(String(index + 2), 'host.clipboard.history', { method, params: {} }));
+      await flush();
+    }
+    expect(requestNativeService).toHaveBeenCalledTimes(8);
+
+    port.receive(send('denied', 'host.clipboard.history', {
+      method: 'clipboard.history.exportDatabase', params: {}
+    }));
+    await flush();
+    expect(port.sent.at(-1)).toMatchObject({
+      id: 'denied', error: { data: { code: 'HOST_CLIPBOARD_METHOD_DENIED' } }
+    });
+    expect(requestNativeService).toHaveBeenCalledTimes(8);
+  });
+
+  it('enforces the public clipboard DTO and list page boundary', async () => {
+    const port = new FakePort();
+    const requestNativeService = vi.fn(async (method: string): Promise<unknown> => {
+      if (method === 'clipboard.history.list') {
+        return Array.from({ length: 101 }, (_, index) => ({ id: `clip-${index}` }));
+      }
+      return {
+        id: 'clip-image',
+        kind: 'image',
+        assetPath: '/home/user/.local/share/attool/clipboard/private.png'
+      };
+    });
+    createPluginHostSession({
+      app: clipboard,
+      port,
+      theme: () => 'dark',
+      notify: vi.fn(),
+      saveFile: vi.fn(),
+      requestNativeService
+    });
+    const send = (id: string, method: string, params: unknown = {}): HostRpcMessage => ({
+      jsonrpc: '2.0', id, apiVersion: '2.0', appId: clipboard.appId, method, params
+    });
+    port.receive(send('handshake', 'host.handshake'));
+    await flush();
+
+    port.receive(send('request-limit', 'host.clipboard.history', {
+      method: 'clipboard.history.list', params: { limit: 101 }
+    }));
+    await flush();
+    expect(port.sent.at(-1)).toMatchObject({
+      id: 'request-limit', error: { data: { code: 'HOST_INVALID_PARAMS' } }
+    });
+    expect(requestNativeService).not.toHaveBeenCalled();
+
+    port.receive(send('response-limit', 'host.clipboard.history', {
+      method: 'clipboard.history.list', params: { limit: 100 }
+    }));
+    await flush();
+    expect(port.sent.at(-1)).toMatchObject({
+      id: 'response-limit', error: { data: { code: 'HOST_CLIPBOARD_RESPONSE_INVALID' } }
+    });
+
+    port.receive(send('path', 'host.clipboard.history', {
+      method: 'clipboard.history.get', params: { id: 'clip-image' }
+    }));
+    await flush();
+    expect(port.sent.at(-1)).toMatchObject({
+      id: 'path', error: { data: { code: 'HOST_CLIPBOARD_RESPONSE_INVALID' } }
+    });
+    expect(JSON.stringify(port.sent.at(-1))).not.toContain('/home/user');
+
+    requestNativeService.mockResolvedValueOnce({
+      id: 'clip-image',
+      kind: 'image',
+      previewDataUrl: `data:image/png;base64,${'a'.repeat(2 * 1024 * 1024)}`
+    });
+    port.receive(send('preview-limit', 'host.clipboard.history', {
+      method: 'clipboard.history.get', params: { id: 'clip-image' }
+    }));
+    await flush();
+    expect(port.sent.at(-1)).toMatchObject({
+      id: 'preview-limit', error: { data: { code: 'HOST_CLIPBOARD_RESPONSE_INVALID' } }
+    });
+  });
+
   it('exposes PSD selections as one-use template tokens', async () => {
     const port = new FakePort();
     const requestService = vi.fn(async () => ({ id: 'template-1' }));

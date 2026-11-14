@@ -1453,6 +1453,9 @@ pub fn run() {
             let plugin_runtime = plugin::commands::PluginRuntime::p0(plugin_store.clone())
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
             app.manage(plugin_runtime);
+            app.manage(plugin::auxiliary_window::AuxiliaryWindowRuntime::new(
+                plugin_store.clone(),
+            ));
             let plugin_native_service_runtime = plugin::http_service::NativeServiceRuntime::new(
                 plugin_store,
                 app.path()
@@ -1460,7 +1463,22 @@ pub fn run() {
                     .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?,
                 app.handle().clone(),
             );
+            let background_runtime = plugin_native_service_runtime.clone();
             app.manage(plugin_native_service_runtime);
+            tauri::async_runtime::spawn(async move {
+                for (app_id, result) in background_runtime.start_background_services().await {
+                    if let Err(error) = result {
+                        let correlation_id = background_runtime
+                            .status_for(&app_id)
+                            .and_then(|status| status.correlation_id)
+                            .unwrap_or_default();
+                        eprintln!(
+                            "background native service {app_id} failed [{}] correlation_id={}: {}",
+                            error.code, correlation_id, error.message
+                        );
+                    }
+                }
+            });
             let catalog_runtime = plugin::catalog::CatalogRuntime::production(
                 app.path()
                     .app_data_dir()
@@ -1572,7 +1590,12 @@ pub fn run() {
             plugin::commands::plugin_get_latest_operation,
             plugin::commands::plugin_confirm_plugin_launch,
             plugin::commands::plugin_rollback_plugin_launch,
+            plugin::auxiliary_window::plugin_open_auxiliary_window,
+            plugin::auxiliary_window::plugin_get_auxiliary_activation,
+            plugin::auxiliary_window::plugin_ack_auxiliary_activation,
             plugin::http_service::plugin_connect_native_service,
+            plugin::http_service::plugin_disconnect_native_service,
+            plugin::http_service::plugin_list_native_service_statuses,
             plugin::http_service::plugin_native_service_request,
             ecommerce::commands::import_psd_template,
             ecommerce::commands::list_ecommerce_templates,

@@ -134,7 +134,7 @@
 - **工具页容器**：`Panel`（`title` + 右上 `#right` slot）分区；多子功能的内置工具（图片 / 网络）用顶部 tab 切分 pane。
 - **快捷键录制**：图片截图页、剪贴板页提供"修改 / 恢复默认"按钮 + 键盘录制框（`keydown` 捕获组合键），注册失败时就地红色 alert 提示。
 - **预览弹窗**：剪贴板图片用 `NImage` 预览层（缩放 / 旋转 / 复制工具栏），文本用 `NModal` 全文弹窗；均以悬浮图标触发，不劫持卡片点击。
-- **多窗口**：统一捕获浮层（`capture-overlay`，透明全屏，顶部切换截图 / 录屏；截图支持选区 + 标注，录屏支持区域 / 窗口 / 全屏与区域调整）、截图钉图窗（`capture-pin-*`）、剪贴板历史独立浮窗（`clipboard-history`）都是独立 Tauri 窗口，共用同一套 token / 主题。
+- **多窗口**：统一捕获浮层（`capture-overlay`，透明全屏，顶部切换截图 / 录屏；截图支持选区 + 标注，录屏支持区域 / 窗口 / 全屏与区域调整）、截图钉图窗（`capture-pin-*`）、剪贴板历史独立浮窗（`clipboard-history`）都是独立 Tauri 窗口，共用同一套 token / 主题。插件辅助窗口由签名 manifest 声明为 `bottomPanel` 或 `centeredDialog`，宿主决定尺寸、位置、置顶和无边框样式，窗口内容仍由 `PluginFrame` 的主题通知和 opaque iframe 隔离。
 - **插件应用容器**：`PluginFrame` 填满宿主工具内容区，不额外套卡片；loading、连接和错误状态由宿主统一呈现。插件内部设计由对应应用仓库维护，但必须通过 Host API 主题通知跟随当前 dark / light 主题。
 
 ## 模板编辑器画布
