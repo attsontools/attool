@@ -18,7 +18,7 @@ mod plugin;
 mod xhs;
 mod youtube;
 
-use ecommerce::EcommerceStore;
+use ecommerce::{EcommerceStore, LegacyTemplateOwner};
 use regex::Regex;
 use rusqlite::{params, Connection, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -1370,8 +1370,11 @@ pub fn run() {
                 .app_data_dir()
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?
                 .join("ecommerce");
-            let ecommerce_store = EcommerceStore::new(ecommerce_dir)
+            let ecommerce_owner = LegacyTemplateOwner::new(ecommerce_dir.clone())
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+            let ecommerce_store = EcommerceStore::new_for_legacy(ecommerce_dir, &ecommerce_owner)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+            app.manage(ecommerce_owner);
             app.manage(ecommerce_store);
             let clipboard_dir = app
                 .path()
