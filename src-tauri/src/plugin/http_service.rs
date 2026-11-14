@@ -2481,6 +2481,140 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires ATCLIPBOARD_TEST_PACKAGE"]
+    async fn packaged_clipboard_plugin_preserves_owned_data_across_lifecycle_changes() {
+        let package = std::env::var("ATCLIPBOARD_TEST_PACKAGE")
+            .expect("ATCLIPBOARD_TEST_PACKAGE is required");
+        let directory = tempdir().unwrap();
+        let store = PluginStore::open(directory.path().join("plugins")).unwrap();
+        let public_key = VerifyingKey::from_bytes(&[
+            0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64,
+            0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68,
+            0xf7, 0x07, 0x51, 0x1a,
+        ])
+        .unwrap();
+        let keys = HashMap::from([("attool-p0-test".to_string(), public_key)]);
+        let environment = HostEnvironment::current("2.0.0");
+        let installed = store
+            .install(Path::new(&package), &environment, &keys)
+            .unwrap();
+        assert_eq!(installed.app_id, "com.attson.clipboard");
+        assert_eq!(installed.publisher_key_id, "attool-p0-test");
+        assert_eq!(
+            installed.native_service.as_ref().unwrap().lifecycle,
+            "background"
+        );
+        assert_eq!(
+            installed.windows.get("history").unwrap().presentation,
+            "bottomPanel"
+        );
+        assert_eq!(
+            installed.windows.get("preview").unwrap().presentation,
+            "centeredDialog"
+        );
+        for entry in [None, Some("ui/history.html"), Some("ui/preview.html")] {
+            let asset = store.read_entry("com.attson.clipboard", entry).unwrap();
+            assert_eq!(asset.content_type, "text/html; charset=utf-8");
+            assert!(String::from_utf8(asset.bytes).unwrap().contains("<html"));
+        }
+
+        let data_directory = directory.path().join("clipboard");
+        let runtime = NativeServiceRuntime::with_event_sink(
+            store,
+            directory.path().to_path_buf(),
+            Arc::new(NoopEventSink),
+        );
+        runtime.connect("com.attson.clipboard").await.unwrap();
+        let settings = runtime
+            .request("com.attson.clipboard", "clipboard.settings.get", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(settings["retentionLimit"], 500);
+        let history = runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.history.list",
+                json!({ "limit": 20 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(history["items"], json!([]));
+        runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.settings.update",
+                json!({ "settings": {
+                    "captureEnabled": false,
+                    "retentionLimit": 321,
+                    "shortcut": settings["shortcut"].as_str().unwrap()
+                }}),
+            )
+            .await
+            .unwrap();
+
+        let marker_path = data_directory.join("clipboard-takeover.json");
+        let marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&marker_path).unwrap()).unwrap();
+        assert_eq!(marker["state"], "owned");
+        let marker_bytes = std::fs::read(&marker_path).unwrap();
+        assert!(data_directory.join("clipboard_history.sqlite3").is_file());
+
+        runtime.disconnect("com.attson.clipboard").await.unwrap();
+        runtime
+            .store
+            .lock()
+            .unwrap()
+            .set_enabled("com.attson.clipboard", false)
+            .unwrap();
+        assert!(!runtime.is_connected("com.attson.clipboard"));
+        let disabled = runtime
+            .request("com.attson.clipboard", "clipboard.settings.get", json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(disabled.code, "NATIVE_SERVICE_PLUGIN_DISABLED");
+
+        runtime
+            .store
+            .lock()
+            .unwrap()
+            .set_enabled("com.attson.clipboard", true)
+            .unwrap();
+        runtime.connect("com.attson.clipboard").await.unwrap();
+        let settings = runtime
+            .request("com.attson.clipboard", "clipboard.settings.get", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(settings["retentionLimit"], 321);
+
+        runtime.disconnect("com.attson.clipboard").await.unwrap();
+        runtime
+            .store
+            .lock()
+            .unwrap()
+            .uninstall("com.attson.clipboard", false)
+            .unwrap();
+        assert_eq!(std::fs::read(&marker_path).unwrap(), marker_bytes);
+        assert!(data_directory.join("clipboard_history.sqlite3").is_file());
+
+        runtime
+            .store
+            .lock()
+            .unwrap()
+            .install(Path::new(&package), &environment, &keys)
+            .unwrap();
+        runtime.connect("com.attson.clipboard").await.unwrap();
+        let settings = runtime
+            .request("com.attson.clipboard", "clipboard.settings.get", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(settings["retentionLimit"], 321);
+        assert_eq!(std::fs::read(&marker_path).unwrap(), marker_bytes);
+
+        stop_packaged_service(&data_directory);
+    }
+
+    #[cfg(unix)]
     fn stop_packaged_service(data_directory: &Path) {
         let lease = std::fs::read_to_string(data_directory.join("service.lock")).unwrap();
         let pid = lease.lines().nth(1).unwrap();

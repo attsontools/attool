@@ -700,6 +700,37 @@ describe('plugin host session', () => {
     session.terminate();
   });
 
+  it('routes content-free clipboard history changes only to the clipboard capability', async () => {
+    const port = new FakePort();
+    const session = createPluginHostSession({
+      app: clipboard,
+      port,
+      theme: () => 'dark',
+      notify: vi.fn(),
+      saveFile: vi.fn(),
+      requestNativeService: vi.fn()
+    });
+    const send = (id: string, method: string): HostRpcMessage => ({
+      jsonrpc: '2.0', id, apiVersion: '2.0', appId: clipboard.appId, method, params: {}
+    });
+    port.receive(send('1', 'host.handshake'));
+    await flush();
+
+    session.notifyNativeServiceEvent({
+      type: 'clipboard.history.changed',
+      revision: 7,
+      contentText: 'must not cross the host boundary',
+      assetPath: '/private/clipboard.png'
+    });
+
+    expect(port.sent.at(-1)).toMatchObject({
+      method: 'host.clipboard.historyChanged',
+      params: { type: 'clipboard.history.changed', revision: 7 }
+    });
+    expect(JSON.stringify(port.sent.at(-1))).not.toMatch(/content|path/i);
+    session.terminate();
+  });
+
   it('routes HTTP Host API 2.0 methods by declared capability and pushes service events', async () => {
     const port = new FakePort();
     const requestService = vi.fn(async (_method: string, _params: unknown) => ({ ok: true }));

@@ -21,6 +21,7 @@ import type { ManagedCatalogApp, NativeServiceStatus, PluginHistoryRecord } from
 import type { Tool } from '../../types/tool';
 import PluginInstallProbe from './PluginInstallProbe.vue';
 import { permissionConfirmationComplete } from './catalogMerge';
+import { permissionDescription } from './permissionDescription';
 
 type View = 'catalog' | 'installed' | 'history';
 type ManagedApp = {
@@ -758,7 +759,10 @@ function formatBytes(bytes: number) {
               :value="permission"
               class="permission-check"
             >
-              <span class="mono">{{ permission }}</span>
+              <span class="permission-disclosure">
+                <span class="mono">{{ permission }}</span>
+                <span>{{ permissionDescription(permission) }}</span>
+              </span>
             </n-checkbox>
           </n-checkbox-group>
           <n-alert v-else-if="catalogOperationMode === 'update'" type="info" :bordered="false">
@@ -817,8 +821,11 @@ function formatBytes(bytes: number) {
         </div>
         <section class="permission-confirm">
           <h4>请求权限</h4>
-          <div class="permission-list">
-            <span v-for="permission in preview.permissions" :key="permission" class="permission mono">{{ permission }}</span>
+          <div class="permission-disclosures">
+            <div v-for="permission in preview.permissions" :key="permission" class="permission-disclosure">
+              <span class="mono">{{ permission }}</span>
+              <span>{{ permissionDescription(permission) }}</span>
+            </div>
           </div>
           <n-checkbox v-model:checked="permissionsAccepted">我已查看并同意授予以上权限</n-checkbox>
         </section>
@@ -924,6 +931,9 @@ function formatBytes(bytes: number) {
 .permission-confirm { display: grid; gap: 8px; margin-top: 14px; }
 .permission-checks { display: grid; gap: 8px; }
 .permission-check { min-width: 0; }
+.permission-disclosures { display: grid; gap: 8px; }
+.permission-disclosure { display: grid; min-width: 0; gap: 2px; }
+.permission-disclosure > span:last-child { color: var(--text-muted); font-size: var(--fs-xxs); line-height: 1.5; }
 .confirm-modal p { color: var(--text-muted); line-height: 1.65; }
 .mono { font-family: var(--font-mono); font-feature-settings: "tnum"; }
 :global(.install-modal) { width: min(640px, 92vw); }

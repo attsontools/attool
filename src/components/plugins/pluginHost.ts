@@ -522,12 +522,18 @@ export function createPluginHostSession(options: SessionOptions): PluginHostSess
     if (!handshaken || terminated || apiVersion !== '2.0') return;
     const method = nativeServiceEventMethod(event, options.app.permissions);
     if (!method) return;
+    const params = method === 'host.clipboard.historyChanged'
+      ? {
+          type: 'clipboard.history.changed',
+          revision: (event as Record<string, unknown>).revision
+        }
+      : event;
     post({
       jsonrpc: '2.0',
       apiVersion,
       appId: options.app.appId,
       method,
-      params: event
+      params
     });
   }
 
@@ -848,6 +854,14 @@ function nativeServiceEventMethod(event: unknown, permissions: string[]): string
     && Number.isFinite(payload.progress)
   ) {
     return 'host.download.taskEvent';
+  }
+  if (
+    permissions.includes('host.clipboard.history')
+    && payload.type === 'clipboard.history.changed'
+    && Number.isSafeInteger(payload.revision)
+    && Number(payload.revision) >= 0
+  ) {
+    return 'host.clipboard.historyChanged';
   }
   return null;
 }
