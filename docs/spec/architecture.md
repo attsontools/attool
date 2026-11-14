@@ -101,7 +101,7 @@ HTTP 数据仍位于 `${app_data_dir}/http/http.sqlite3`，但不属于宿主 ru
 
 `com.attson.template` 的 Native Service 固定复用 `${app_data_dir}/ecommerce`，以便后续原位接管现有模板 SQLite、素材和批量缓存；其他未知应用仍使用 `${app_data_dir}/native-services/<appId>`。Host API 与 Rust 网关共同限制 `template.templates.*`、PSD/素材导入及批量注册、渲染、保存方法，文件与目录路径只在 token 解析后进入 service，插件页面不接触真实路径。当前阶段只建立权限与目录契约，数据 owner 切换和旧内置写入保护由独立模板应用接管阶段完成。
 
-`com.attson.clipboard` 的 Native Service 固定复用 `${app_data_dir}/clipboard`，并通过 `host.clipboard.history` 的双层白名单访问。公共图片条目不得返回 asset、数据库或缓存路径，预览只接受 PNG/JPEG/WebP base64 data URL 且整串不超过 2 MiB；列表单页最多 100 条。当前平台仍由内置剪贴板 owner 提供可见功能，目录接管、监听器和快捷键迁移在独立剪贴板应用阶段完成。
+`com.attson.clipboard` 的独立版与插件版复用 `atclipboard-service`，固定原位接管 `${app_data_dir}/clipboard`，并通过 `host.clipboard.history` 的双层白名单访问。service 以生命周期锁和 `migrating / owned` marker 保证单一 owner；旧设置表为空时沿用历史默认值且不改写数据库，部分缺失或非法设置继续 fail closed。公共图片条目不得返回 asset、数据库或缓存路径，预览只接受 PNG/JPEG/WebP base64 data URL 且整串不超过 2 MiB；列表单页最多 100 条。后台采集、三类恢复、暂停、保留策略、清空未收藏和停启/重装已通过本地签名包与真实 500 条旧库验证；Wayland 插件模式使用宿主 `--plugin-window` 命令激活签名 history 窗口。生产 Catalog 生命周期完成前，宿主旧实现仍保留但在 `owned` 后永久退权，完整删除属于后续退场阶段。
 
 `com.attson.aria2` 已完成本地双制品与发布链验证：独立 Tauri 与签名 `.atpkg` 复用同一 Vue UI 和 `ataria2-service`，service 通过跨平台文件锁独占 `${app_data_dir}/aria2`、SQLite、固定 aria2 1.37.0 runtime 和取消句柄。首次接管先要求宿主写入 capability，再写 `migrating` marker，并以 SQLite exclusive barrier 等待 marker 前的旧写事务完成；一致快照通过 schema、完整性和行数校验后切换为永久 `owned`。旧库保留只读，宿主旧 owner 的所有读写在 marker 存在时拒绝，写路径取得 SQLite write transaction 后还会再次检查，停用或卸载插件也不恢复旧 owner。Linux x86_64 测试包已通过真实安装、下载和共享历史，五目标 workflow、生产签名校验和 Catalog 包布局校验也已在本地完成；生产 Publisher 授权、正式 Release 和安装/升级/回滚生命周期仍待远端验证。
 
@@ -395,3 +395,7 @@ Root 私钥保持离线，日常 Catalog 只使用 Root 授权的独立 Signing 
 ### 2026-11-15 后台 Service 与宿主承载辅助窗口
 
 需要页面关闭后持续工作的独立应用使用 `background` Native Service 持有领域状态，签名辅助 UI 仍由宿主以 opaque `srcdoc` 窗口承载并通过受控 activation 通知驱动。相比宿主继续持有业务 owner 或让 service 直接创建原生窗口，该方案增加生命周期与窗口协调契约，但保留单一数据 owner、统一隔离和权限边界。
+
+### 2026-11-15 剪贴板接管后永久退权旧 owner
+
+`atclipboard-service` 在原目录完整性验证成功后写入永久 `owned` marker，宿主旧剪贴板 owner 即使插件停用或卸载也不自动恢复。相比可逆切换，该方案要求独立版与插件版共同承担恢复能力，但避免外部 service 仍运行时宿主重新写入同一 SQLite 和资产目录。

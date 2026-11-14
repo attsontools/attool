@@ -1286,7 +1286,7 @@ pub fn run() {
     #[cfg(target_os = "linux")]
     let external_command = capture_command::requested_command();
     #[cfg(target_os = "linux")]
-    if let Some(request) = external_command {
+    if let Some(request) = external_command.as_ref() {
         if capture_command::forward_if_running(request) {
             return;
         }

@@ -1284,9 +1284,10 @@ fn disconnected() -> NativeServiceError {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
         io,
-        path::Path,
+        path::{Path, PathBuf},
+        process::{Command, Stdio},
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc, Mutex,
@@ -1295,7 +1296,8 @@ mod tests {
     };
 
     use ed25519_dalek::VerifyingKey;
-    use serde_json::json;
+    use image::{Rgba, RgbaImage};
+    use serde_json::{json, Value};
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
     use tokio::{
@@ -2612,6 +2614,660 @@ mod tests {
         assert_eq!(std::fs::read(&marker_path).unwrap(), marker_bytes);
 
         stop_packaged_service(&data_directory);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires ATCLIPBOARD_REAL_FLOW_ROOT and ATCLIPBOARD_TEST_PACKAGE"]
+    async fn packaged_clipboard_plugin_captures_and_restores_the_real_wayland_clipboard() {
+        let app_data_root = std::path::PathBuf::from(
+            std::env::var("ATCLIPBOARD_REAL_FLOW_ROOT")
+                .expect("ATCLIPBOARD_REAL_FLOW_ROOT is required"),
+        );
+        assert!(
+            app_data_root.join("clipboard-real-flow-approved").is_file(),
+            "real clipboard flow is restricted to an explicitly approved root"
+        );
+        let _clipboard_snapshot = WaylandClipboardSnapshot::capture();
+        let package = std::env::var("ATCLIPBOARD_TEST_PACKAGE")
+            .expect("ATCLIPBOARD_TEST_PACKAGE is required");
+        let store = PluginStore::open(app_data_root.join("plugins")).unwrap();
+        let public_key = VerifyingKey::from_bytes(&[
+            0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64,
+            0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68,
+            0xf7, 0x07, 0x51, 0x1a,
+        ])
+        .unwrap();
+        let keys = HashMap::from([("attool-p0-test".to_string(), public_key)]);
+        if !store
+            .list()
+            .unwrap()
+            .iter()
+            .any(|plugin| plugin.app_id == "com.attson.clipboard")
+        {
+            store
+                .install(
+                    Path::new(&package),
+                    &HostEnvironment::current("2.0.0"),
+                    &keys,
+                )
+                .unwrap();
+        }
+        let runtime = NativeServiceRuntime::with_event_sink(
+            store,
+            app_data_root.clone(),
+            Arc::new(NoopEventSink),
+        );
+        runtime.connect("com.attson.clipboard").await.unwrap();
+        let mut service_cleanup = PackagedServiceCleanup::new(app_data_root.join("clipboard"));
+        cleanup_clipboard_query(&runtime, "atclipboard-real-").await;
+        let recovery_settings = runtime
+            .request("com.attson.clipboard", "clipboard.settings.get", json!({}))
+            .await
+            .unwrap();
+        runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.settings.update",
+                json!({ "settings": {
+                    "captureEnabled": true,
+                    "retentionLimit": 500,
+                    "shortcut": recovery_settings["shortcut"]
+                }}),
+            )
+            .await
+            .unwrap();
+        let original_ids = clipboard_all_ids(&runtime).await;
+        assert_eq!(original_ids.len(), 500);
+        let original_settings = runtime
+            .request("com.attson.clipboard", "clipboard.settings.get", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(original_settings["captureEnabled"], true);
+        assert_eq!(original_settings["retentionLimit"], 500);
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            assert!(original_settings["unavailableReason"].is_string());
+            assert_eq!(
+                original_settings["systemShortcutCommand"],
+                "atclipboard --history"
+            );
+        }
+        runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.settings.update",
+                json!({ "settings": {
+                    "captureEnabled": true,
+                    "retentionLimit": 1000,
+                    "shortcut": original_settings["shortcut"]
+                }}),
+            )
+            .await
+            .unwrap();
+
+        let flow = tempdir().unwrap();
+        let marker = uuid::Uuid::new_v4().to_string();
+        let mut test_ids = Vec::new();
+
+        let text = format!("atclipboard-real-text-{marker}");
+        wayland_copy("text/plain;charset=utf-8", text.as_bytes());
+        let text_item = wait_for_clipboard_query(&runtime, &text).await;
+        let text_id = text_item["id"].as_str().unwrap().to_string();
+        test_ids.push(text_id.clone());
+        runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.history.restore",
+                json!({ "id": text_id }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wayland_paste(None), text.as_bytes());
+
+        let long_prefix = format!("atclipboard-real-long-{marker}-");
+        let long_text = format!("{long_prefix}{}", "x".repeat(300_000));
+        wayland_copy("text/plain;charset=utf-8", long_text.as_bytes());
+        let long_item = wait_for_clipboard_query(&runtime, &long_prefix).await;
+        assert_eq!(long_item["contentTruncated"], true);
+        let long_id = long_item["id"].as_str().unwrap().to_string();
+        test_ids.push(long_id.clone());
+        let long_preview = runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.history.get",
+                json!({ "id": long_id }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(long_preview["contentTruncated"], true);
+        assert!(long_preview["contentText"].as_str().unwrap().len() <= 256 * 1024);
+        runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.history.restore",
+                json!({ "id": long_id }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wayland_paste(None), long_text.as_bytes());
+
+        let file_path = flow
+            .path()
+            .join(format!("atclipboard-real-file-{marker}.txt"));
+        std::fs::write(&file_path, b"atclipboard real flow").unwrap();
+        let file_uri = format!("file://{}\r\n", file_path.to_string_lossy());
+        wayland_copy("text/uri-list", file_uri.as_bytes());
+        let file_item =
+            wait_for_clipboard_query(&runtime, &format!("atclipboard-real-file-{marker}.txt"))
+                .await;
+        assert_eq!(file_item["kind"], "files");
+        let file_id = file_item["id"].as_str().unwrap().to_string();
+        test_ids.push(file_id.clone());
+        let file_preview = runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.history.get",
+                json!({ "id": file_id }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            file_preview["filePaths"][0],
+            file_path.to_string_lossy().as_ref()
+        );
+        runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.history.restore",
+                json!({ "id": file_id }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wayland_paste(None), file_path.to_string_lossy().as_bytes());
+
+        let known_images = clipboard_kind_ids(&runtime, "image").await;
+        let image_path = flow.path().join("large.png");
+        let image = RgbaImage::from_fn(1200, 900, |x, y| {
+            Rgba([
+                ((x * 31 + y * 17) % 251) as u8,
+                ((x * 13 + y * 47) % 253) as u8,
+                ((x * 7 + y * 19) % 255) as u8,
+                255,
+            ])
+        });
+        image.save(&image_path).unwrap();
+        wayland_copy("image/png", &std::fs::read(&image_path).unwrap());
+        let image_item = wait_for_new_clipboard_kind(&runtime, "image", &known_images).await;
+        assert!(image_item["previewDataUrl"].as_str().unwrap().len() <= 2 * 1024 * 1024);
+        let image_id = image_item["id"].as_str().unwrap().to_string();
+        test_ids.push(image_id.clone());
+        let image_preview = runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.history.get",
+                json!({ "id": image_id }),
+            )
+            .await
+            .unwrap();
+        assert!(image_preview["previewDataUrl"].as_str().unwrap().len() <= 2 * 1024 * 1024);
+        runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.history.restore",
+                json!({ "id": image_id }),
+            )
+            .await
+            .unwrap();
+        let restored_image = image::load_from_memory(&wayland_paste(Some("image/png"))).unwrap();
+        assert_eq!(restored_image.width(), 1200);
+        assert_eq!(restored_image.height(), 900);
+
+        runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.settings.update",
+                json!({ "settings": {
+                    "captureEnabled": false,
+                    "retentionLimit": 1000,
+                    "shortcut": original_settings["shortcut"]
+                }}),
+            )
+            .await
+            .unwrap();
+        let paused_text = format!("atclipboard-real-paused-{marker}");
+        wayland_copy("text/plain;charset=utf-8", paused_text.as_bytes());
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(clipboard_query_items(&runtime, &paused_text)
+            .await
+            .is_empty());
+        runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.settings.update",
+                json!({ "settings": {
+                    "captureEnabled": true,
+                    "retentionLimit": 1000,
+                    "shortcut": original_settings["shortcut"]
+                }}),
+            )
+            .await
+            .unwrap();
+        let resumed_item = wait_for_clipboard_query(&runtime, &paused_text).await;
+        test_ids.push(resumed_item["id"].as_str().unwrap().to_string());
+
+        for id in test_ids {
+            runtime
+                .request(
+                    "com.attson.clipboard",
+                    "clipboard.history.delete",
+                    json!({ "id": id }),
+                )
+                .await
+                .unwrap();
+        }
+        runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.settings.update",
+                json!({ "settings": {
+                    "captureEnabled": true,
+                    "retentionLimit": 500,
+                    "shortcut": original_settings["shortcut"]
+                }}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(clipboard_all_ids(&runtime).await, original_ids);
+        runtime.disconnect("com.attson.clipboard").await.unwrap();
+        service_cleanup.stop();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(app_data_root.join("clipboard/clipboard-takeover.json")).unwrap()
+            )
+            .unwrap()["state"],
+            "owned"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires ATCLIPBOARD_DESTRUCTIVE_FLOW_ROOT and ATCLIPBOARD_TEST_PACKAGE"]
+    async fn packaged_clipboard_plugin_applies_retention_and_clears_only_unpinned_history() {
+        let app_data_root = PathBuf::from(
+            std::env::var("ATCLIPBOARD_DESTRUCTIVE_FLOW_ROOT")
+                .expect("ATCLIPBOARD_DESTRUCTIVE_FLOW_ROOT is required"),
+        );
+        assert!(
+            app_data_root
+                .join("clipboard-destructive-flow-approved")
+                .is_file(),
+            "destructive clipboard flow is restricted to an explicitly approved disposable root"
+        );
+        let package = std::env::var("ATCLIPBOARD_TEST_PACKAGE")
+            .expect("ATCLIPBOARD_TEST_PACKAGE is required");
+        let store = PluginStore::open(app_data_root.join("plugins")).unwrap();
+        let public_key = VerifyingKey::from_bytes(&[
+            0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64,
+            0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68,
+            0xf7, 0x07, 0x51, 0x1a,
+        ])
+        .unwrap();
+        let keys = HashMap::from([("attool-p0-test".to_string(), public_key)]);
+        store
+            .install(
+                Path::new(&package),
+                &HostEnvironment::current("2.0.0"),
+                &keys,
+            )
+            .unwrap();
+        let runtime = NativeServiceRuntime::with_event_sink(
+            store,
+            app_data_root.clone(),
+            Arc::new(NoopEventSink),
+        );
+        runtime.connect("com.attson.clipboard").await.unwrap();
+        let mut service_cleanup = PackagedServiceCleanup::new(app_data_root.join("clipboard"));
+        let original_settings = runtime
+            .request("com.attson.clipboard", "clipboard.settings.get", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(clipboard_all_ids(&runtime).await.len(), 500);
+        let initial_image_count = clipboard_kind_ids(&runtime, "image").await.len();
+        let initial_asset_count = std::fs::read_dir(app_data_root.join("clipboard/assets"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_file())
+            .count();
+        let unreferenced_asset_count = initial_asset_count
+            .checked_sub(initial_image_count)
+            .expect("every image item must have one owned asset");
+        let first_page = runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.history.list",
+                json!({ "limit": 100 }),
+            )
+            .await
+            .unwrap();
+        let pinned = first_page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["isPinned"] == true)
+            .unwrap();
+        let pinned_id = pinned["id"].as_str().unwrap().to_string();
+        let pinned_is_image = pinned["kind"] == "image";
+
+        runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.settings.update",
+                json!({ "settings": {
+                    "captureEnabled": false,
+                    "retentionLimit": 50,
+                    "shortcut": original_settings["shortcut"]
+                }}),
+            )
+            .await
+            .unwrap();
+        let retained = clipboard_all_ids(&runtime).await;
+        assert_eq!(retained.len(), 50);
+        assert!(retained.contains(&pinned_id));
+
+        let cleared = runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.history.clearUnpinned",
+                json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleared["deletedCount"], 49);
+        assert_eq!(
+            clipboard_all_ids(&runtime).await,
+            HashSet::from([pinned_id])
+        );
+        let remaining_assets = std::fs::read_dir(app_data_root.join("clipboard/assets"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_file())
+            .count();
+        assert_eq!(
+            remaining_assets,
+            unreferenced_asset_count + usize::from(pinned_is_image)
+        );
+
+        runtime.disconnect("com.attson.clipboard").await.unwrap();
+        service_cleanup.stop();
+    }
+
+    #[cfg(target_os = "linux")]
+    struct WaylandClipboardSnapshot {
+        value: Option<(String, Vec<u8>)>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl WaylandClipboardSnapshot {
+        fn capture() -> Self {
+            let types = Command::new("wl-paste")
+                .arg("--list-types")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let mime = [
+                "image/png",
+                "text/uri-list",
+                "text/plain;charset=utf-8",
+                "text/plain",
+            ]
+            .into_iter()
+            .find(|candidate| types.iter().any(|value| value == candidate))
+            .map(str::to_string)
+            .or_else(|| types.into_iter().find(|value| !value.is_empty()));
+            let value = mime.and_then(|mime| {
+                let output = Command::new("wl-paste")
+                    .args(["--no-newline", "--type", &mime])
+                    .output()
+                    .ok()?;
+                output.status.success().then_some((mime, output.stdout))
+            });
+            Self { value }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for WaylandClipboardSnapshot {
+        fn drop(&mut self) {
+            if let Some((mime, bytes)) = self.value.as_ref() {
+                let _ = write_wayland_clipboard(mime, bytes);
+            } else {
+                let _ = Command::new("wl-copy")
+                    .arg("--clear")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct PackagedServiceCleanup {
+        data_directory: PathBuf,
+        armed: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl PackagedServiceCleanup {
+        fn new(data_directory: PathBuf) -> Self {
+            Self {
+                data_directory,
+                armed: true,
+            }
+        }
+
+        fn stop(&mut self) {
+            let lease = std::fs::read_to_string(self.data_directory.join("service.lock")).unwrap();
+            let pid = lease.lines().nth(1).unwrap();
+            let running = Command::new("kill")
+                .args(["-0", pid])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            if running {
+                assert!(Command::new("kill")
+                    .args(["-TERM", pid])
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            self.armed = false;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for PackagedServiceCleanup {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            let Ok(lease) = std::fs::read_to_string(self.data_directory.join("service.lock"))
+            else {
+                return;
+            };
+            let Some(pid) = lease.lines().nth(1) else {
+                return;
+            };
+            let _ = Command::new("kill").args(["-TERM", pid]).status();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wayland_copy(mime: &str, bytes: &[u8]) {
+        assert!(write_wayland_clipboard(mime, bytes).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_wayland_clipboard(mime: &str, bytes: &[u8]) -> io::Result<bool> {
+        let mut child = Command::new("wl-copy")
+            .args(["--type", mime])
+            .stdin(Stdio::piped())
+            .spawn()?;
+        std::io::Write::write_all(child.stdin.as_mut().unwrap(), bytes)?;
+        drop(child.stdin.take());
+        Ok(child.wait()?.success())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wayland_paste(mime: Option<&str>) -> Vec<u8> {
+        let mut command = Command::new("wl-paste");
+        command.arg("--no-newline");
+        if let Some(mime) = mime {
+            command.args(["--type", mime]);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        output.stdout
+    }
+
+    async fn clipboard_query_items(runtime: &NativeServiceRuntime, query: &str) -> Vec<Value> {
+        runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.history.list",
+                json!({ "query": query, "limit": 20 }),
+            )
+            .await
+            .unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    async fn cleanup_clipboard_query(runtime: &NativeServiceRuntime, query: &str) {
+        loop {
+            let items = clipboard_query_items(runtime, query).await;
+            if items.is_empty() {
+                return;
+            }
+            for item in items {
+                runtime
+                    .request(
+                        "com.attson.clipboard",
+                        "clipboard.history.delete",
+                        json!({ "id": item["id"] }),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    async fn clipboard_all_ids(runtime: &NativeServiceRuntime) -> HashSet<String> {
+        let mut ids = HashSet::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut params = json!({ "limit": 100 });
+            if let Some(value) = cursor.as_ref() {
+                params["cursor"] = Value::String(value.clone());
+            }
+            let page = runtime
+                .request("com.attson.clipboard", "clipboard.history.list", params)
+                .await
+                .unwrap();
+            ids.extend(
+                page["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["id"].as_str().unwrap().to_string()),
+            );
+            cursor = page["nextCursor"].as_str().map(str::to_string);
+            if cursor.is_none() {
+                return ids;
+            }
+        }
+    }
+
+    async fn wait_for_clipboard_query(runtime: &NativeServiceRuntime, query: &str) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(item) = clipboard_query_items(runtime, query)
+                    .await
+                    .into_iter()
+                    .next()
+                {
+                    return item;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("clipboard item should be captured")
+    }
+
+    async fn clipboard_kind_ids(runtime: &NativeServiceRuntime, kind: &str) -> HashSet<String> {
+        let mut ids = HashSet::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut params = json!({ "kind": kind, "limit": 100 });
+            if let Some(value) = cursor.as_ref() {
+                params["cursor"] = Value::String(value.clone());
+            }
+            let page = runtime
+                .request("com.attson.clipboard", "clipboard.history.list", params)
+                .await
+                .unwrap();
+            ids.extend(
+                page["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["id"].as_str().unwrap().to_string()),
+            );
+            cursor = page["nextCursor"].as_str().map(str::to_string);
+            if cursor.is_none() {
+                return ids;
+            }
+        }
+    }
+
+    async fn wait_for_new_clipboard_kind(
+        runtime: &NativeServiceRuntime,
+        kind: &str,
+        known: &HashSet<String>,
+    ) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let listed = runtime
+                    .request(
+                        "com.attson.clipboard",
+                        "clipboard.history.list",
+                        json!({ "kind": kind, "limit": 100 }),
+                    )
+                    .await
+                    .unwrap();
+                if let Some(item) = listed["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["id"].as_str().is_some_and(|id| !known.contains(id)))
+                {
+                    return item.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("clipboard item kind should be captured")
     }
 
     #[cfg(unix)]

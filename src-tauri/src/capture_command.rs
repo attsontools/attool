@@ -11,22 +11,27 @@ use tauri::{AppHandle, Manager};
 
 const CAPTURE_ARG: &str = "--capture";
 const CLIPBOARD_HISTORY_ARG: &str = "--clipboard-history";
+const PLUGIN_WINDOW_ARG: &str = "--plugin-window";
 const RECORDING_ARG: &str = "--recording";
 const SOCKET_FILE: &str = "attool-capture.sock";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CommandRequest {
     Capture,
     ClipboardHistory,
+    PluginWindow { app_id: String, window_id: String },
     Recording,
 }
 
 impl CommandRequest {
-    fn message(self) -> &'static [u8] {
+    fn message(&self) -> Vec<u8> {
         match self {
-            Self::Capture => b"capture\n",
-            Self::ClipboardHistory => b"clipboard-history\n",
-            Self::Recording => b"recording\n",
+            Self::Capture => b"capture\n".to_vec(),
+            Self::ClipboardHistory => b"clipboard-history\n".to_vec(),
+            Self::PluginWindow { app_id, window_id } => {
+                format!("plugin-window\t{app_id}\t{window_id}\n").into_bytes()
+            }
+            Self::Recording => b"recording\n".to_vec(),
         }
     }
 }
@@ -47,7 +52,10 @@ fn requested_command_from_args(args: &[OsString]) -> Option<CommandRequest> {
     } else if args.iter().any(|arg| arg == RECORDING_ARG) {
         Some(CommandRequest::Recording)
     } else {
-        None
+        args.windows(2)
+            .find(|pair| pair[0] == PLUGIN_WINDOW_ARG)
+            .and_then(|pair| pair[1].to_str())
+            .and_then(parse_plugin_window_identity)
     }
 }
 
@@ -63,26 +71,75 @@ fn socket_path() -> Result<PathBuf, String> {
     Ok(cache_dir.join("attool").join(SOCKET_FILE))
 }
 
-fn send_command(path: &Path, request: CommandRequest) -> Result<(), String> {
+fn send_command(path: &Path, request: &CommandRequest) -> Result<(), String> {
     let mut stream = UnixStream::connect(path).map_err(|error| error.to_string())?;
     stream
-        .write_all(request.message())
+        .write_all(&request.message())
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn forward_if_running(request: CommandRequest) -> bool {
+pub(crate) fn forward_if_running(request: &CommandRequest) -> bool {
     socket_path()
         .and_then(|path| send_command(&path, request))
         .is_ok()
 }
 
 fn parse_command_message(payload: &str) -> Option<CommandRequest> {
-    match payload.trim() {
+    let payload = payload.trim();
+    match payload {
         "capture" => Some(CommandRequest::Capture),
         "clipboard-history" => Some(CommandRequest::ClipboardHistory),
         "recording" => Some(CommandRequest::Recording),
-        _ => None,
+        _ => {
+            let mut parts = payload.split('\t');
+            match (parts.next(), parts.next(), parts.next(), parts.next()) {
+                (Some("plugin-window"), Some(app_id), Some(window_id), None) => {
+                    plugin_window_request(app_id, window_id)
+                }
+                _ => None,
+            }
+        }
     }
+}
+
+fn parse_plugin_window_identity(value: &str) -> Option<CommandRequest> {
+    let (app_id, window_id) = value.split_once('/')?;
+    if window_id.contains('/') {
+        return None;
+    }
+    plugin_window_request(app_id, window_id)
+}
+
+fn plugin_window_request(app_id: &str, window_id: &str) -> Option<CommandRequest> {
+    let app_id_bytes = app_id.as_bytes();
+    let valid_app_id = app_id.len() <= 128
+        && app_id_bytes
+            .iter()
+            .any(|value| matches!(value, b'.' | b'-'))
+        && app_id_bytes
+            .first()
+            .is_some_and(|value| value.is_ascii_lowercase() || value.is_ascii_digit())
+        && app_id_bytes
+            .last()
+            .is_some_and(|value| value.is_ascii_lowercase() || value.is_ascii_digit())
+        && app_id_bytes.iter().all(|value| {
+            value.is_ascii_lowercase() || value.is_ascii_digit() || matches!(value, b'.' | b'-')
+        })
+        && app_id_bytes
+            .windows(2)
+            .all(|pair| !(matches!(pair[0], b'.' | b'-') && matches!(pair[1], b'.' | b'-')));
+    let valid_window_id = !window_id.is_empty()
+        && window_id.len() <= 64
+        && window_id
+            .bytes()
+            .all(|value| value.is_ascii_lowercase() || value.is_ascii_digit() || value == b'-')
+        && !window_id.starts_with('-')
+        && !window_id.ends_with('-')
+        && !window_id.contains("--");
+    (valid_app_id && valid_window_id).then(|| CommandRequest::PluginWindow {
+        app_id: app_id.to_string(),
+        window_id: window_id.to_string(),
+    })
 }
 
 fn trigger_command(app: &AppHandle, request: CommandRequest) -> Result<(), String> {
@@ -92,6 +149,19 @@ fn trigger_command(app: &AppHandle, request: CommandRequest) -> Result<(), Strin
             Ok(())
         }
         CommandRequest::ClipboardHistory => show_clipboard_history(app),
+        CommandRequest::PluginWindow { app_id, window_id } => {
+            let runtime = app
+                .try_state::<crate::plugin::auxiliary_window::AuxiliaryWindowRuntime>()
+                .ok_or_else(|| "插件窗口运行时尚未就绪".to_string())?;
+            tauri::async_runtime::block_on(runtime.open(
+                app,
+                &app_id,
+                &window_id,
+                serde_json::json!({ "source": "systemShortcut" }),
+            ))
+            .map(|_| ())
+            .map_err(|error| format!("{}: {}", error.code, error.message))
+        }
         CommandRequest::Recording => {
             trigger_recording_overlay(app);
             Ok(())
@@ -126,7 +196,7 @@ pub fn start_listener(app: &AppHandle) -> Result<(), String> {
             };
             let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
             let mut payload = String::new();
-            if stream.take(64).read_to_string(&mut payload).is_ok() {
+            if stream.take(512).read_to_string(&mut payload).is_ok() {
                 if let Some(request) = parse_command_message(&payload) {
                     if let Err(error) = trigger_command(&handle, request) {
                         eprintln!("处理外部快捷键命令失败：{error}");
@@ -241,6 +311,25 @@ mod tests {
             requested_command_from_args(&[OsString::from("attool"), OsString::from("--recording")]),
             Some(CommandRequest::Recording)
         );
+        assert_eq!(
+            requested_command_from_args(&[
+                OsString::from("attool"),
+                OsString::from("--plugin-window"),
+                OsString::from("com.attson.clipboard/history"),
+            ]),
+            Some(CommandRequest::PluginWindow {
+                app_id: "com.attson.clipboard".to_string(),
+                window_id: "history".to_string(),
+            })
+        );
+        assert_eq!(
+            requested_command_from_args(&[
+                OsString::from("attool"),
+                OsString::from("--plugin-window"),
+                OsString::from("../history"),
+            ]),
+            None
+        );
     }
 
     #[test]
@@ -256,6 +345,17 @@ mod tests {
         assert_eq!(
             parse_command_message("recording\n"),
             Some(CommandRequest::Recording)
+        );
+        assert_eq!(
+            parse_command_message("plugin-window\tcom.attson.clipboard\thistory\n"),
+            Some(CommandRequest::PluginWindow {
+                app_id: "com.attson.clipboard".to_string(),
+                window_id: "history".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_command_message("plugin-window\t../clipboard\thistory\n"),
+            None
         );
         assert_eq!(parse_command_message("unknown\n"), None);
     }
