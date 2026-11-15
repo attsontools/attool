@@ -673,6 +673,7 @@ function assertClipboardResult(method: string, value: unknown) {
       }
       if (
         normalized === 'previewdataurl'
+        && nested !== null
         && (typeof nested !== 'string'
           || !/^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/]*={0,2}$/.test(nested)
           || new TextEncoder().encode(nested).byteLength > CLIPBOARD_PREVIEW_MAX_BYTES)

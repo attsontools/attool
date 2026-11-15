@@ -294,6 +294,39 @@ describe('plugin host session', () => {
     });
   });
 
+  it('accepts clipboard items without an image preview', async () => {
+    const port = new FakePort();
+    const result = {
+      items: [{
+        id: 'clip-text',
+        kind: 'text',
+        preview: 'plain text',
+        previewDataUrl: null
+      }],
+      nextCursor: null
+    };
+    createPluginHostSession({
+      app: clipboard,
+      port,
+      theme: () => 'dark',
+      notify: vi.fn(),
+      saveFile: vi.fn(),
+      requestNativeService: vi.fn(async () => result)
+    });
+    const send = (id: string, method: string, params: unknown = {}): HostRpcMessage => ({
+      jsonrpc: '2.0', id, apiVersion: '2.0', appId: clipboard.appId, method, params
+    });
+    port.receive(send('handshake', 'host.handshake'));
+    await flush();
+
+    port.receive(send('list', 'host.clipboard.history', {
+      method: 'clipboard.history.list', params: { limit: 50 }
+    }));
+    await flush();
+
+    expect(port.sent.at(-1)).toMatchObject({ id: 'list', result });
+  });
+
   it('exposes PSD selections as one-use template tokens', async () => {
     const port = new FakePort();
     const requestService = vi.fn(async () => ({ id: 'template-1' }));
