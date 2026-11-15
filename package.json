@@ -30,7 +30,7 @@
     "vue": "^3.5.33"
   },
   "devDependencies": {
-    "@attson/plugin-sdk": "github:attsontools/attool-plugin-sdk#a6da42104b051c228c897bd5ce63121a10264b4d",
+    "@attson/plugin-sdk": "https://gh-proxy.com/https://github.com/attsontools/attool-plugin-sdk/archive/410158b5e850836d5db681b1a02b13e4d55d53d6.tar.gz",
     "@tauri-apps/cli": "2.12.2",
     "@vitejs/plugin-vue": "^6.0.6",
     "esbuild": "^0.28.0",

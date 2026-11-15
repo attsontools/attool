@@ -491,6 +491,34 @@ export async function inspectPluginPackage({
 }
 
 function requireApplicationPackageLayout(application, manifest) {
+  if (application.appId === 'com.attson.clipboard') {
+    const windows = manifest.target.os === 'windows';
+    const serviceEntry = `native/atclipboard-service${windows ? '.exe' : ''}`;
+    requireEqual(manifest.nativeService?.entry, serviceEntry, 'Clipboard native service entry');
+    requireEqual(manifest.nativeService?.lifecycle, 'background', 'Clipboard native service lifecycle');
+    requireEqual(manifest.ui.windows, {
+      history: { entry: 'ui/history.html', presentation: 'bottomPanel' },
+      preview: { entry: 'ui/preview.html', presentation: 'centeredDialog' }
+    }, 'Clipboard auxiliary windows');
+    const expectedFiles = [
+      'LICENSE',
+      serviceEntry,
+      'ui/history.html',
+      'ui/index.html',
+      'ui/preview.html'
+    ].sort();
+    const actualFiles = Object.keys(manifest.files).sort();
+    const missingFiles = expectedFiles.filter((relative) => !manifest.files[relative]);
+    const unexpectedFiles = actualFiles.filter(
+      (relative) => !expectedFiles.includes(relative) && !relative.startsWith('ui/')
+    );
+    if (missingFiles.length > 0 || unexpectedFiles.length > 0) {
+      throw new Error(
+        `Clipboard package files mismatch: missing ${JSON.stringify(missingFiles)}, unexpected ${JSON.stringify(unexpectedFiles)}`
+      );
+    }
+    return;
+  }
   if (application.appId !== 'com.attson.aria2') return;
 
   const windows = manifest.target.os === 'windows';
