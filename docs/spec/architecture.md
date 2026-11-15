@@ -10,17 +10,16 @@
 │  │                   Dashboard / SettingsModal /           │
 │  │                   UpdateBanner / ...                    │
 │  ├─ ui/*             Panel / TaskRow / StatPill / Kbd     │
-│  ├─ <6 工具>/*       clipboard / image / network /        │
-│  │                   douyin / ecommerce / ai              │
+│  ├─ <5 工具>/*       image / network / douyin /            │
+│  │                   ecommerce / ai                       │
 │  │                   （懒加载）                             │
 │  ├─ composables/*    useTheme / useSidebarState /         │
-│  │                   useUpdater / useClipboardHistory /    │
-│  │                   usePluginStore...                     │
+│  │                   useUpdater / usePluginStore...        │
 │  ├─ plugins/*        应用管理 / PluginFrame / Host API     │
 │  ├─ theme/index.ts   Naive UI overrides（dark + light）    │
 │  ├─ styles/*.css     tokens + reset + template-editor     │
-│  ├─ types/*          Tool / DownloadTask / Clipboard...   │
-│  └─ utils/*          ecommerceTemplate / clipboardHistory │
+│  ├─ types/*          Tool / DownloadTask / Template...    │
+│  └─ utils/*          ecommerceTemplate / downloadFormat   │
 │                                                          │
 │           ↕ invoke() / listen()                          │
 │                                                          │
@@ -28,7 +27,7 @@
 │  ├─ build.rs         注入 updater 公钥 → OUT_DIR/*.pem     │
 │  ├─ lib.rs           run() + Aria2 下载 + command 注册    │
 │  ├─ embedded_runtime / bundled_tools  内置运行时释放与定位 │
-│  ├─ clipboard/       历史存储 + 系统剪贴板监听（SQLite）   │
+│  ├─ clipboard/       系统图片剪贴板写入 + capture 浮层     │
 │  ├─ imaging/         压缩/转换/EXIF/OCR/截图（xcap）       │
 │  ├─ recording.rs    录屏分块缓存 / 保存 / 清理             │
 │  ├─ ecommerce/       模板 render / storage / psd_bridge   │
@@ -46,7 +45,7 @@
 │  ├─ psd-bridge sidecar    Python + psd-tools + yt-dlp    │
 │  ├─ QuickJS / GStreamer plugins  YouTube / Linux 录屏    │
 │  ├─ xcap / core-graphics  屏幕截图                        │
-│  ├─ gtk-layer-shell  Wayland 剪贴板面板底部定位           │
+│  ├─ gtk-layer-shell  Wayland capture overlay 定位         │
 │  ├─ pkexec           Linux 升级提权（updater）             │
 │  └─ open / explorer / xdg-open    打开文件夹              │
 └──────────────────────────────────────────────────────────┘
@@ -56,7 +55,7 @@
 
 - **请求-响应：** `invoke<T>('command_name', { arg })` （`@tauri-apps/api/core`）
 - **流式事件：** Rust `app_handle.emit("event-name", payload)` → 前端 `listen<T>('event-name', cb)`
-  - `download-progress`（aria2 输出解析后推送）、`clipboard-history-updated`（剪贴板监听）、`capture-overlay-init` / `capture-failed`（统一捕获浮层）、`capture-overlay-recording-toggle`（录屏快捷键切换 / 停止）、`recording://completed` / `recording://native-error`（录屏结果与原生错误）、`updater://state`（自研 updater 状态机推送）、`plugin://native-service-event`（Native Service 事件统一转发）等
+  - `download-progress`（aria2 输出解析后推送）、`capture-overlay-init` / `capture-failed`（统一捕获浮层）、`capture-overlay-recording-toggle`（录屏快捷键切换 / 停止）、`recording://completed` / `recording://native-error`（录屏结果与原生错误）、`updater://state`（自研 updater 状态机推送）、`plugin://native-service-event`（Native Service 事件统一转发）等
 - **错误：** Rust 命令返回 `Result<T, String>`，前端 `try { await invoke(...) } catch (e)` 捕获
 
 ## 状态分层
@@ -65,11 +64,11 @@
 |---|---|---|
 | UI session | Vue ref | 当前选中工具、表单值、loading flags（应用退出即清） |
 | 浏览器持久 | `localStorage` | sidebar 折叠状态、上次打开工具、主题、属性面板折叠 |
-| 应用持久 | rusqlite（Tauri data dir） | 下载任务历史、剪贴板历史、模板项目 / 素材库、插件 registry 与管理历史 |
+| 应用持久 | rusqlite（Tauri data dir） | 下载任务历史、模板项目 / 素材库、插件 registry 与管理历史 |
 | updater 缓存 | 文件（`app_cache_dir/updater/`） | 已下载但未 apply 的 archive stage |
 | 临时 | Tauri runtime State | 进行中的下载子进程句柄（`DownloadTasks`）、录屏分块文件 / Wayland 原生录制 session（`RecordingStore`）、Updater 状态机 `UpdaterState`、插件 registry/runtime 与 Native Service supervisor |
 
-HTTP 数据仍位于 `${app_data_dir}/http/http.sqlite3`，但不属于宿主 rusqlite 状态。`com.attson.http` 的 Native/Data Service 独占数据库、迁移、历史清理、请求取消和 SSE/WS session；平台只把同一数据目录交给已验签 service。停用或卸载插件默认保留该目录，平台启动不打开、改写或删除数据库。
+HTTP 与剪贴板数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app_data_dir}/clipboard/clipboard_history.sqlite3`，但不属于宿主 rusqlite 状态。对应 Native/Data Service 独占数据库、迁移和领域状态；平台只把原数据目录交给已验签 service。停用或卸载插件默认保留数据，平台启动不打开、改写或删除两者数据库。
 
 ## 可插拔应用
 
@@ -101,16 +100,16 @@ HTTP 数据仍位于 `${app_data_dir}/http/http.sqlite3`，但不属于宿主 ru
 
 `com.attson.template` 的 Native Service 固定复用 `${app_data_dir}/ecommerce`，以便后续原位接管现有模板 SQLite、素材和批量缓存；其他未知应用仍使用 `${app_data_dir}/native-services/<appId>`。Host API 与 Rust 网关共同限制 `template.templates.*`、PSD/素材导入及批量注册、渲染、保存方法，文件与目录路径只在 token 解析后进入 service，插件页面不接触真实路径。当前阶段只建立权限与目录契约，数据 owner 切换和旧内置写入保护由独立模板应用接管阶段完成。
 
-`com.attson.clipboard` 的独立版与插件版复用 `atclipboard-service`，固定原位接管 `${app_data_dir}/clipboard`，并通过 `host.clipboard.history` 的双层白名单访问。service 以生命周期锁和 `migrating / owned` marker 保证单一 owner；旧设置表为空时沿用历史默认值且不改写数据库，部分缺失或非法设置继续 fail closed。公共图片条目不得返回 asset、数据库或缓存路径，预览只接受 PNG/JPEG/WebP base64 data URL 且整串不超过 2 MiB；列表单页最多 100 条。后台采集、三类恢复、暂停、保留策略、清空未收藏、停启、卸载、重装、升级和首启失败回滚已通过两版生产 Catalog 与真实 500 条旧库验证；Wayland 插件模式使用宿主 `--plugin-window` 命令激活签名 history 窗口。宿主旧实现仍以兼容 guard 保留但在 `owned` 后永久退权，完整删除属于后续退场阶段。
+`com.attson.clipboard` 的独立版与插件版复用 `atclipboard-service`，固定原位接管 `${app_data_dir}/clipboard`，并通过 `host.clipboard.history` 的双层白名单访问。service 以生命周期锁和 `migrating / owned` marker 保证单一 owner；旧设置表为空时沿用历史默认值且不改写数据库，部分缺失或非法设置继续 fail closed。公共图片条目不得返回 asset、数据库或缓存路径，预览只接受 PNG/JPEG/WebP base64 data URL 且整串不超过 2 MiB；列表单页最多 100 条。后台采集、三类恢复、暂停、保留策略、清空未收藏、停启、卸载、重装、升级和首启失败回滚已通过两版生产 Catalog 与真实 500 条旧库验证；Wayland 插件模式使用宿主 `--plugin-window` 命令激活签名 history 窗口。宿主旧 UI、SQLite owner、watcher、领域快捷键、commands 和固定窗口已删除；停用或卸载插件不触发宿主回退。
 
 `com.attson.aria2` 已完成本地双制品与发布链验证：独立 Tauri 与签名 `.atpkg` 复用同一 Vue UI 和 `ataria2-service`，service 通过跨平台文件锁独占 `${app_data_dir}/aria2`、SQLite、固定 aria2 1.37.0 runtime 和取消句柄。首次接管先要求宿主写入 capability，再写 `migrating` marker，并以 SQLite exclusive barrier 等待 marker 前的旧写事务完成；一致快照通过 schema、完整性和行数校验后切换为永久 `owned`。旧库保留只读，宿主旧 owner 的所有读写在 marker 存在时拒绝，写路径取得 SQLite write transaction 后还会再次检查，停用或卸载插件也不恢复旧 owner。Linux x86_64 测试包已通过真实安装、下载和共享历史，五目标 workflow、生产签名校验和 Catalog 包布局校验也已在本地完成；生产 Publisher 授权、正式 Release 和安装/升级/回滚生命周期仍待远端验证。
 
 ### 前端装配与应用外置
 
 - `usePluginStore` 从 Tauri registry 加载插件并生成动态 `Tool`；“应用管理”固定在侧栏平台分组，负责本地包预览、权限确认、安装、启停、卸载、筛选和历史查看。
-- 平台不再内置 `codec`、`text`、`generator`、`time`、`json` 与 `http`；对应插件是这些工具在平台中的唯一入口。停用或卸载插件后，平台不提供回退版内置工具。
+- 平台不再内置 `codec`、`text`、`generator`、`time`、`json`、`http` 与 `clipboard`；对应插件是这些工具在平台中的唯一入口。停用或卸载插件后，平台不提供回退版内置工具。
 - `@attson/plugin-sdk` 定义 manifest、签名 canonical JSON、浏览器 Host bridge 和稳定错误；`atcodec`、`attext`、`atgenerator`、`attime` 与 `atjson` 通过 Vite host alias 在 Standalone Adapter 与 Plugin Adapter 间切换，各自共享独立版和插件版的 Vue UI 与核心逻辑。
-- `athttp` 同样通过 Vite adapter 复用 UI：独立版直接连接本地 service，插件版经 Host API 2.x 转发到相同 service。生产 `0.1.0-alpha.2` 已通过五目标 Release、Catalog 安装/升级/回滚和真实 Tauri 验收。
+- `athttp` 与 `atclipboard` 同样通过 Vite adapter 复用 UI：独立版直接连接本地 service，插件版经 Host API 2.x 转发到相同 service。两者的生产 `0.1.0-alpha.2` 均已通过五目标 Release、Catalog 安装/升级/回滚和真实 Tauri 验收。
 
 ### 官方 Catalog、升级与回滚
 
@@ -185,7 +184,7 @@ HTTP 数据仍位于 `${app_data_dir}/http/http.sqlite3`，但不属于宿主 ru
 
 顶层装配点：
 
-- 定义 `builtinTools[]`，并与 `usePluginStore.navigationTools` 组合成动态导航
+- 导入 `builtinTools[]`，并与 `usePluginStore.navigationTools` 组合成动态导航
 - 起 composable：`useSidebarState` / `useLastTool` / `useTheme`
 - Naive UI ConfigProvider 切换主题
 - 渲染 `<AppShell>` + `<template v-else-if="selectedTool.id === '<id>'">` 分支
@@ -234,7 +233,7 @@ export function useTheme(
 | 模块 | 职责 | 关键 command |
 |---|---|---|
 | `lib.rs` | Aria2 下载（正式版启动内置 `aria2c` + 进度事件）、command 注册 | `start_download` / `cancel_download` / `list_download_tasks` / `open_external_url` |
-| `clipboard/` | 剪贴板历史（SQLite 存储 + 系统剪贴板监听 + 快捷键面板） | `list_clipboard_items` / `restore_clipboard_item` / `clear_clipboard_history` / `get·save_clipboard_settings` |
+| `clipboard/` | 截图/钉图共用的跨平台系统图片剪贴板写入，以及 Linux capture overlay layer-shell | 无领域 command |
 | `imaging/` | 图片压缩 / 转换 / EXIF / OCR / 截图与统一捕获浮层 | `compress_images` / `convert_images` / `read·strip_image_exif` / `ocr_image` / `ocr_capture_overlay` / `capture_screen` / `open·commit·pin_capture_overlay` / `get·set_capture_shortcut` |
 | `recording.rs` / `recording_preview.rs` | 录屏快捷键、Web 分块缓存、Wayland 来源准备 / 区域裁剪 / 编码控制、完成结果交接、只读 Range 预览、保存与清理 | `get·set_recording_shortcut` / `prepare·start·pause·resume·stop·cancel_native_recording` / `begin·append·finish_recording_file` / `present_recording_result` / `recording_preview_url` / `save·discard_recording_file` / `default_recording_path` |
 | `ecommerce/` | 主图模板：PSD 导入 / 图层渲染 / 批量替换 | `import_psd_template` / `save·load·list·delete_ecommerce_template` / `run_batch_replace_tasks` |
@@ -271,7 +270,7 @@ export function useTheme(
 ### `src-tauri/src/plugin/http_service.rs`
 
 - 只为已安装、已启用、带合法 `nativeService` 的应用启动或连接 service；入口文件仍由安装 registry 的 hash 契约约束。
-- 按 app 解析受控数据目录：HTTP 保持 `${app_data_dir}/http`，Aria2 使用 `${app_data_dir}/aria2`，主图模板使用 `${app_data_dir}/ecommerce`，其他应用使用 `${app_data_dir}/native-services/<appId>`；runtime 管理 endpoint/lease、并发启动、owned child 生命周期、版本协商、请求超时和稳定错误码。
+- 按 app 解析受控数据目录：HTTP 保持 `${app_data_dir}/http`，剪贴板使用 `${app_data_dir}/clipboard`，Aria2 使用 `${app_data_dir}/aria2`，主图模板使用 `${app_data_dir}/ecommerce`，其他应用使用 `${app_data_dir}/native-services/<appId>`；runtime 管理 endpoint/lease、并发启动、owned child 生命周期、版本协商、请求超时和稳定错误码。
 - `plugin_connect_native_service` 建立连接，`plugin_native_service_request` 代理 Host API 2.x 请求；service 事件带 `appId` 统一转发给 `PluginFrame`。
 - transport 只开放显式领域方法：HTTP 继续映射三项 `host.http.*` 权限，下载七个方法映射到 `host.download.tasks`，模板十三个项目方法映射到 `host.template.project`；不提供任意 native service call。
 - 不实现 HTTP、下载或其他应用业务，也不持有业务 SQLite schema；业务状态均由各自版本化 service 拥有。
@@ -399,3 +398,7 @@ Root 私钥保持离线，日常 Catalog 只使用 Root 授权的独立 Signing 
 ### 2026-11-15 剪贴板接管后永久退权旧 owner
 
 `atclipboard-service` 在原目录完整性验证成功后写入永久 `owned` marker，宿主旧剪贴板 owner 即使插件停用或卸载也不自动恢复。相比可逆切换，该方案要求独立版与插件版共同承担恢复能力，但避免外部 service 仍运行时宿主重新写入同一 SQLite 和资产目录。
+
+### 2026-11-15 剪贴板仅保留独立应用入口
+
+生产 Catalog、升级回滚和真实旧库生命周期验证完成后，平台完整删除内置剪贴板 UI、SQLite owner、watcher、领域快捷键、commands 与固定窗口，只保留动态应用入口、service 桥接和签名辅助窗口。相比隐藏旧入口或保留兼容命令，完整退场避免宿主再次成为数据 owner，也确保停用或卸载插件不会触发不可见回退。

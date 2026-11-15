@@ -15,9 +15,10 @@ attool 是一个个人使用的桌面工具集合，运行在 Tauri 2 上。前�
 - Codec、Text、Generator、Time 与 JSON 均为从平台完全外置的双制品应用：`atcodec`、`attext`、`atgenerator`、`attime`、`atjson` 仓库分别生成独立 Tauri 安装包和对应插件包。平台不再包含五者的内置实现，安装的插件是唯一入口。
 - 官方 Catalog 由 AT Tool 主仓维护并签名，平台可按当前 OS/架构远程安装和主动升级多个官方应用；新版本先进入 `pending`，健康检查与原子切换通过后成为 `current`，失败时保留或恢复上一可用版本。
 - HTTP 已完全外置为 `com.attson.http`：`athttp` 独立版和官方 Catalog 插件复用同一 UI、请求核心与 `${app_data_dir}/http/http.sqlite3`，由单一 Native/Data Service 提供请求、长连接和数据 API。平台只保留 Host API 2.x 桥接和 service supervisor，不再包含内置 HTTP UI、Store、Tauri commands 或 SQLite owner。
+- 剪贴板已完全外置为 `com.attson.clipboard`：`atclipboard` 独立版和官方 Catalog 插件复用同一 UI 与 `${app_data_dir}/clipboard`，由单一 background Native Service 持有历史、监听和快捷键。平台只保留 Host API 2.x、service supervisor、签名辅助窗口及通用系统剪贴板写入，不再包含内置剪贴板 UI、commands、SQLite owner 或固定历史/预览窗口。
 - 插件平台支持页面关闭后继续连接的 `background` Native Service，以及由 manifest 声明、宿主隔离承载的底部面板和居中对话框辅助窗口。后台连接失败不会阻止平台启动，应用入口和管理页会显示稳定错误码与关联 ID。
 
-下面详列两个“重后端”内置工具与 HTTP 独立应用，其余见汇总表。
+下面详列两个“重后端”内置工具与 HTTP、剪贴板独立应用，其余见汇总表。
 
 ### Aria2 下载（`id: aria2`）
 
@@ -44,11 +45,17 @@ attool 是一个个人使用的桌面工具集合，运行在 Tauri 2 上。前�
 - SSE / WebSocket 消息只驻 service 内存 buffer（2000 条 / 5 MB），不写历史数据库；关闭 tab 后清理。
 - 历史持久值 `attool.lastTool=http` 会映射到动态应用 ID；目标应用不可用时留在首页，不静默恢复旧实现。
 
+### 剪贴板（独立应用 `com.attson.clipboard`）
+
+- 通过官方 Catalog 安装；启用后动态工具 ID 为 `plugin:com.attson.clipboard`，停用或卸载后入口消失，平台不提供内置回退或自动安装。
+- `atclipboard-service` 独占 `${app_data_dir}/clipboard`，页面关闭时仍采集文本、图片和文件；`CommandOrControl+Alt+V` 由 service 持有并通过签名 `history` 辅助窗口打开历史面板，预览使用签名 `preview` 辅助窗口。
+- 插件 iframe 通过 `host.clipboard.history` 的六个历史方法和两个设置方法访问 service；公共 DTO、分页、文本截断与图片预览均有界，不暴露内部图片、数据库或缓存路径。
+- 宿主启动不打开、迁移、清理或删除剪贴板数据库，不注册领域快捷键，也不保留固定窗口或旧 Tauri commands。截图、钉图等通用系统图片剪贴板写入仍由宿主提供。
+
 ### 其余工具
 
 | 工具（id） | 能力 | 后端 |
 |---|---|---|
-| 剪贴板（`clipboard`） | 历史记录、图片/文本预览、Paste 风格恢复、快捷键自定义、独立浮窗；`atclipboard` 双制品、五目标 Release、两版生产 Catalog、升级与首启失败回滚已通过真实旧库验证，宿主内置实现仅以 owner guard 兼容保留并等待退场 | `atclipboard-service`（单一 owner）+ 宿主 `clipboard/`（兼容 guard，待退场） |
 | 视频链接抽取（`douyin`） | 抖音 / B站 / 小红书 / YouTube 链接与文案解析；YouTube 使用内置 yt-dlp + EJS + QuickJS | `douyin/bilibili/xhs/youtube.rs` |
 | 图片（`image`） | 统一捕获工作台（截图 / 录屏，截图选区支持标注与快捷 OCR）、压缩、格式转换、EXIF、OCR；OCR 内置 Tesseract 与中英日语言模型 | `imaging/`（含 xcap 截图）+ `recording.rs` |
 | 网络（`network`） | URL 分解、Ping、端口、DNS | `network/` |

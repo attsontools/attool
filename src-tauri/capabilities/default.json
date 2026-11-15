@@ -4,8 +4,6 @@
   "description": "Default desktop permissions for AT Tool",
   "windows": [
     "main",
-    "clipboard-history",
-    "clipboard-preview",
     "capture-overlay",
     "capture-pin-*",
     "plugin-aux-*"

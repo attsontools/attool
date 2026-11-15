@@ -132,9 +132,8 @@
 平台内置工具复用同一套外壳与原子组件，形成一致的页面骨架：
 
 - **工具页容器**：`Panel`（`title` + 右上 `#right` slot）分区；多子功能的内置工具（图片 / 网络）用顶部 tab 切分 pane。
-- **快捷键录制**：图片截图页、剪贴板页提供"修改 / 恢复默认"按钮 + 键盘录制框（`keydown` 捕获组合键），注册失败时就地红色 alert 提示。
-- **预览弹窗**：剪贴板图片用 `NImage` 预览层（缩放 / 旋转 / 复制工具栏），文本用 `NModal` 全文弹窗；均以悬浮图标触发，不劫持卡片点击。
-- **多窗口**：统一捕获浮层（`capture-overlay`，透明全屏，顶部切换截图 / 录屏；截图支持选区 + 标注，录屏支持区域 / 窗口 / 全屏与区域调整）、截图钉图窗（`capture-pin-*`）、剪贴板历史独立浮窗（`clipboard-history`）都是独立 Tauri 窗口，共用同一套 token / 主题。插件辅助窗口由签名 manifest 声明为 `bottomPanel` 或 `centeredDialog`，宿主决定尺寸、位置、置顶和无边框样式，窗口内容仍由 `PluginFrame` 的主题通知和 opaque iframe 隔离。
+- **快捷键录制**：图片截图页和录屏页提供"修改 / 恢复默认"按钮 + 键盘录制框（`keydown` 捕获组合键），注册失败时就地红色 alert 提示。剪贴板快捷键与错误状态由独立应用设置页维护。
+- **多窗口**：统一捕获浮层（`capture-overlay`，透明全屏，顶部切换截图 / 录屏；截图支持选区 + 标注，录屏支持区域 / 窗口 / 全屏与区域调整）和截图钉图窗（`capture-pin-*`）由宿主持有。插件辅助窗口由签名 manifest 声明为 `bottomPanel` 或 `centeredDialog`；剪贴板 history/preview 也走该通用路径，由宿主决定尺寸、位置、置顶和无边框样式，窗口内容仍由 `PluginFrame` 的主题通知和 opaque iframe 隔离。
 - **插件应用容器**：`PluginFrame` 填满宿主工具内容区，不额外套卡片；loading、连接和错误状态由宿主统一呈现。插件内部设计由对应应用仓库维护，但必须通过 Host API 主题通知跟随当前 dark / light 主题。
 
 ## 模板编辑器画布
@@ -161,7 +160,7 @@
 | `⌘\` / `Ctrl\` | 切换 sidebar 折叠 |
 | `⌘K` / `CtrlK` | 命令面板：搜索内置工具与已启用的独立应用 |
 
-**系统全局**（任意窗口，`tauri-plugin-global-shortcut`，用户可在对应工具页改）：
+**系统全局**（任意窗口；截图/录屏由宿主注册，剪贴板由 `atclipboard-service` 注册）：
 
 | 默认键位 | 行为 |
 |---|---|
@@ -169,7 +168,7 @@
 | `CommandOrControl+Shift+R` | 录屏（打开来源选择器；录制中再次按下停止） |
 | `CommandOrControl+Alt+V` | 打开剪贴板历史面板 |
 
-全局快捷键在启动时注册；若被系统 / 输入法 / 远程桌面占用，注册失败信息记录在后端 `ShortcutRegisterState`，前端查询后以 toast + 工具页常驻 alert 提示用户更换（`ShortcutErrorNotifier.vue` + 各工具页录制 UI）。
+宿主启动时注册截图与录屏快捷键；失败信息记录在 `ShortcutRegisterState`，前端通过 `ShortcutErrorNotifier.vue` 和对应工具页提示。剪贴板快捷键由 background service 持有，状态通过 `clipboard.settings.get` 交给独立应用显示，宿主不重复注册。
 
 ## 不允许
 

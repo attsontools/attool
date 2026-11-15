@@ -20,7 +20,6 @@ const EDGE_BOTTOM: c_int = 3;
 const LAYER_OVERLAY: c_int = 3;
 const KEYBOARD_MODE_NONE: c_int = 0;
 const KEYBOARD_MODE_EXCLUSIVE: c_int = 1;
-const EXCLUSIVE_ZONE_NONE: c_int = 0;
 const EXCLUSIVE_ZONE_IGNORE: c_int = -1;
 
 type GtkWindowPtr = *mut gtk::ffi::GtkWindow;
@@ -47,7 +46,6 @@ struct LayerShellApi {
 }
 
 static LAYER_SHELL_API: OnceLock<Result<LayerShellApi, String>> = OnceLock::new();
-static HISTORY_LAYER_SHELL_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CAPTURE_LAYER_SHELL_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn is_wayland_backend(
@@ -112,7 +110,7 @@ impl LayerShellApi {
             }
         }
         Err(format!(
-            "无法加载 {LIBRARY_NAME}，剪贴板面板将回退为普通窗口：{}",
+            "无法加载 {LIBRARY_NAME}，Wayland 浮层不可用：{}",
             failures.join("; ")
         ))
     }
@@ -210,18 +208,6 @@ fn configure_window(
     Ok(true)
 }
 
-pub(crate) fn configure_history_window(app: &AppHandle) -> Result<bool, String> {
-    configure_window(
-        app,
-        "clipboard-history",
-        "剪贴板快捷面板",
-        false,
-        true,
-        EXCLUSIVE_ZONE_NONE,
-        &HISTORY_LAYER_SHELL_ACTIVE,
-    )
-}
-
 pub(crate) fn configure_capture_overlay(app: &AppHandle) -> Result<bool, String> {
     configure_window(
         app,
@@ -232,10 +218,6 @@ pub(crate) fn configure_capture_overlay(app: &AppHandle) -> Result<bool, String>
         EXCLUSIVE_ZONE_IGNORE,
         &CAPTURE_LAYER_SHELL_ACTIVE,
     )
-}
-
-pub(crate) fn history_window_is_layer_shell() -> bool {
-    HISTORY_LAYER_SHELL_ACTIVE.load(Ordering::Acquire)
 }
 
 pub(crate) fn capture_overlay_is_layer_shell() -> bool {
