@@ -22,13 +22,20 @@ pub async fn send_with_fallback(
     client: &reqwest::Client,
     url: &str,
 ) -> Result<reqwest::Response, reqwest::Error> {
-    match client.get(url).send().await {
-        Ok(response) => Ok(response),
-        Err(direct_error) => match fallback_url(url) {
-            Some(fallback) => client.get(fallback).send().await,
-            None => Err(direct_error),
-        },
+    send_with_fallback_from(client, url, None).await
+}
+
+pub async fn send_with_fallback_from(
+    client: &reqwest::Client,
+    url: &str,
+    offset: Option<u64>,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let request_url = fallback_url(url).unwrap_or_else(|| url.to_string());
+    let mut request = client.get(request_url);
+    if let Some(offset) = offset.filter(|offset| *offset > 0) {
+        request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
     }
+    request.send().await
 }
 
 #[cfg(test)]

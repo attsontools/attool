@@ -10,9 +10,11 @@ use tokio::{fs::File, io::AsyncWriteExt};
 
 use super::{
     catalog::{CatalogArtifact, CatalogInstallPlan, CatalogTargetArch, CatalogTargetOs},
-    github_proxy::send_with_fallback,
+    github_proxy::send_with_fallback_from,
     package::{AuxiliaryWindow, InspectedPackage, NativeService},
 };
+
+const DOWNLOAD_ATTEMPTS: usize = 4;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -262,30 +264,6 @@ pub async fn download_artifact(
     mut on_progress: impl FnMut(u64),
 ) -> Result<(), RemoteInstallError> {
     let result = async {
-        let response = send_with_fallback(client, &artifact.url)
-            .await
-            .map_err(|error| {
-                RemoteInstallError::new(
-                    "PLUGIN_DOWNLOAD_HTTP_FAILED",
-                    format!("Plugin download failed: {error}"),
-                )
-            })?;
-        if !response.status().is_success() {
-            return Err(RemoteInstallError::new(
-                "PLUGIN_DOWNLOAD_HTTP_FAILED",
-                format!("Plugin server returned HTTP {}", response.status().as_u16()),
-            ));
-        }
-        if response
-            .content_length()
-            .map(|size| size != artifact.size)
-            .unwrap_or(false)
-        {
-            return Err(RemoteInstallError::new(
-                "PLUGIN_DOWNLOAD_SIZE_MISMATCH",
-                "Plugin download size does not match the Catalog",
-            ));
-        }
         if let Some(parent) = destination.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|error| {
                 RemoteInstallError::new(
@@ -302,34 +280,71 @@ pub async fn download_artifact(
         })?;
         let mut downloaded = 0_u64;
         let mut hash = Sha256::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| {
-                RemoteInstallError::new(
-                    "PLUGIN_DOWNLOAD_INTERRUPTED",
-                    format!("Plugin download was interrupted: {error}"),
-                )
-            })?;
-            downloaded = downloaded.checked_add(chunk.len() as u64).ok_or_else(|| {
-                RemoteInstallError::new(
-                    "PLUGIN_DOWNLOAD_SIZE_MISMATCH",
-                    "Plugin download size overflowed",
-                )
-            })?;
-            if downloaded > artifact.size {
-                return Err(RemoteInstallError::new(
-                    "PLUGIN_DOWNLOAD_SIZE_MISMATCH",
-                    "Plugin download exceeds the Catalog size",
-                ));
+        for attempt in 0..DOWNLOAD_ATTEMPTS {
+            let response = match send_with_fallback_from(
+                client,
+                &artifact.url,
+                (downloaded > 0).then_some(downloaded),
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(_error) if attempt + 1 < DOWNLOAD_ATTEMPTS => {
+                    continue;
+                }
+                Err(error) => {
+                    let code = if downloaded == 0 {
+                        "PLUGIN_DOWNLOAD_HTTP_FAILED"
+                    } else {
+                        "PLUGIN_DOWNLOAD_INTERRUPTED"
+                    };
+                    return Err(RemoteInstallError::new(
+                        code,
+                        format!("Plugin download failed: {error}"),
+                    ));
+                }
+            };
+            validate_download_response(&response, downloaded, artifact.size)?;
+            let mut stream = response.bytes_stream();
+            let mut interrupted = None;
+            while let Some(chunk) = stream.next().await {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        interrupted = Some(error.to_string());
+                        break;
+                    }
+                };
+                downloaded = downloaded.checked_add(chunk.len() as u64).ok_or_else(|| {
+                    RemoteInstallError::new(
+                        "PLUGIN_DOWNLOAD_SIZE_MISMATCH",
+                        "Plugin download size overflowed",
+                    )
+                })?;
+                if downloaded > artifact.size {
+                    return Err(RemoteInstallError::new(
+                        "PLUGIN_DOWNLOAD_SIZE_MISMATCH",
+                        "Plugin download exceeds the Catalog size",
+                    ));
+                }
+                file.write_all(&chunk).await.map_err(|error| {
+                    RemoteInstallError::new(
+                        "PLUGIN_STAGING_FAILED",
+                        format!("Cannot write plugin download: {error}"),
+                    )
+                })?;
+                hash.update(&chunk);
+                on_progress(downloaded);
             }
-            file.write_all(&chunk).await.map_err(|error| {
-                RemoteInstallError::new(
-                    "PLUGIN_STAGING_FAILED",
-                    format!("Cannot write plugin download: {error}"),
-                )
-            })?;
-            hash.update(&chunk);
-            on_progress(downloaded);
+            if downloaded == artifact.size {
+                break;
+            }
+            let interruption = interrupted.unwrap_or_else(|| {
+                "response ended before the Catalog size was reached".to_string()
+            });
+            if attempt + 1 == DOWNLOAD_ATTEMPTS {
+                return Err(download_interrupted(Some(&interruption)));
+            }
         }
         file.flush().await.map_err(|error| {
             RemoteInstallError::new(
@@ -358,12 +373,66 @@ pub async fn download_artifact(
     result
 }
 
+fn validate_download_response(
+    response: &reqwest::Response,
+    downloaded: u64,
+    expected_size: u64,
+) -> Result<(), RemoteInstallError> {
+    if downloaded == 0 {
+        if !response.status().is_success() {
+            return Err(RemoteInstallError::new(
+                "PLUGIN_DOWNLOAD_HTTP_FAILED",
+                format!("Plugin server returned HTTP {}", response.status().as_u16()),
+            ));
+        }
+    } else {
+        if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+            return Err(RemoteInstallError::new(
+                "PLUGIN_DOWNLOAD_SIZE_MISMATCH",
+                "Plugin server did not honor the download offset",
+            ));
+        }
+        let expected_range = format!("bytes {downloaded}-{}/{}", expected_size - 1, expected_size);
+        let actual_range = response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok());
+        if actual_range != Some(expected_range.as_str()) {
+            return Err(RemoteInstallError::new(
+                "PLUGIN_DOWNLOAD_SIZE_MISMATCH",
+                "Plugin download range does not match the Catalog",
+            ));
+        }
+    }
+    let expected_response_size = expected_size - downloaded;
+    if response
+        .content_length()
+        .map(|size| size != expected_response_size)
+        .unwrap_or(false)
+    {
+        return Err(RemoteInstallError::new(
+            "PLUGIN_DOWNLOAD_SIZE_MISMATCH",
+            "Plugin download size does not match the Catalog",
+        ));
+    }
+    Ok(())
+}
+
+fn download_interrupted(reason: Option<&str>) -> RemoteInstallError {
+    RemoteInstallError::new(
+        "PLUGIN_DOWNLOAD_INTERRUPTED",
+        format!(
+            "Plugin download was interrupted: {}",
+            reason.unwrap_or("response ended unexpectedly")
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
         collections::{BTreeMap, HashMap},
         io::{Cursor, Write},
-        path::Path,
     };
 
     use base64::Engine;
@@ -403,6 +472,48 @@ mod tests {
                 .await
                 .unwrap();
             stream.write_all(&body).await.unwrap();
+        });
+        format!("http://{address}/codec.atpkg")
+    }
+
+    async fn serve_interrupted_then_range(body: Vec<u8>, interrupted_at: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = first.read(&mut request).await;
+            first
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            first.write_all(&body[..interrupted_at]).await.unwrap();
+            first.shutdown().await.unwrap();
+
+            let (mut resumed, _) = listener.accept().await.unwrap();
+            let read = resumed.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+            assert!(request.contains(&format!("range: bytes={interrupted_at}-")));
+            resumed
+                .write_all(
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
+                        body.len() - interrupted_at,
+                        interrupted_at,
+                        body.len() - 1,
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            resumed.write_all(&body[interrupted_at..]).await.unwrap();
         });
         format!("http://{address}/codec.atpkg")
     }
@@ -604,41 +715,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_an_interrupted_response_and_removes_the_partial_file() {
-        let body = b"partial".to_vec();
-        let url = serve_once(body.clone(), body.len() + 20).await;
-        let mut interrupted_artifact = artifact(url, &body);
-        interrupted_artifact.size += 20;
+    async fn resumes_an_interrupted_response_from_the_verified_offset() {
+        let body = b"signed plugin package resumed after interruption".to_vec();
+        let interrupted_at = 14;
+        let url = serve_interrupted_then_range(body.clone(), interrupted_at).await;
+        let interrupted_artifact = artifact(url, &body);
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("codec.atpkg");
-
-        let error = download_artifact(
-            &reqwest::Client::new(),
-            &interrupted_artifact,
-            &destination,
-            |_| {},
-        )
-        .await
-        .expect_err("interrupted download must fail");
-
-        assert_eq!(error.code, "PLUGIN_DOWNLOAD_INTERRUPTED");
-        assert!(!Path::new(&destination).exists());
-
-        let complete = b"complete retry".to_vec();
-        let retry_url = serve_once(complete.clone(), complete.len()).await;
-        let retry_artifact = artifact(retry_url, &complete);
         let mut progress = Vec::new();
+
         download_artifact(
             &reqwest::Client::new(),
-            &retry_artifact,
+            &interrupted_artifact,
             &destination,
             |downloaded| progress.push(downloaded),
         )
         .await
         .unwrap();
 
-        assert_eq!(tokio::fs::read(&destination).await.unwrap(), complete);
-        assert_eq!(progress.last(), Some(&retry_artifact.size));
+        assert_eq!(tokio::fs::read(&destination).await.unwrap(), body);
+        assert_eq!(progress.last(), Some(&interrupted_artifact.size));
     }
 
     #[tokio::test]
