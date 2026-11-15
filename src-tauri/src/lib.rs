@@ -92,7 +92,6 @@ impl DownloadState {
 /// 供前端启动后查询并提示用户。
 #[derive(Default)]
 struct ShortcutRegisterState {
-    clipboard: std::sync::Mutex<Option<String>>,
     capture: std::sync::Mutex<Option<String>>,
     recording: std::sync::Mutex<Option<String>>,
 }
@@ -100,7 +99,6 @@ struct ShortcutRegisterState {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ShortcutRegisterErrors {
-    clipboard: Option<String>,
     capture: Option<String>,
     recording: Option<String>,
 }
@@ -108,7 +106,6 @@ struct ShortcutRegisterErrors {
 #[tauri::command]
 fn get_shortcut_register_errors(state: State<'_, ShortcutRegisterState>) -> ShortcutRegisterErrors {
     ShortcutRegisterErrors {
-        clipboard: state.clipboard.lock().ok().and_then(|g| g.clone()),
         capture: state.capture.lock().ok().and_then(|g| g.clone()),
         recording: state.recording.lock().ok().and_then(|g| g.clone()),
     }
@@ -1345,12 +1342,6 @@ pub fn run() {
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
 
             #[cfg(target_os = "linux")]
-            match clipboard::layer_shell::configure_history_window(app.handle()) {
-                Ok(true) => eprintln!("剪贴板面板已启用 Wayland layer-shell 底部定位"),
-                Ok(false) => {}
-                Err(error) => eprintln!("{error}"),
-            }
-            #[cfg(target_os = "linux")]
             match clipboard::layer_shell::configure_capture_overlay(app.handle()) {
                 Ok(true) => eprintln!("截图录屏浮层已启用 Wayland layer-shell Overlay 层"),
                 Ok(false) => {}
@@ -1376,49 +1367,7 @@ pub fn run() {
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
             app.manage(ecommerce_owner);
             app.manage(ecommerce_store);
-            let clipboard_dir = app
-                .path()
-                .app_data_dir()
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?
-                .join("clipboard");
-            let clipboard_owner = clipboard::owner::LegacyClipboardOwner::new(clipboard_dir.clone())
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
-            let clipboard_store = clipboard::storage::ClipboardStore::new_for_legacy(
-                clipboard_dir,
-                &clipboard_owner,
-            )
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
-            let clipboard_watcher_state = clipboard::watcher::ClipboardWatcherState::new();
-            let clipboard_store_for_watcher = clipboard_store.clone();
-            app.manage(clipboard_watcher_state.clone());
-            app.manage(clipboard_owner.clone());
             let shortcut_errors = ShortcutRegisterState::default();
-            if !clipboard_owner.is_permanently_taken_over() {
-                if let Ok(_owner_guard) = clipboard_owner.enter() {
-                    clipboard_store.ensure_initialized().map_err(|error| {
-                        std::io::Error::new(std::io::ErrorKind::Other, error)
-                    })?;
-                    let clipboard_shortcut = clipboard_store
-                        .load_settings()
-                        .map(|settings| settings.shortcut)
-                        .unwrap_or_default();
-                    if let Err(error) = clipboard::watcher::register_clipboard_shortcut(
-                        app.handle(),
-                        &clipboard_shortcut,
-                    ) {
-                        eprintln!("{error}");
-                        if let Ok(mut slot) = shortcut_errors.clipboard.lock() {
-                            *slot = Some(error);
-                        }
-                    }
-                }
-                clipboard::watcher::start_clipboard_watcher(
-                    app.handle().clone(),
-                    clipboard_store_for_watcher,
-                    clipboard_watcher_state,
-                    clipboard_owner,
-                );
-            }
             if let Err(error) = imaging::capture::register_capture_shortcut(app.handle()) {
                 eprintln!("{error}");
                 if let Ok(mut slot) = shortcut_errors.capture.lock() {
@@ -1432,7 +1381,6 @@ pub fn run() {
                 }
             }
             app.manage(shortcut_errors);
-            app.manage(clipboard_store);
 
             let ai_dir = app
                 .path()
@@ -1624,14 +1572,6 @@ pub fn run() {
             ecommerce::commands::import_template_asset_from_path,
             ecommerce::commands::run_batch_replace_tasks,
             ecommerce::commands::save_batch_replace_outputs,
-            clipboard::commands::list_clipboard_items,
-            clipboard::commands::delete_clipboard_item,
-            clipboard::commands::set_clipboard_item_pinned,
-            clipboard::commands::clear_clipboard_history,
-            clipboard::commands::get_clipboard_settings,
-            clipboard::commands::get_clipboard_shortcut_info,
-            clipboard::commands::save_clipboard_settings,
-            clipboard::commands::restore_clipboard_item,
             imaging::commands::compress_images,
             imaging::commands::convert_images,
             imaging::commands::read_image_exif,

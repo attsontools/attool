@@ -12,8 +12,9 @@ describe('Tool.group', () => {
     }
   });
 
-  it('7 个内置 tool 全数', () => {
-    expect(tools).toHaveLength(7);
+  it('6 个内置 tool 全数', () => {
+    expect(tools).toHaveLength(6);
+    expect(tools.some((tool) => tool.id === 'clipboard')).toBe(false);
     expect(tools.some((tool) => tool.id === 'codec')).toBe(false);
     expect(tools.some((tool) => tool.id === 'generator')).toBe(false);
     expect(tools.some((tool) => tool.id === 'json')).toBe(false);

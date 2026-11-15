@@ -22,34 +22,6 @@
         "label": "main"
       },
       {
-        "label": "clipboard-history",
-        "title": "剪贴板历史",
-        "width": 1180,
-        "height": 260,
-        "minWidth": 480,
-        "minHeight": 220,
-        "resizable": true,
-        "visible": false,
-        "decorations": false,
-        "alwaysOnTop": true,
-        "skipTaskbar": true,
-        "dragDropEnabled": false
-      },
-      {
-        "label": "clipboard-preview",
-        "title": "剪贴板预览",
-        "width": 1100,
-        "height": 760,
-        "minWidth": 720,
-        "minHeight": 360,
-        "resizable": true,
-        "visible": false,
-        "decorations": false,
-        "alwaysOnTop": true,
-        "skipTaskbar": true,
-        "dragDropEnabled": false
-      },
-      {
         "label": "capture-overlay",
         "title": "AT Tool Capture",
         "width": 800,

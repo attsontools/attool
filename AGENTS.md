@@ -1,6 +1,6 @@
 # AGENTS.md
 
-个人桌面工具箱（Tauri 2 + Vue 3 + Naive UI）。平台内置 Aria2 下载、主图模板、剪贴板、视频链接抽取、图片（含跨平台截图与录屏）、网络、AI 对话（多提供商多模型 AI 助手：OpenAI 兼容 / Anthropic Claude / 本地 Ollama，流式 Markdown + 会话侧栏 + 模型热切换）。HTTP 请求、编码转换、文本工具、生成器、时间工具与 JSON 工具通过官方 Catalog 作为独立应用按需安装；HTTP 使用 Host API 2.x + Native/Data Service 复用原有本地数据。
+个人桌面工具箱（Tauri 2 + Vue 3 + Naive UI）。平台内置 Aria2 下载、主图模板、视频链接抽取、图片（含跨平台截图与录屏）、网络、AI 对话（多提供商多模型 AI 助手：OpenAI 兼容 / Anthropic Claude / 本地 Ollama，流式 Markdown + 会话侧栏 + 模型热切换）。剪贴板、HTTP 请求、编码转换、文本工具、生成器、时间工具与 JSON 工具通过官方 Catalog 作为独立应用按需安装；剪贴板与 HTTP 使用 Host API 2.x + Native/Data Service 复用原有本地数据。
 
 ## 技术栈
 
@@ -45,14 +45,13 @@ src/
 ├── styles/                      # tokens.css（设计 token）/ reset.css / template-editor.css
 ├── theme/index.ts               # Naive UI darkOverrides + lightOverrides
 ├── composables/                 # useTheme / useSidebarState / useLastTool / useUpdater
-│                                #   / useClipboardHistory / useFileDrop / useAria2Handoff
+│                                #   / useFileDrop / useAria2Handoff
 │                                #   / usePluginStore（应用 registry / Catalog / 生命周期）
 ├── components/
 │   ├── shell/                   # 外壳：AppShell / Sidebar / Topbar / Dashboard / ToolIcon
 │   │                            #   / SettingsModal / UpdateBanner / ShortcutErrorNotifier
 │   ├── ui/                      # 通用原子：Panel / TaskRow / StatPill / Kbd
 │   ├── plugins/                 # 应用管理、隔离 iframe、Host API 与 Catalog UI
-│   ├── clipboard/               # 剪贴板：ClipboardTool + ClipboardHistoryWindow（独立窗口）+ ItemCard
 │   ├── ecommerce/               # 主图模板：TemplateTool + 5 子组件（图层树/属性/画布/资源/批量）
 │   ├── image/                   # 图片：ImageTool（tabs：压缩/转换/EXIF/标注/OCR/截图）
 │   │                            #   + CaptureOverlay（截图浮层）+ CapturePinWindow
@@ -63,13 +62,13 @@ src/
 │                                #   / AiMessageBubble + AiComposer + AiModelPicker
 │                                #   / AiSettingsModal + AiSystemPromptDrawer
 │                                #   + aiApi.ts / markdown.ts（手写渲染器）/ useAiChat.ts（带测试）
-├── types/                       # tool.ts / download.ts / ecommerceTemplate.ts / clipboard.ts
-└── utils/                       # ecommerceTemplate.ts / clipboardHistory.ts 等
+├── types/                       # tool.ts / download.ts / ecommerceTemplate.ts
+└── utils/                       # ecommerceTemplate.ts / downloadFormat.ts 等
 
 src-tauri/
 ├── build.rs                     # 注入 ATTOOL_UPDATE_VERIFY_PUBLIC_KEY 到 OUT_DIR/verify_public_key.pem
 ├── src/lib.rs                   # 主入口 run() + Aria2 下载全部逻辑 + command 注册
-├── src/clipboard/               # 剪贴板：commands / storage(SQLite) / watcher / models
+├── src/clipboard/               # 系统图片剪贴板写入 + Linux capture layer-shell
 ├── src/imaging/                 # 图片：commands / compress / convert / exif / ocr
 │                                #   / capture（截图）/ windows（xcap 窗口枚举）
 ├── src/ecommerce/               # 主图模板：commands / models / render / storage / psd_bridge
@@ -82,7 +81,7 @@ src-tauri/
 ├── src/ai/                      # AI 对话：mod / models / storage(SQLite) / session（cancel handle）
 │                                #   / commands / providers/{openai,anthropic,ollama}（统一 trait）
 ├── src/{douyin,bilibili,xhs,youtube}.rs  # 单文件模块
-└── tauri.conf.json              # 打包配置（5 个窗口 / 插件 / 无 updater plugin，走自研）
+└── tauri.conf.json              # main / capture 固定窗口 + 动态 pin/plugin 辅助窗口
 
 .github/
 ├── workflows/build.yml          # CI 矩阵（mac arm/x64 + linux arm/x64 + win x64）+ release job

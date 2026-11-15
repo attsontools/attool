@@ -17,9 +17,6 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import TemplateTool from './components/ecommerce/TemplateTool.vue';
-import ClipboardHistoryWindow from './components/clipboard/ClipboardHistoryWindow.vue';
-import ClipboardPreviewWindow from './components/clipboard/ClipboardPreviewWindow.vue';
-import ClipboardTool from './components/clipboard/ClipboardTool.vue';
 import AppShell from './components/shell/AppShell.vue';
 import ShortcutErrorNotifier from './components/shell/ShortcutErrorNotifier.vue';
 import Dashboard from './components/shell/Dashboard.vue';
@@ -67,8 +64,6 @@ const pluginAuxiliaryIdentity = (() => {
   return appId && windowId ? { appId, windowId } : null;
 })();
 const isPluginAuxiliaryWindow = pluginAuxiliaryIdentity !== null;
-const isClipboardHistoryWindow = currentWindow.label === 'clipboard-history';
-const isClipboardPreviewWindow = currentWindow.label === 'clipboard-preview';
 const isCaptureOverlayWindow = currentWindow.label === 'capture-overlay';
 const isCapturePinWindow = currentWindow.label.startsWith('capture-pin-');
 const CaptureOverlay = defineAsyncComponent(() => import('./components/image/CaptureOverlay.vue'));
@@ -135,7 +130,6 @@ let unlistenRecordingCompleted: Promise<UnlistenFn> | undefined;
 onMounted(() => {
   if (
     isPluginAuxiliaryWindow
-    || isClipboardHistoryWindow
     || isCaptureOverlayWindow
     || isCapturePinWindow
   ) return;
@@ -448,7 +442,7 @@ async function clearCompleted() {
   <n-config-provider :theme="naiveTheme" :theme-overrides="naiveOverrides">
     <n-message-provider>
       <ShortcutErrorNotifier
-        v-if="!isPluginAuxiliaryWindow && !isCaptureOverlayWindow && !isCapturePinWindow && !isClipboardHistoryWindow && !isClipboardPreviewWindow"
+        v-if="!isPluginAuxiliaryWindow && !isCaptureOverlayWindow && !isCapturePinWindow"
       />
       <PluginAuxiliaryWindow
         v-if="pluginAuxiliaryIdentity"
@@ -457,10 +451,8 @@ async function clearCompleted() {
       />
       <CaptureOverlay v-else-if="isCaptureOverlayWindow" />
       <CapturePinWindow v-else-if="isCapturePinWindow" />
-      <ClipboardHistoryWindow v-else-if="isClipboardHistoryWindow" />
-      <ClipboardPreviewWindow v-else-if="isClipboardPreviewWindow" />
       <AppShell
-        v-else-if="!isClipboardHistoryWindow && !isClipboardPreviewWindow && !isCapturePinWindow"
+        v-else-if="!isCapturePinWindow"
         :tools="tools"
         :active-id="selectedToolId"
         :collapsed="sidebarCollapsed"
@@ -599,10 +591,6 @@ async function clearCompleted() {
 
         <template v-else-if="selectedTool.id === 'template'">
           <TemplateTool />
-        </template>
-
-        <template v-else-if="selectedTool.id === 'clipboard'">
-          <ClipboardTool />
         </template>
 
         <template v-else-if="selectedTool.id === 'video-link'">

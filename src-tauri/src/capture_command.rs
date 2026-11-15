@@ -1,4 +1,3 @@
-use crate::clipboard::watcher::show_clipboard_history;
 use crate::imaging::capture::{trigger_capture_overlay, trigger_recording_overlay};
 use std::ffi::OsString;
 use std::fs;
@@ -10,7 +9,6 @@ use std::time::Duration;
 use tauri::{AppHandle, Manager};
 
 const CAPTURE_ARG: &str = "--capture";
-const CLIPBOARD_HISTORY_ARG: &str = "--clipboard-history";
 const PLUGIN_WINDOW_ARG: &str = "--plugin-window";
 const RECORDING_ARG: &str = "--recording";
 const SOCKET_FILE: &str = "attool-capture.sock";
@@ -18,7 +16,6 @@ const SOCKET_FILE: &str = "attool-capture.sock";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CommandRequest {
     Capture,
-    ClipboardHistory,
     PluginWindow { app_id: String, window_id: String },
     Recording,
 }
@@ -27,7 +24,6 @@ impl CommandRequest {
     fn message(&self) -> Vec<u8> {
         match self {
             Self::Capture => b"capture\n".to_vec(),
-            Self::ClipboardHistory => b"clipboard-history\n".to_vec(),
             Self::PluginWindow { app_id, window_id } => {
                 format!("plugin-window\t{app_id}\t{window_id}\n").into_bytes()
             }
@@ -47,8 +43,6 @@ impl Drop for ExternalCommandSocket {
 fn requested_command_from_args(args: &[OsString]) -> Option<CommandRequest> {
     if args.iter().any(|arg| arg == CAPTURE_ARG) {
         Some(CommandRequest::Capture)
-    } else if args.iter().any(|arg| arg == CLIPBOARD_HISTORY_ARG) {
-        Some(CommandRequest::ClipboardHistory)
     } else if args.iter().any(|arg| arg == RECORDING_ARG) {
         Some(CommandRequest::Recording)
     } else {
@@ -88,7 +82,6 @@ fn parse_command_message(payload: &str) -> Option<CommandRequest> {
     let payload = payload.trim();
     match payload {
         "capture" => Some(CommandRequest::Capture),
-        "clipboard-history" => Some(CommandRequest::ClipboardHistory),
         "recording" => Some(CommandRequest::Recording),
         _ => {
             let mut parts = payload.split('\t');
@@ -148,7 +141,6 @@ fn trigger_command(app: &AppHandle, request: CommandRequest) -> Result<(), Strin
             trigger_capture_overlay(app);
             Ok(())
         }
-        CommandRequest::ClipboardHistory => show_clipboard_history(app),
         CommandRequest::PluginWindow { app_id, window_id } => {
             let runtime = app
                 .try_state::<crate::plugin::auxiliary_window::AuxiliaryWindowRuntime>()
@@ -241,10 +233,6 @@ pub fn system_capture_command() -> Option<String> {
     system_command(CAPTURE_ARG)
 }
 
-pub fn system_clipboard_history_command() -> Option<String> {
-    system_command(CLIPBOARD_HISTORY_ARG)
-}
-
 pub fn system_recording_command() -> Option<String> {
     system_command(RECORDING_ARG)
 }
@@ -301,7 +289,7 @@ mod tests {
                 OsString::from("attool"),
                 OsString::from("--clipboard-history")
             ]),
-            Some(CommandRequest::ClipboardHistory)
+            None
         );
         assert_eq!(
             requested_command_from_args(&[OsString::from("attool")]),
@@ -340,7 +328,7 @@ mod tests {
         );
         assert_eq!(
             parse_command_message("clipboard-history\n"),
-            Some(CommandRequest::ClipboardHistory)
+            None
         );
         assert_eq!(
             parse_command_message("recording\n"),
