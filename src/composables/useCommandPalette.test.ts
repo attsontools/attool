@@ -3,7 +3,7 @@ import { useCommandPalette } from './useCommandPalette';
 import type { Tool } from '../types/tool';
 
 const fakeTools: Tool[] = [
-  { id: 'http',  name: 'HTTP 请求', description: 'HTTP body/headers',   status: 'ready', icon: 'send',     group: 'network' },
+  { id: 'plugin:com.attson.http', name: 'HTTP 请求', description: 'HTTP body/headers', status: 'ready', icon: 'send', group: 'network', source: 'plugin', pluginAppId: 'com.attson.http' },
   { id: 'plugin:com.attson.json', name: 'JSON 工具', description: '格式化 / JSONPath', status: 'ready', icon: 'code', group: 'edit', source: 'plugin', pluginAppId: 'com.attson.json' },
   { id: 'aria2', name: 'Aria2',    description: '多连接下载',           status: 'ready', icon: 'download', group: 'download' }
 ];
@@ -27,13 +27,13 @@ describe('useCommandPalette', () => {
   it('substring 匹配 description', () => {
     const cp = useCommandPalette({ tools: () => fakeTools, onOpenTool: vi.fn() });
     cp.query.value = 'headers';
-    expect(cp.results.value.map((r) => r.id)).toEqual(['http']);
+    expect(cp.results.value.map((r) => r.id)).toEqual(['plugin:com.attson.http']);
   });
 
   it('拼音首字母匹配（HTTP → h）', () => {
     const cp = useCommandPalette({ tools: () => fakeTools, onOpenTool: vi.fn() });
     cp.query.value = 'ht';
-    expect(cp.results.value.map((r) => r.id)).toContain('http');
+    expect(cp.results.value.map((r) => r.id)).toContain('plugin:com.attson.http');
   });
 
   it('onSelect 触发 onOpenTool 回调', () => {
@@ -42,64 +42,6 @@ describe('useCommandPalette', () => {
     cp.query.value = 'json';
     cp.results.value[0].onSelect();
     expect(onOpenTool).toHaveBeenCalledWith('plugin:com.attson.json');
-  });
-
-  it('提供 envs 时空 query 也列出环境', () => {
-    const cp = useCommandPalette({
-      tools: () => fakeTools,
-      onOpenTool: vi.fn(),
-      envs: () => [{ name: 'prod', active: true }, { name: 'dev', active: false }],
-      onSwitchEnv: vi.fn()
-    });
-    cp.query.value = '';
-    const envItems = cp.results.value.filter((r) => r.kind === 'env');
-    expect(envItems.map((r) => r.id)).toEqual(['prod', 'dev']);
-  });
-
-  it('提供 httpHistory 时空 query 也列出前 5 条历史', () => {
-    const history = Array.from({ length: 10 }, (_, i) => ({
-      method: 'GET', url: `/x/${i}`, ts: i
-    }));
-    const cp = useCommandPalette({
-      tools: () => fakeTools,
-      onOpenTool: vi.fn(),
-      httpHistory: () => history,
-      onOpenHistory: vi.fn()
-    });
-    cp.query.value = '';
-    const histItems = cp.results.value.filter((r) => r.kind === 'history');
-    expect(histItems.length).toBe(5);
-  });
-
-  it('提供 collectionRequests 时可搜索集合请求', () => {
-    const onOpenCollectionRequest = vi.fn();
-    const cp = useCommandPalette({
-      tools: () => fakeTools,
-      onOpenTool: vi.fn(),
-      collectionRequests: () => [
-        { id: 'r1', name: 'GET users', method: 'GET', url: '{{baseUrl}}/users', collectionName: 'Admin API' }
-      ],
-      onOpenCollectionRequest
-    });
-    cp.query.value = 'users';
-    const item = cp.results.value[0];
-    expect(item.kind).toBe('collection-request');
-    item.onSelect();
-    expect(onOpenCollectionRequest).toHaveBeenCalledWith('r1');
-  });
-
-  it('提供 actions 时可触发普通动作', () => {
-    const onSelect = vi.fn();
-    const cp = useCommandPalette({
-      tools: () => fakeTools,
-      onOpenTool: vi.fn(),
-      actions: () => [{ id: 'http-vars', title: 'HTTP 变量', subtitle: '打开变量管理', groupLabel: '动作', onSelect }]
-    });
-    cp.query.value = '变量';
-    const item = cp.results.value[0];
-    expect(item.kind).toBe('action');
-    item.onSelect();
-    expect(onSelect).toHaveBeenCalled();
   });
 
   it('每分区搜索命中最多 20 条', () => {

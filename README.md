@@ -12,10 +12,11 @@
 | **视频链接抽取** | 抖音 / B站 / 小红书 / YouTube 视频链接与文案解析 |
 | **图片** | 截图与录屏统一捕获工作台、压缩、格式转换、EXIF 读取/去除、标注、OCR |
 | **网络** | URL 分解、Ping、端口检查、DNS 查询 |
-| **HTTP 请求** | Apifox-lite：多 tab + SQLite 持久化 / 请求集合目录树 / OpenAPI JSON 导入（可配置 base URL 或 `{{baseUrl}}`）/ 发送历史侧栏 / 多环境变量 `{{var}}` / Bearer & Basic auth / cURL 双向导入导出 / form-data 文件上传 / 响应 Pretty · Raw · Preview / 取消进行中请求 / 快捷键（⌘Enter / T / W / B / E）。v0.8.9 起 tab 分 **HTTP / SSE / WebSocket** 三种：SSE 覆盖 AI 流式接口调试（自定义 Header + Bearer Token）；WebSocket 支持双向收发 + 发送模板；长连接切走 tab 不断线，`{{var}}` 展开也适用于 SSE / WS 的 URL / Header / 发送内容 |
 | **AI 对话** | 多提供商多模型 AI 助手：OpenAI 兼容 / Anthropic Claude / 本地 Ollama，流式 Markdown + 会话侧栏 + 模型热切换 |
 
-编码转换、文本工具、生成器、时间工具与 JSON 工具已拆分为独立应用，可在平台的“应用管理”中按需安装；独立安装包与平台插件包分别由对应应用仓库发布。
+HTTP 请求、编码转换、文本工具、生成器、时间工具与 JSON 工具已拆分为独立应用，可在平台的“应用管理”中按需安装；独立安装包与平台插件包分别由对应应用仓库发布。
+
+HTTP 请求应用提供 HTTP / SSE / WebSocket、多 tab、历史、环境变量、集合、OpenAPI、cURL 和 multipart 调试。平台通过 Host API 2.x 连接应用自带的 Native/Data Service，沿用原 `${app_data_dir}/http/http.sqlite3` 数据；停用或卸载应用不会恢复隐藏的内置 HTTP。
 
 截图支持全平台：macOS 用系统 `screencapture`，Linux / Windows 用 xcap。录屏通过系统屏幕来源选择器捕获画面，可组合系统音频与麦克风，停止后预览并保存。默认全局快捷键为 `CommandOrControl+Shift+R`，首次按下开始选择录制来源，录制中再次按下停止。
 
@@ -94,4 +95,4 @@ sudo apt install libxcb1-dev libxrandr-dev libdbus-1-dev \
 
 - `AGENTS.md` —— 给 AI 看的工程地图（技术栈、约定、目录速览、加新工具最小路径、发布流程）
 - `docs/spec/` —— 当前态规范（overview / ui-design-system / architecture）
-- `docs/superpowers/` —— 每个任务的设计文档 + 实施计划（gitignored）
+- `docs/tasks/` —— 每个任务的 intent / roadmap / spec / plan（gitignored）

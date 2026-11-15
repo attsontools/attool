@@ -1,4 +1,7 @@
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::Path,
+};
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -8,7 +11,7 @@ use tokio::{fs::File, io::AsyncWriteExt};
 use super::{
     catalog::{CatalogArtifact, CatalogInstallPlan, CatalogTargetArch, CatalogTargetOs},
     github_proxy::send_with_fallback,
-    package::{InspectedPackage, NativeService},
+    package::{AuxiliaryWindow, InspectedPackage, NativeService},
 };
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -67,6 +70,7 @@ pub struct OperationSnapshot {
     pub publisher_name: String,
     pub publisher_key_id: String,
     pub entry: Option<String>,
+    pub windows: BTreeMap<String, AuxiliaryWindow>,
     pub permissions: Vec<String>,
     pub native_service: Option<NativeService>,
     pub stage: OperationStage,
@@ -96,6 +100,7 @@ impl OperationSnapshot {
             publisher_name: plan.publisher_name.clone(),
             publisher_key_id: plan.publisher_key_id.clone(),
             entry: None,
+            windows: BTreeMap::new(),
             permissions: plan.permissions.clone(),
             native_service: None,
             stage: OperationStage::Download,
@@ -494,6 +499,7 @@ mod tests {
             host_api_min: "1.0.0".to_string(),
             host_api_max: "1.x".to_string(),
             entry: "ui/index.html".to_string(),
+            windows: BTreeMap::new(),
             permissions: vec!["host.theme.read".to_string()],
             native_service: None,
             files: BTreeMap::from([("ui/index.html".to_string(), "a".repeat(64))]),

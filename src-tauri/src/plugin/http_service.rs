@@ -7,10 +7,12 @@ use std::{
     time::Duration as StdDuration,
 };
 
+use chrono::Utc;
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{tcp::OwnedWriteHalf, TcpStream},
@@ -24,28 +26,71 @@ use super::install::{InstalledPlugin, PluginStore};
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-trait HttpServiceEventSink: Send + Sync {
-    fn emit(&self, app_id: &str, event: Value);
+trait NativeServiceEventSink: Send + Sync {
+    fn emit(&self, app_id: &str, service_version: &str, event: Value);
+
+    fn emit_status(&self, _status: &NativeServiceStatus) {}
 }
 
 struct TauriEventSink(AppHandle);
 
-impl HttpServiceEventSink for TauriEventSink {
-    fn emit(&self, app_id: &str, event: Value) {
-        let _ = self.0.emit_to(
+impl NativeServiceEventSink for TauriEventSink {
+    fn emit(&self, app_id: &str, service_version: &str, event: Value) {
+        let Some(native_services) = self.0.try_state::<NativeServiceRuntime>() else {
+            eprintln!("cannot route native service event for {app_id}: runtime is unavailable");
+            return;
+        };
+        if !native_services.accepts_event(app_id, service_version) {
+            return;
+        }
+        if let Some(runtime) = self
+            .0
+            .try_state::<super::auxiliary_window::AuxiliaryWindowRuntime>()
+        {
+            runtime.route_native_event(&self.0, app_id, event);
+            return;
+        }
+        if let Err(error) = self.0.emit_to(
             "main",
-            "plugin://http-service-event",
+            "plugin://native-service-event",
             json!({ "appId": app_id, "event": event }),
-        );
+        ) {
+            eprintln!("cannot emit native service event for {app_id}: {error}");
+        }
+    }
+
+    fn emit_status(&self, status: &NativeServiceStatus) {
+        if let Err(error) = self
+            .0
+            .emit_to("main", "plugin://native-service-status", status)
+        {
+            eprintln!(
+                "cannot emit native service status for {}: {error}",
+                status.app_id
+            );
+        }
     }
 }
 
-pub struct HttpServiceRuntime {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeServiceStatus {
+    pub app_id: String,
+    pub state: String,
+    pub error_code: Option<String>,
+    pub message: Option<String>,
+    pub correlation_id: Option<String>,
+    pub updated_at: i64,
+}
+
+#[derive(Clone)]
+pub struct NativeServiceRuntime {
     store: Arc<Mutex<PluginStore>>,
-    data_directory: PathBuf,
-    event_sink: Arc<dyn HttpServiceEventSink>,
+    app_data_root: PathBuf,
+    event_sink: Arc<dyn NativeServiceEventSink>,
     clients: Arc<Mutex<HashMap<String, ConnectedService>>>,
     connect_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    statuses: Arc<Mutex<HashMap<String, NativeServiceStatus>>>,
 }
 
 struct ConnectedService {
@@ -54,40 +99,74 @@ struct ConnectedService {
     process: Option<Box<dyn ServiceProcess>>,
 }
 
-impl HttpServiceRuntime {
-    pub fn new(store: PluginStore, data_directory: PathBuf, app: AppHandle) -> Self {
-        Self::with_sink(store, data_directory, Arc::new(TauriEventSink(app)))
+impl NativeServiceRuntime {
+    pub fn new(store: PluginStore, app_data_root: PathBuf, app: AppHandle) -> Self {
+        Self::with_sink(store, app_data_root, Arc::new(TauriEventSink(app)))
     }
 
     #[cfg(test)]
     fn with_event_sink(
         store: PluginStore,
-        data_directory: PathBuf,
-        event_sink: Arc<dyn HttpServiceEventSink>,
+        app_data_root: PathBuf,
+        event_sink: Arc<dyn NativeServiceEventSink>,
     ) -> Self {
-        Self::with_sink(store, data_directory, event_sink)
+        Self::with_sink(store, app_data_root, event_sink)
     }
 
     fn with_sink(
         store: PluginStore,
-        data_directory: PathBuf,
-        event_sink: Arc<dyn HttpServiceEventSink>,
+        app_data_root: PathBuf,
+        event_sink: Arc<dyn NativeServiceEventSink>,
     ) -> Self {
         Self {
             store: Arc::new(Mutex::new(store)),
-            data_directory,
+            app_data_root,
             event_sink,
             clients: Arc::new(Mutex::new(HashMap::new())),
             connect_locks: Arc::new(Mutex::new(HashMap::new())),
+            statuses: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub async fn connect(&self, app_id: &str) -> Result<(), HttpServiceError> {
+    pub async fn connect(&self, app_id: &str) -> Result<(), NativeServiceError> {
+        let correlation_id = Uuid::new_v4().to_string();
+        self.record_status(NativeServiceStatus {
+            app_id: app_id.to_string(),
+            state: "connecting".to_string(),
+            error_code: None,
+            message: None,
+            correlation_id: Some(correlation_id.clone()),
+            updated_at: Utc::now().timestamp_millis(),
+        });
+        let result = self.connect_inner(app_id).await;
+        let status = match &result {
+            Ok(()) => NativeServiceStatus {
+                app_id: app_id.to_string(),
+                state: "connected".to_string(),
+                error_code: None,
+                message: None,
+                correlation_id: Some(correlation_id),
+                updated_at: Utc::now().timestamp_millis(),
+            },
+            Err(error) => NativeServiceStatus {
+                app_id: app_id.to_string(),
+                state: "unavailable".to_string(),
+                error_code: Some(error.code.clone()),
+                message: Some(error.message.clone()),
+                correlation_id: Some(correlation_id),
+                updated_at: Utc::now().timestamp_millis(),
+            },
+        };
+        self.record_status(status);
+        result
+    }
+
+    async fn connect_inner(&self, app_id: &str) -> Result<(), NativeServiceError> {
         let connect_lock = {
             let mut locks = self.connect_locks.lock().map_err(|_| {
-                HttpServiceError::new(
-                    "HTTP_SERVICE_STATE_LOCK_FAILED",
-                    "HTTP service state lock failed",
+                NativeServiceError::new(
+                    "NATIVE_SERVICE_STATE_LOCK_FAILED",
+                    "Native service state lock failed",
                 )
             })?;
             Arc::clone(
@@ -99,40 +178,40 @@ impl HttpServiceRuntime {
         let _connect_guard = connect_lock.lock().await;
         let plugin = self.installed_plugin(app_id)?;
         let service = plugin.native_service.as_ref().ok_or_else(|| {
-            HttpServiceError::new(
-                "HTTP_SERVICE_NOT_DECLARED",
-                "Plugin does not declare a native HTTP service",
+            NativeServiceError::new(
+                "NATIVE_SERVICE_NOT_DECLARED",
+                "Plugin does not declare a native service",
             )
         })?;
         if service.protocol_version != 1 {
-            return Err(HttpServiceError::new(
-                "HTTP_SERVICE_PROTOCOL_UNSUPPORTED",
+            return Err(NativeServiceError::new(
+                "NATIVE_SERVICE_PROTOCOL_UNSUPPORTED",
                 format!(
-                    "HTTP service protocol {} is not supported",
+                    "Native service protocol {} is not supported",
                     service.protocol_version
                 ),
             ));
         }
         let executable = plugin.root.join(&service.entry);
         let bytes = std::fs::read(&executable).map_err(|error| {
-            HttpServiceError::new(
-                "HTTP_SERVICE_BINARY_READ_FAILED",
-                format!("Cannot read installed HTTP service: {error}"),
+            NativeServiceError::new(
+                "NATIVE_SERVICE_BINARY_READ_FAILED",
+                format!("Cannot read installed native service: {error}"),
             )
         })?;
         if hex::encode(Sha256::digest(&bytes)) != service.sha256 {
-            return Err(HttpServiceError::new(
-                "HTTP_SERVICE_BINARY_HASH_MISMATCH",
-                "Installed HTTP service does not match the signed manifest",
+            return Err(NativeServiceError::new(
+                "NATIVE_SERVICE_BINARY_HASH_MISMATCH",
+                "Installed native service does not match the signed manifest",
             ));
         }
         if self
             .clients
             .lock()
             .map_err(|_| {
-                HttpServiceError::new(
-                    "HTTP_SERVICE_STATE_LOCK_FAILED",
-                    "HTTP service state lock failed",
+                NativeServiceError::new(
+                    "NATIVE_SERVICE_STATE_LOCK_FAILED",
+                    "Native service state lock failed",
                 )
             })?
             .get(app_id)
@@ -145,9 +224,9 @@ impl HttpServiceRuntime {
 
         {
             let mut clients = self.clients.lock().map_err(|_| {
-                HttpServiceError::new(
-                    "HTTP_SERVICE_STATE_LOCK_FAILED",
-                    "HTTP service state lock failed",
+                NativeServiceError::new(
+                    "NATIVE_SERVICE_STATE_LOCK_FAILED",
+                    "Native service state lock failed",
                 )
             })?;
             let owned_previous = clients
@@ -156,19 +235,21 @@ impl HttpServiceRuntime {
                 .and_then(|connected| connected.process.as_mut());
             if let Some(process) = owned_previous {
                 process.terminate().map_err(|error| {
-                    HttpServiceError::new(
-                        "HTTP_SERVICE_STOP_FAILED",
-                        format!("Cannot stop previous HTTP service version: {error}"),
+                    NativeServiceError::new(
+                        "NATIVE_SERVICE_STOP_FAILED",
+                        format!("Cannot stop previous native service version: {error}"),
                     )
                 })?;
                 clients.remove(app_id);
             }
         }
 
+        let data_directory = data_directory_for(&self.app_data_root, app_id)?;
         let mut supervisor = ServiceSupervisor::new(
-            self.data_directory.join("service.endpoint.json"),
-            self.data_directory.clone(),
+            data_directory.join("service.endpoint.json"),
+            data_directory,
             executable,
+            app_id,
             format!("attool-{app_id}-{}", Uuid::new_v4()),
             service.version.clone(),
             StdDuration::from_secs(10),
@@ -177,21 +258,13 @@ impl HttpServiceRuntime {
         let mut events = client.subscribe();
         let event_sink = Arc::clone(&self.event_sink);
         let event_app_id = app_id.to_string();
-        tokio::spawn(async move {
-            loop {
-                match events.recv().await {
-                    Ok(event) => event_sink.emit(&event_app_id, event),
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
+        let event_service_version = plugin.version.clone();
         self.clients
             .lock()
             .map_err(|_| {
-                HttpServiceError::new(
-                    "HTTP_SERVICE_STATE_LOCK_FAILED",
-                    "HTTP service state lock failed",
+                NativeServiceError::new(
+                    "NATIVE_SERVICE_STATE_LOCK_FAILED",
+                    "Native service state lock failed",
                 )
             })?
             .insert(
@@ -202,7 +275,166 @@ impl HttpServiceRuntime {
                     process,
                 },
             );
+        tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(event) => event_sink.emit(&event_app_id, &event_service_version, event),
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
         Ok(())
+    }
+
+    pub async fn start_background_services(&self) -> Vec<(String, Result<(), NativeServiceError>)> {
+        let app_ids = match self.background_app_ids() {
+            Ok(app_ids) => app_ids,
+            Err(error) => return vec![(String::new(), Err(error))],
+        };
+        join_all(app_ids.into_iter().map(|app_id| async move {
+            let result = self.connect(&app_id).await;
+            (app_id, result)
+        }))
+        .await
+    }
+
+    pub async fn disconnect(&self, app_id: &str) -> Result<(), NativeServiceError> {
+        let connect_lock = {
+            let mut locks = self.connect_locks.lock().map_err(|_| {
+                NativeServiceError::new(
+                    "NATIVE_SERVICE_STATE_LOCK_FAILED",
+                    "Native service state lock failed",
+                )
+            })?;
+            Arc::clone(
+                locks
+                    .entry(app_id.to_string())
+                    .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+            )
+        };
+        let _connect_guard = connect_lock.lock().await;
+        let connected = self
+            .clients
+            .lock()
+            .map_err(|_| {
+                NativeServiceError::new(
+                    "NATIVE_SERVICE_STATE_LOCK_FAILED",
+                    "Native service state lock failed",
+                )
+            })?
+            .remove(app_id);
+        let Some(mut connected) = connected else {
+            self.record_disconnected(app_id);
+            return Ok(());
+        };
+        if let Some(process) = connected.process.as_mut() {
+            if let Err(error) = process.terminate() {
+                self.clients
+                    .lock()
+                    .map_err(|_| {
+                        NativeServiceError::new(
+                            "NATIVE_SERVICE_STATE_LOCK_FAILED",
+                            "Native service state lock failed",
+                        )
+                    })?
+                    .insert(app_id.to_string(), connected);
+                return Err(NativeServiceError::new(
+                    "NATIVE_SERVICE_STOP_FAILED",
+                    format!("Cannot stop native service: {error}"),
+                ));
+            }
+        }
+        self.record_disconnected(app_id);
+        Ok(())
+    }
+
+    pub fn statuses(&self) -> Result<Vec<NativeServiceStatus>, NativeServiceError> {
+        self.statuses
+            .lock()
+            .map(|statuses| statuses.values().cloned().collect())
+            .map_err(|_| {
+                NativeServiceError::new(
+                    "NATIVE_SERVICE_STATE_LOCK_FAILED",
+                    "Native service status lock failed",
+                )
+            })
+    }
+
+    pub(crate) fn status_for(&self, app_id: &str) -> Option<NativeServiceStatus> {
+        self.statuses
+            .lock()
+            .ok()
+            .and_then(|statuses| statuses.get(app_id).cloned())
+    }
+
+    fn record_disconnected(&self, app_id: &str) {
+        self.record_status(NativeServiceStatus {
+            app_id: app_id.to_string(),
+            state: "disconnected".to_string(),
+            error_code: None,
+            message: None,
+            correlation_id: None,
+            updated_at: Utc::now().timestamp_millis(),
+        });
+    }
+
+    fn record_status(&self, mut status: NativeServiceStatus) {
+        if let Ok(mut statuses) = self.statuses.lock() {
+            if let Some(current) = statuses.get(&status.app_id) {
+                status.updated_at = status.updated_at.max(current.updated_at.saturating_add(1));
+            }
+            statuses.insert(status.app_id.clone(), status.clone());
+        }
+        self.event_sink.emit_status(&status);
+    }
+
+    pub(super) fn is_connected(&self, app_id: &str) -> bool {
+        self.clients
+            .lock()
+            .ok()
+            .and_then(|clients| {
+                clients
+                    .get(app_id)
+                    .map(|connected| !connected.client.is_disconnected())
+            })
+            .unwrap_or(false)
+    }
+
+    fn background_app_ids(&self) -> Result<Vec<String>, NativeServiceError> {
+        let plugins = self
+            .store
+            .lock()
+            .map_err(|_| {
+                NativeServiceError::new(
+                    "NATIVE_SERVICE_STORE_LOCK_FAILED",
+                    "Plugin store lock failed",
+                )
+            })?
+            .list_enabled()
+            .map_err(|error| NativeServiceError::new(error.code, error.message))?;
+        Ok(plugins
+            .into_iter()
+            .filter(|plugin| {
+                plugin
+                    .native_service
+                    .as_ref()
+                    .is_some_and(|service| service.lifecycle == "background")
+            })
+            .map(|plugin| plugin.app_id)
+            .collect())
+    }
+
+    fn accepts_event(&self, app_id: &str, service_version: &str) -> bool {
+        self.clients
+            .lock()
+            .ok()
+            .and_then(|clients| {
+                clients.get(app_id).map(|connected| {
+                    connected.version == service_version && !connected.client.is_disconnected()
+                })
+            })
+            .unwrap_or(false)
     }
 
     pub async fn request(
@@ -210,7 +442,7 @@ impl HttpServiceRuntime {
         app_id: &str,
         method: &str,
         params: Value,
-    ) -> Result<Value, HttpServiceError> {
+    ) -> Result<Value, NativeServiceError> {
         let plugin = self.installed_plugin(app_id)?;
         let permission = required_permission(method)?;
         if !plugin
@@ -218,8 +450,8 @@ impl HttpServiceRuntime {
             .iter()
             .any(|declared| declared == permission)
         {
-            return Err(HttpServiceError::new(
-                "HTTP_SERVICE_PERMISSION_DENIED",
+            return Err(NativeServiceError::new(
+                "NATIVE_SERVICE_PERMISSION_DENIED",
                 format!("Plugin does not declare {permission}"),
             ));
         }
@@ -227,43 +459,46 @@ impl HttpServiceRuntime {
             .clients
             .lock()
             .map_err(|_| {
-                HttpServiceError::new(
-                    "HTTP_SERVICE_STATE_LOCK_FAILED",
-                    "HTTP service state lock failed",
+                NativeServiceError::new(
+                    "NATIVE_SERVICE_STATE_LOCK_FAILED",
+                    "Native service state lock failed",
                 )
             })?
             .get(app_id)
             .filter(|connected| connected.version == plugin.version)
             .map(|connected| connected.client.clone())
             .ok_or_else(|| {
-                HttpServiceError::new(
-                    "HTTP_SERVICE_NOT_CONNECTED",
-                    "HTTP service is not connected for this plugin version",
+                NativeServiceError::new(
+                    "NATIVE_SERVICE_NOT_CONNECTED",
+                    "Native service is not connected for this plugin version",
                 )
             })?;
         client.request(method, params).await
     }
 
-    fn installed_plugin(&self, app_id: &str) -> Result<InstalledPlugin, HttpServiceError> {
+    fn installed_plugin(&self, app_id: &str) -> Result<InstalledPlugin, NativeServiceError> {
         let plugin = self
             .store
             .lock()
             .map_err(|_| {
-                HttpServiceError::new("HTTP_SERVICE_STORE_LOCK_FAILED", "Plugin store lock failed")
+                NativeServiceError::new(
+                    "NATIVE_SERVICE_STORE_LOCK_FAILED",
+                    "Plugin store lock failed",
+                )
             })?
             .list()
-            .map_err(|error| HttpServiceError::new(error.code, error.message))?
+            .map_err(|error| NativeServiceError::new(error.code, error.message))?
             .into_iter()
             .find(|plugin| plugin.app_id == app_id)
             .ok_or_else(|| {
-                HttpServiceError::new(
-                    "HTTP_SERVICE_PLUGIN_NOT_FOUND",
+                NativeServiceError::new(
+                    "NATIVE_SERVICE_PLUGIN_NOT_FOUND",
                     "Installed plugin was not found",
                 )
             })?;
         if !plugin.enabled {
-            return Err(HttpServiceError::new(
-                "HTTP_SERVICE_PLUGIN_DISABLED",
+            return Err(NativeServiceError::new(
+                "NATIVE_SERVICE_PLUGIN_DISABLED",
                 "Installed plugin is disabled",
             ));
         }
@@ -272,21 +507,36 @@ impl HttpServiceRuntime {
 }
 
 #[tauri::command]
-pub async fn plugin_connect_http_service(
+pub async fn plugin_connect_native_service(
     app_id: String,
-    runtime: State<'_, HttpServiceRuntime>,
-) -> Result<(), HttpServiceError> {
+    runtime: State<'_, NativeServiceRuntime>,
+) -> Result<(), NativeServiceError> {
     runtime.connect(&app_id).await
 }
 
 #[tauri::command]
-pub async fn plugin_http_service_request(
+pub async fn plugin_native_service_request(
     app_id: String,
     method: String,
     params: Value,
-    runtime: State<'_, HttpServiceRuntime>,
-) -> Result<Value, HttpServiceError> {
+    runtime: State<'_, NativeServiceRuntime>,
+) -> Result<Value, NativeServiceError> {
     runtime.request(&app_id, &method, params).await
+}
+
+#[tauri::command]
+pub async fn plugin_disconnect_native_service(
+    app_id: String,
+    runtime: State<'_, NativeServiceRuntime>,
+) -> Result<(), NativeServiceError> {
+    runtime.disconnect(&app_id).await
+}
+
+#[tauri::command]
+pub fn plugin_list_native_service_statuses(
+    runtime: State<'_, NativeServiceRuntime>,
+) -> Result<Vec<NativeServiceStatus>, NativeServiceError> {
+    runtime.statuses()
 }
 
 #[derive(Debug, Clone)]
@@ -308,8 +558,10 @@ pub trait ServiceProcess: Send {
 }
 
 pub trait ServiceLauncher: Send + Sync {
-    fn launch(&self, spec: &ServiceLaunchSpec)
-        -> Result<Box<dyn ServiceProcess>, HttpServiceError>;
+    fn launch(
+        &self,
+        spec: &ServiceLaunchSpec,
+    ) -> Result<Box<dyn ServiceProcess>, NativeServiceError>;
 }
 
 struct CommandServiceLauncher {
@@ -326,7 +578,7 @@ impl ServiceLauncher for CommandServiceLauncher {
     fn launch(
         &self,
         spec: &ServiceLaunchSpec,
-    ) -> Result<Box<dyn ServiceProcess>, HttpServiceError> {
+    ) -> Result<Box<dyn ServiceProcess>, NativeServiceError> {
         let child = Command::new(&self.executable)
             .arg("--endpoint")
             .arg(&spec.endpoint_path)
@@ -335,9 +587,9 @@ impl ServiceLauncher for CommandServiceLauncher {
             .stdin(Stdio::null())
             .spawn()
             .map_err(|error| {
-                HttpServiceError::new(
-                    "HTTP_SERVICE_START_FAILED",
-                    format!("Cannot start HTTP service: {error}"),
+                NativeServiceError::new(
+                    "NATIVE_SERVICE_START_FAILED",
+                    format!("Cannot start Native service: {error}"),
                 )
             })?;
         Ok(Box::new(ChildProcess(child)))
@@ -365,6 +617,7 @@ impl ServiceProcess for ChildProcess {
 struct ServiceSupervisor {
     endpoint_path: PathBuf,
     data_directory: PathBuf,
+    app_id: String,
     client_id: String,
     service_version: String,
     startup_timeout: StdDuration,
@@ -377,13 +630,15 @@ impl ServiceSupervisor {
         endpoint_path: PathBuf,
         data_directory: PathBuf,
         executable: PathBuf,
+        app_id: impl Into<String>,
         client_id: impl Into<String>,
         service_version: impl Into<String>,
         startup_timeout: StdDuration,
     ) -> Self {
-        Self::with_launcher(
+        Self::with_launcher_for_app(
             endpoint_path,
             data_directory,
+            app_id,
             client_id,
             service_version,
             startup_timeout,
@@ -391,6 +646,7 @@ impl ServiceSupervisor {
         )
     }
 
+    #[cfg(test)]
     fn with_launcher(
         endpoint_path: PathBuf,
         data_directory: PathBuf,
@@ -399,9 +655,30 @@ impl ServiceSupervisor {
         startup_timeout: StdDuration,
         launcher: Arc<dyn ServiceLauncher>,
     ) -> Self {
+        Self::with_launcher_for_app(
+            endpoint_path,
+            data_directory,
+            "com.attson.http",
+            client_id,
+            service_version,
+            startup_timeout,
+            launcher,
+        )
+    }
+
+    fn with_launcher_for_app(
+        endpoint_path: PathBuf,
+        data_directory: PathBuf,
+        app_id: impl Into<String>,
+        client_id: impl Into<String>,
+        service_version: impl Into<String>,
+        startup_timeout: StdDuration,
+        launcher: Arc<dyn ServiceLauncher>,
+    ) -> Self {
         Self {
             endpoint_path,
             data_directory,
+            app_id: app_id.into(),
             client_id: client_id.into(),
             service_version: service_version.into(),
             startup_timeout,
@@ -410,16 +687,21 @@ impl ServiceSupervisor {
         }
     }
 
-    async fn connect(&mut self) -> Result<ServiceClient, HttpServiceError> {
+    async fn connect(&mut self) -> Result<ServiceClient, NativeServiceError> {
         if self.endpoint_path.exists() {
-            match ServiceClient::connect(&self.endpoint_path, &self.data_directory, &self.client_id)
-                .await
+            match ServiceClient::connect(
+                &self.endpoint_path,
+                &self.data_directory,
+                &self.app_id,
+                &self.client_id,
+            )
+            .await
             {
                 Ok(client) => {
                     self.ensure_endpoint_version()?;
                     return Ok(client);
                 }
-                Err(error) if error.code == "HTTP_SERVICE_NOT_RUNNING" => {
+                Err(error) if error.code == "NATIVE_SERVICE_NOT_RUNNING" => {
                     remove_stale_endpoint(&self.endpoint_path, &self.data_directory)?;
                 }
                 Err(error) => return Err(error),
@@ -437,18 +719,19 @@ impl ServiceSupervisor {
 
     async fn connect_managed(
         &mut self,
-    ) -> Result<(ServiceClient, Option<Box<dyn ServiceProcess>>), HttpServiceError> {
+    ) -> Result<(ServiceClient, Option<Box<dyn ServiceProcess>>), NativeServiceError> {
         let client = self.connect().await?;
         Ok((client, self.process.take()))
     }
 
-    async fn wait_until_ready(&mut self) -> Result<ServiceClient, HttpServiceError> {
+    async fn wait_until_ready(&mut self) -> Result<ServiceClient, NativeServiceError> {
         let deadline = Instant::now() + self.startup_timeout;
         loop {
             if self.endpoint_path.exists() {
                 match ServiceClient::connect(
                     &self.endpoint_path,
                     &self.data_directory,
+                    &self.app_id,
                     &self.client_id,
                 )
                 .await
@@ -457,7 +740,7 @@ impl ServiceSupervisor {
                         self.ensure_endpoint_version()?;
                         return Ok(client);
                     }
-                    Err(error) if error.code == "HTTP_SERVICE_NOT_RUNNING" => {}
+                    Err(error) if error.code == "NATIVE_SERVICE_NOT_RUNNING" => {}
                     Err(error) => return Err(error),
                 }
             }
@@ -465,29 +748,31 @@ impl ServiceSupervisor {
                 if self.data_directory.join("service.lock").exists() {
                     self.process = None;
                 } else {
-                    return Err(HttpServiceError::new(
-                        "HTTP_SERVICE_START_FAILED",
-                        format!("HTTP service exited before it became ready (status {exit_code})"),
+                    return Err(NativeServiceError::new(
+                        "NATIVE_SERVICE_START_FAILED",
+                        format!(
+                            "Native service exited before it became ready (status {exit_code})"
+                        ),
                     ));
                 }
             }
             if Instant::now() >= deadline {
-                return Err(HttpServiceError::new(
-                    "HTTP_SERVICE_START_TIMEOUT",
-                    "HTTP service did not become ready before the startup timeout",
+                return Err(NativeServiceError::new(
+                    "NATIVE_SERVICE_START_TIMEOUT",
+                    "Native service did not become ready before the startup timeout",
                 ));
             }
             sleep(READINESS_POLL_INTERVAL).await;
         }
     }
 
-    fn ensure_endpoint_version(&self) -> Result<(), HttpServiceError> {
+    fn ensure_endpoint_version(&self) -> Result<(), NativeServiceError> {
         let endpoint = read_endpoint(&self.endpoint_path)?;
         if endpoint.service_version != self.service_version {
-            return Err(HttpServiceError::new(
-                "HTTP_SERVICE_VERSION_UNSUPPORTED",
+            return Err(NativeServiceError::new(
+                "NATIVE_SERVICE_VERSION_UNSUPPORTED",
                 format!(
-                    "HTTP service version {} does not match installed version {}",
+                    "Native service version {} does not match installed version {}",
                     endpoint.service_version, self.service_version
                 ),
             ));
@@ -495,36 +780,36 @@ impl ServiceSupervisor {
         Ok(())
     }
 
-    fn process_exit_code(&mut self) -> Result<Option<i32>, HttpServiceError> {
+    fn process_exit_code(&mut self) -> Result<Option<i32>, NativeServiceError> {
         self.process
             .as_mut()
             .map(|process| process.try_exit())
             .transpose()
             .map(|status| status.flatten())
             .map_err(|error| {
-                HttpServiceError::new(
-                    "HTTP_SERVICE_START_FAILED",
-                    format!("Cannot inspect HTTP service process: {error}"),
+                NativeServiceError::new(
+                    "NATIVE_SERVICE_START_FAILED",
+                    format!("Cannot inspect Native service process: {error}"),
                 )
             })
     }
 }
 
-fn remove_stale_endpoint(path: &Path, data_directory: &Path) -> Result<(), HttpServiceError> {
+fn remove_stale_endpoint(path: &Path, data_directory: &Path) -> Result<(), NativeServiceError> {
     let endpoint = read_endpoint(path)?;
     std::fs::remove_file(path).map_err(|error| {
-        HttpServiceError::new(
-            "HTTP_SERVICE_ENDPOINT_WRITE_FAILED",
-            format!("Cannot remove stale HTTP service endpoint: {error}"),
+        NativeServiceError::new(
+            "NATIVE_SERVICE_ENDPOINT_WRITE_FAILED",
+            format!("Cannot remove stale Native service endpoint: {error}"),
         )
     })?;
     let lease_path = data_directory.join("service.lock");
     if let Ok(lease) = std::fs::read_to_string(&lease_path) {
         if lease.lines().next() == Some(endpoint.token.as_str()) {
             std::fs::remove_file(lease_path).map_err(|error| {
-                HttpServiceError::new(
-                    "HTTP_SERVICE_LEASE_FAILED",
-                    format!("Cannot remove stale HTTP service lease: {error}"),
+                NativeServiceError::new(
+                    "NATIVE_SERVICE_LEASE_FAILED",
+                    format!("Cannot remove stale Native service lease: {error}"),
                 )
             })?;
         }
@@ -534,13 +819,13 @@ fn remove_stale_endpoint(path: &Path, data_directory: &Path) -> Result<(), HttpS
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HttpServiceError {
+pub struct NativeServiceError {
     pub code: String,
     pub message: String,
     pub retryable: bool,
 }
 
-impl HttpServiceError {
+impl NativeServiceError {
     fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
@@ -550,15 +835,15 @@ impl HttpServiceError {
     }
 }
 
-impl std::fmt::Display for HttpServiceError {
+impl std::fmt::Display for NativeServiceError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}: {}", self.code, self.message)
     }
 }
 
-impl std::error::Error for HttpServiceError {}
+impl std::error::Error for NativeServiceError {}
 
-fn required_permission(method: &str) -> Result<&'static str, HttpServiceError> {
+fn required_permission(method: &str) -> Result<&'static str, NativeServiceError> {
     match method {
         "http.send" | "http.cancel" => Ok("host.http.request"),
         "stream.open" | "stream.close" | "stream.send" | "stream.snapshot" => {
@@ -589,11 +874,59 @@ fn required_permission(method: &str) -> Result<&'static str, HttpServiceError> {
         | "data.collections.folders.delete"
         | "data.collections.requests.delete"
         | "data.openapi.import" => Ok("host.http.data"),
-        _ => Err(HttpServiceError::new(
-            "HTTP_SERVICE_METHOD_NOT_FOUND",
-            "HTTP service method is not exposed by the host",
+        "download.defaultDirectory"
+        | "download.tasks.list"
+        | "download.tasks.start"
+        | "download.tasks.cancel"
+        | "download.tasks.openFolder"
+        | "download.tasks.clearCompleted"
+        | "download.tasks.delete" => Ok("host.download.tasks"),
+        "template.templates.list"
+        | "template.templates.load"
+        | "template.templates.save"
+        | "template.templates.rename"
+        | "template.templates.delete"
+        | "template.psd.import"
+        | "template.assets.import"
+        | "template.assets.save"
+        | "template.assets.list"
+        | "template.assets.delete"
+        | "template.batch.sources.register"
+        | "template.batch.run"
+        | "template.batch.save" => Ok("host.template.project"),
+        "clipboard.history.list"
+        | "clipboard.history.get"
+        | "clipboard.history.pin"
+        | "clipboard.history.delete"
+        | "clipboard.history.clearUnpinned"
+        | "clipboard.history.restore"
+        | "clipboard.settings.get"
+        | "clipboard.settings.update" => Ok("host.clipboard.history"),
+        _ => Err(NativeServiceError::new(
+            "NATIVE_SERVICE_METHOD_NOT_FOUND",
+            "Native service method is not exposed by the host",
         )),
     }
+}
+
+fn data_directory_for(app_data_root: &Path, app_id: &str) -> Result<PathBuf, NativeServiceError> {
+    if app_id.is_empty()
+        || !app_id
+            .bytes()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'.' | b'-'))
+    {
+        return Err(NativeServiceError::new(
+            "NATIVE_SERVICE_APP_ID_INVALID",
+            "Native service app ID is invalid",
+        ));
+    }
+    Ok(match app_id {
+        "com.attson.http" => app_data_root.join("http"),
+        "com.attson.aria2" => app_data_root.join("aria2"),
+        "com.attson.template" => app_data_root.join("ecommerce"),
+        "com.attson.clipboard" => app_data_root.join("clipboard"),
+        _ => app_data_root.join("native-services").join(app_id),
+    })
 }
 
 #[derive(Deserialize)]
@@ -634,19 +967,17 @@ enum ServiceReply {
     },
     #[serde(rename = "event")]
     Event {
-        #[serde(rename = "sessionId")]
-        session_id: String,
-        generation: u64,
-        message: Value,
+        #[serde(flatten)]
+        event: serde_json::Map<String, Value>,
     },
 }
 
-type PendingResult = Result<Value, HttpServiceError>;
+type PendingResult = Result<Value, NativeServiceError>;
 
 #[derive(Default)]
 struct ClientState {
     pending: HashMap<String, oneshot::Sender<PendingResult>>,
-    disconnected: Option<HttpServiceError>,
+    disconnected: Option<NativeServiceError>,
 }
 
 type SharedClientState = Arc<Mutex<ClientState>>;
@@ -662,18 +993,19 @@ impl ServiceClient {
     async fn connect(
         endpoint_path: &Path,
         data_directory: &Path,
+        app_id: &str,
         client_id: &str,
-    ) -> Result<Self, HttpServiceError> {
+    ) -> Result<Self, NativeServiceError> {
         let endpoint = read_endpoint(endpoint_path)?;
         let stream = TcpStream::connect(("127.0.0.1", endpoint.port))
             .await
             .map_err(|error| {
                 let code = if error.kind() == std::io::ErrorKind::ConnectionRefused {
-                    "HTTP_SERVICE_NOT_RUNNING"
+                    "NATIVE_SERVICE_NOT_RUNNING"
                 } else {
-                    "HTTP_SERVICE_CONNECT_FAILED"
+                    "NATIVE_SERVICE_CONNECT_FAILED"
                 };
-                HttpServiceError::new(code, format!("Cannot connect to HTTP service: {error}"))
+                NativeServiceError::new(code, format!("Cannot connect to Native service: {error}"))
             })?;
         let (reader, mut writer) = stream.into_split();
         let request_id = Uuid::new_v4().to_string();
@@ -682,7 +1014,7 @@ impl ServiceClient {
             &json!({
                 "kind": "request",
                 "protocolVersion": 1,
-                "appId": "com.attson.http",
+                "appId": app_id,
                 "clientId": client_id,
                 "requestId": request_id,
                 "hostApi": "2.0.0",
@@ -699,24 +1031,24 @@ impl ServiceClient {
         let read = timeout(Duration::from_secs(10), reader.read_until(b'\n', &mut line))
             .await
             .map_err(|_| {
-                HttpServiceError::new(
-                    "HTTP_SERVICE_HANDSHAKE_TIMEOUT",
-                    "HTTP service handshake timed out",
+                NativeServiceError::new(
+                    "NATIVE_SERVICE_HANDSHAKE_TIMEOUT",
+                    "Native service handshake timed out",
                 )
             })?
             .map_err(|error| {
-                HttpServiceError::new(
-                    "HTTP_SERVICE_HANDSHAKE_FAILED",
-                    format!("Cannot read HTTP service handshake: {error}"),
+                NativeServiceError::new(
+                    "NATIVE_SERVICE_HANDSHAKE_FAILED",
+                    format!("Cannot read Native service handshake: {error}"),
                 )
             })?;
         if read == 0 {
             return Err(disconnected());
         }
         let reply = serde_json::from_slice::<ServiceReply>(&line).map_err(|error| {
-            HttpServiceError::new(
-                "HTTP_SERVICE_HANDSHAKE_FAILED",
-                format!("Cannot decode HTTP service handshake: {error}"),
+            NativeServiceError::new(
+                "NATIVE_SERVICE_HANDSHAKE_FAILED",
+                format!("Cannot decode Native service handshake: {error}"),
             )
         })?;
         match reply {
@@ -725,9 +1057,9 @@ impl ServiceClient {
             } if response_id == request_id => {}
             ServiceReply::Error { error, .. } => return Err(error.into()),
             _ => {
-                return Err(HttpServiceError::new(
-                    "HTTP_SERVICE_HANDSHAKE_FAILED",
-                    "HTTP service returned an unexpected handshake response",
+                return Err(NativeServiceError::new(
+                    "NATIVE_SERVICE_HANDSHAKE_FAILED",
+                    "Native service returned an unexpected handshake response",
                 ));
             }
         }
@@ -746,7 +1078,7 @@ impl ServiceClient {
         self.events.subscribe()
     }
 
-    async fn request(&self, method: &str, params: Value) -> Result<Value, HttpServiceError> {
+    async fn request(&self, method: &str, params: Value) -> Result<Value, NativeServiceError> {
         let request_timeout = request_timeout(method, &params);
         let request_id = Uuid::new_v4().to_string();
         let request = json!({
@@ -771,9 +1103,9 @@ impl ServiceClient {
         match timeout(request_timeout, receiver).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(disconnected()),
-            Err(_) => Err(HttpServiceError::new(
-                "HTTP_SERVICE_REQUEST_TIMEOUT",
-                "HTTP service request timed out",
+            Err(_) => Err(NativeServiceError::new(
+                "NATIVE_SERVICE_REQUEST_TIMEOUT",
+                "Native service request timed out",
             )),
         }
     }
@@ -800,7 +1132,7 @@ fn request_timeout(method: &str, params: &Value) -> Duration {
     Duration::from_secs(seconds + 5)
 }
 
-impl From<ErrorEnvelope> for HttpServiceError {
+impl From<ErrorEnvelope> for NativeServiceError {
     fn from(error: ErrorEnvelope) -> Self {
         Self {
             code: error.code,
@@ -836,9 +1168,9 @@ async fn read_replies(
         match reader.read_until(b'\n', &mut line).await {
             Ok(0) => break disconnected(),
             Err(error) => {
-                break HttpServiceError::new(
-                    "HTTP_SERVICE_DISCONNECTED",
-                    format!("Cannot read HTTP service response: {error}"),
+                break NativeServiceError::new(
+                    "NATIVE_SERVICE_DISCONNECTED",
+                    format!("Cannot read Native service response: {error}"),
                 );
             }
             Ok(_) => {}
@@ -846,9 +1178,9 @@ async fn read_replies(
         let reply = match serde_json::from_slice::<ServiceReply>(&line) {
             Ok(reply) => reply,
             Err(error) => {
-                break HttpServiceError::new(
-                    "HTTP_SERVICE_RESPONSE_INVALID",
-                    format!("Cannot decode HTTP service response: {error}"),
+                break NativeServiceError::new(
+                    "NATIVE_SERVICE_RESPONSE_INVALID",
+                    format!("Cannot decode Native service response: {error}"),
                 );
             }
         };
@@ -873,20 +1205,12 @@ async fn read_replies(
                     let _ = sender.send(Err(error.into()));
                 }
             }
-            ServiceReply::Event {
-                session_id,
-                generation,
-                message,
-            } => {
-                let _ = events.send(json!({
-                    "sessionId": session_id,
-                    "generation": generation,
-                    "message": message
-                }));
+            ServiceReply::Event { event } => {
+                let _ = events.send(Value::Object(event));
             }
             ServiceReply::Handshake { .. } => {
-                break HttpServiceError::new(
-                    "HTTP_SERVICE_RESPONSE_INVALID",
+                break NativeServiceError::new(
+                    "NATIVE_SERVICE_RESPONSE_INVALID",
                     "Unexpected handshake response after connection was established",
                 );
             }
@@ -909,60 +1233,61 @@ async fn read_replies(
 async fn write_json_line(
     writer: &mut OwnedWriteHalf,
     value: &impl Serialize,
-) -> Result<(), HttpServiceError> {
+) -> Result<(), NativeServiceError> {
     let mut bytes = serde_json::to_vec(value).map_err(|error| {
-        HttpServiceError::new(
-            "HTTP_SERVICE_REQUEST_INVALID",
-            format!("Cannot encode HTTP service request: {error}"),
+        NativeServiceError::new(
+            "NATIVE_SERVICE_REQUEST_INVALID",
+            format!("Cannot encode Native service request: {error}"),
         )
     })?;
     bytes.push(b'\n');
     writer.write_all(&bytes).await.map_err(|error| {
-        HttpServiceError::new(
-            "HTTP_SERVICE_DISCONNECTED",
-            format!("Cannot write HTTP service request: {error}"),
+        NativeServiceError::new(
+            "NATIVE_SERVICE_DISCONNECTED",
+            format!("Cannot write Native service request: {error}"),
         )
     })
 }
 
-fn read_endpoint(path: &Path) -> Result<Endpoint, HttpServiceError> {
+fn read_endpoint(path: &Path) -> Result<Endpoint, NativeServiceError> {
     let bytes = std::fs::read(path).map_err(|error| {
-        HttpServiceError::new(
-            "HTTP_SERVICE_ENDPOINT_READ_FAILED",
-            format!("Cannot read HTTP service endpoint: {error}"),
+        NativeServiceError::new(
+            "NATIVE_SERVICE_ENDPOINT_READ_FAILED",
+            format!("Cannot read Native service endpoint: {error}"),
         )
     })?;
     let endpoint: Endpoint = serde_json::from_slice(&bytes).map_err(|error| {
-        HttpServiceError::new(
-            "HTTP_SERVICE_ENDPOINT_INVALID",
-            format!("Cannot decode HTTP service endpoint: {error}"),
+        NativeServiceError::new(
+            "NATIVE_SERVICE_ENDPOINT_INVALID",
+            format!("Cannot decode Native service endpoint: {error}"),
         )
     })?;
     if endpoint.port == 0
         || endpoint.token.trim().is_empty()
         || endpoint.service_version.trim().is_empty()
     {
-        return Err(HttpServiceError::new(
-            "HTTP_SERVICE_ENDPOINT_INVALID",
-            "HTTP service endpoint fields are invalid",
+        return Err(NativeServiceError::new(
+            "NATIVE_SERVICE_ENDPOINT_INVALID",
+            "Native service endpoint fields are invalid",
         ));
     }
     Ok(endpoint)
 }
 
-fn disconnected() -> HttpServiceError {
-    HttpServiceError::new(
-        "HTTP_SERVICE_DISCONNECTED",
-        "HTTP service connection was closed",
+fn disconnected() -> NativeServiceError {
+    NativeServiceError::new(
+        "NATIVE_SERVICE_DISCONNECTED",
+        "Native service connection was closed",
     )
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
         io,
-        path::Path,
+        path::{Path, PathBuf},
+        process::{Command, Stdio},
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc, Mutex,
@@ -971,18 +1296,21 @@ mod tests {
     };
 
     use ed25519_dalek::VerifyingKey;
-    use serde_json::json;
+    use image::{Rgba, RgbaImage};
+    use serde_json::{json, Value};
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::TcpListener,
+        sync::Barrier,
     };
 
     use super::{
-        request_timeout, required_permission, HttpServiceError, HttpServiceEventSink,
-        HttpServiceRuntime, ServiceClient, ServiceLaunchSpec, ServiceLauncher, ServiceProcess,
-        ServiceSupervisor, DEFAULT_REQUEST_TIMEOUT,
+        data_directory_for, request_timeout, required_permission, ConnectedService, ErrorEnvelope,
+        NativeServiceError, NativeServiceEventSink, NativeServiceRuntime, ServiceClient,
+        ServiceLaunchSpec, ServiceLauncher, ServiceProcess, ServiceReply, ServiceSupervisor,
+        DEFAULT_REQUEST_TIMEOUT,
     };
     use crate::plugin::{install::PluginStore, package::HostEnvironment};
 
@@ -992,12 +1320,12 @@ mod tests {
         sender: tokio::sync::mpsc::UnboundedSender<(String, serde_json::Value)>,
     }
 
-    impl HttpServiceEventSink for NoopEventSink {
-        fn emit(&self, _app_id: &str, _event: serde_json::Value) {}
+    impl NativeServiceEventSink for NoopEventSink {
+        fn emit(&self, _app_id: &str, _service_version: &str, _event: serde_json::Value) {}
     }
 
-    impl HttpServiceEventSink for RecordingEventSink {
-        fn emit(&self, app_id: &str, event: serde_json::Value) {
+    impl NativeServiceEventSink for RecordingEventSink {
+        fn emit(&self, app_id: &str, _service_version: &str, event: serde_json::Value) {
             let _ = self.sender.send((app_id.to_string(), event));
         }
     }
@@ -1037,7 +1365,7 @@ mod tests {
         fn launch(
             &self,
             _spec: &ServiceLaunchSpec,
-        ) -> Result<Box<dyn ServiceProcess>, HttpServiceError> {
+        ) -> Result<Box<dyn ServiceProcess>, NativeServiceError> {
             panic!("healthy service must be reused")
         }
     }
@@ -1046,7 +1374,7 @@ mod tests {
         fn launch(
             &self,
             spec: &ServiceLaunchSpec,
-        ) -> Result<Box<dyn ServiceProcess>, HttpServiceError> {
+        ) -> Result<Box<dyn ServiceProcess>, NativeServiceError> {
             self.starts.fetch_add(1, Ordering::SeqCst);
             let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -1093,7 +1421,7 @@ mod tests {
         fn launch(
             &self,
             _spec: &ServiceLaunchSpec,
-        ) -> Result<Box<dyn ServiceProcess>, HttpServiceError> {
+        ) -> Result<Box<dyn ServiceProcess>, NativeServiceError> {
             Ok(Box::new(ExitedProcess))
         }
     }
@@ -1102,7 +1430,7 @@ mod tests {
         fn launch(
             &self,
             spec: &ServiceLaunchSpec,
-        ) -> Result<Box<dyn ServiceProcess>, HttpServiceError> {
+        ) -> Result<Box<dyn ServiceProcess>, NativeServiceError> {
             std::fs::create_dir_all(&spec.data_directory).unwrap();
             std::fs::write(spec.data_directory.join("service.lock"), "winner-token").unwrap();
             let spec = spec.clone();
@@ -1131,7 +1459,7 @@ mod tests {
         fn launch(
             &self,
             spec: &ServiceLaunchSpec,
-        ) -> Result<Box<dyn ServiceProcess>, HttpServiceError> {
+        ) -> Result<Box<dyn ServiceProcess>, NativeServiceError> {
             std::fs::create_dir_all(&spec.data_directory).unwrap();
             std::fs::write(spec.data_directory.join("service.lock"), "missing-winner").unwrap();
             Ok(Box::new(ExitedProcess))
@@ -1142,7 +1470,7 @@ mod tests {
         fn launch(
             &self,
             spec: &ServiceLaunchSpec,
-        ) -> Result<Box<dyn ServiceProcess>, HttpServiceError> {
+        ) -> Result<Box<dyn ServiceProcess>, NativeServiceError> {
             let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
             listener.set_nonblocking(true).unwrap();
             let listener = TcpListener::from_std(listener).unwrap();
@@ -1213,6 +1541,97 @@ mod tests {
     }
 
     #[test]
+    fn maps_only_declared_download_service_methods_to_permissions() {
+        for method in [
+            "download.defaultDirectory",
+            "download.tasks.list",
+            "download.tasks.start",
+            "download.tasks.cancel",
+            "download.tasks.openFolder",
+            "download.tasks.clearCompleted",
+            "download.tasks.delete",
+        ] {
+            assert_eq!(required_permission(method).unwrap(), "host.download.tasks");
+        }
+        assert!(required_permission("download.process.spawn").is_err());
+        assert!(required_permission("download.tasks.unknown").is_err());
+    }
+
+    #[test]
+    fn maps_only_declared_template_service_methods_to_permissions() {
+        for method in [
+            "template.templates.list",
+            "template.templates.load",
+            "template.templates.save",
+            "template.templates.rename",
+            "template.templates.delete",
+            "template.psd.import",
+            "template.assets.import",
+            "template.assets.save",
+            "template.assets.list",
+            "template.assets.delete",
+            "template.batch.sources.register",
+            "template.batch.run",
+            "template.batch.save",
+        ] {
+            assert_eq!(
+                required_permission(method).unwrap(),
+                "host.template.project"
+            );
+        }
+        assert!(required_permission("template.process.spawn").is_err());
+        assert!(required_permission("template.batch.unknown").is_err());
+    }
+
+    #[test]
+    fn maps_only_declared_clipboard_service_methods_to_permissions() {
+        for method in [
+            "clipboard.history.list",
+            "clipboard.history.get",
+            "clipboard.history.pin",
+            "clipboard.history.delete",
+            "clipboard.history.clearUnpinned",
+            "clipboard.history.restore",
+            "clipboard.settings.get",
+            "clipboard.settings.update",
+        ] {
+            assert_eq!(
+                required_permission(method).unwrap(),
+                "host.clipboard.history"
+            );
+        }
+        assert!(required_permission("clipboard.history.exportDatabase").is_err());
+        assert!(required_permission("clipboard.settings.reset").is_err());
+    }
+
+    #[test]
+    fn maps_native_service_data_directories_without_moving_http_data() {
+        let root = Path::new("/tmp/attool-data");
+        assert_eq!(
+            data_directory_for(root, "com.attson.http").unwrap(),
+            root.join("http")
+        );
+        assert_eq!(
+            data_directory_for(root, "com.attson.aria2").unwrap(),
+            root.join("aria2")
+        );
+        assert_eq!(
+            data_directory_for(root, "com.attson.template").unwrap(),
+            root.join("ecommerce")
+        );
+        assert_eq!(
+            data_directory_for(root, "com.attson.clipboard").unwrap(),
+            root.join("clipboard")
+        );
+        assert_eq!(
+            data_directory_for(root, "com.example.service").unwrap(),
+            root.join("native-services/com.example.service")
+        );
+        assert!(data_directory_for(root, "../escaped").is_err());
+        assert!(data_directory_for(root, "nested/service").is_err());
+    }
+
+    #[test]
     fn http_request_timeout_respects_the_user_setting() {
         assert_eq!(
             request_timeout(
@@ -1250,6 +1669,7 @@ mod tests {
         let client = ServiceClient::connect(
             &endpoint_path,
             Path::new(&expected_data_directory),
+            "com.attson.http",
             "attool-test",
         )
         .await
@@ -1267,6 +1687,79 @@ mod tests {
             })
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn service_client_uses_the_requested_app_identity() {
+        let directory = tempdir().unwrap();
+        let data_directory = directory.path().join("aria2");
+        std::fs::create_dir_all(&data_directory).unwrap();
+        let endpoint_path = data_directory.join("service.endpoint.json");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        std::fs::write(
+            &endpoint_path,
+            serde_json::to_vec(&json!({
+                "port": listener.local_addr().unwrap().port(),
+                "token": "secret-token",
+                "serviceVersion": "0.1.0-alpha.0"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let expected_data_directory = data_directory.to_string_lossy().to_string();
+        let server = tokio::spawn(fake_service_for_app(
+            listener,
+            expected_data_directory.clone(),
+            "com.attson.aria2",
+        ));
+
+        let client = ServiceClient::connect(
+            &endpoint_path,
+            Path::new(&expected_data_directory),
+            "com.attson.aria2",
+            "attool-test",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            client
+                .request("download.tasks.list", json!({}))
+                .await
+                .unwrap(),
+            json!([{"id": "tab-1"}])
+        );
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn preserves_domain_errors_returned_by_native_services() {
+        let error: NativeServiceError = ErrorEnvelope {
+            code: "HTTP_SERVICE_BAD_REQUEST".to_string(),
+            message: "Invalid URL".to_string(),
+            retryable: false,
+        }
+        .into();
+
+        assert_eq!(error.code, "HTTP_SERVICE_BAD_REQUEST");
+        assert_eq!(error.message, "Invalid URL");
+    }
+
+    #[test]
+    fn decodes_download_events_without_an_http_stream_envelope() {
+        let reply: ServiceReply = serde_json::from_value(json!({
+            "kind": "event",
+            "id": "download-1",
+            "status": "running",
+            "progress": 25
+        }))
+        .unwrap();
+
+        let ServiceReply::Event { event } = reply else {
+            panic!("expected an event reply");
+        };
+        assert_eq!(event["id"], "download-1");
+        assert_eq!(event["status"], "running");
+        assert_eq!(event["progress"], 25);
     }
 
     #[tokio::test]
@@ -1419,7 +1912,7 @@ mod tests {
             Err(error) => error,
         };
 
-        assert_eq!(error.code, "HTTP_SERVICE_START_FAILED");
+        assert_eq!(error.code, "NATIVE_SERVICE_START_FAILED");
         assert!(error.message.contains("17"));
     }
 
@@ -1465,7 +1958,7 @@ mod tests {
             Err(error) => error,
         };
 
-        assert_eq!(error.code, "HTTP_SERVICE_START_TIMEOUT");
+        assert_eq!(error.code, "NATIVE_SERVICE_START_TIMEOUT");
     }
 
     #[tokio::test]
@@ -1473,16 +1966,57 @@ mod tests {
         let directory = tempdir().unwrap();
         let store_root = directory.path().join("plugins");
         let store = native_service_store(&store_root, b"tampered-service", b"signed-service");
-        let runtime = HttpServiceRuntime::with_event_sink(
+        let runtime = NativeServiceRuntime::with_event_sink(
             store,
-            directory.path().join("http"),
+            directory.path().to_path_buf(),
             Arc::new(NoopEventSink),
         );
 
         let error = runtime.connect("com.attson.http").await.unwrap_err();
 
-        assert_eq!(error.code, "HTTP_SERVICE_BINARY_HASH_MISMATCH");
+        assert_eq!(error.code, "NATIVE_SERVICE_BINARY_HASH_MISMATCH");
         assert!(!directory.path().join("http/service.endpoint.json").exists());
+        let status = runtime.status_for("com.attson.http").unwrap();
+        assert_eq!(status.state, "unavailable");
+        assert_eq!(
+            status.error_code.as_deref(),
+            Some("NATIVE_SERVICE_BINARY_HASH_MISMATCH")
+        );
+        assert!(!status
+            .correlation_id
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_applies_download_permissions_before_service_dispatch() {
+        let directory = tempdir().unwrap();
+        let store_root = directory.path().join("plugins");
+        let store = native_service_store_for(
+            &store_root,
+            "com.attson.aria2",
+            &["host.download.tasks"],
+            b"signed-service",
+            b"signed-service",
+        );
+        let runtime = NativeServiceRuntime::with_event_sink(
+            store,
+            directory.path().to_path_buf(),
+            Arc::new(NoopEventSink),
+        );
+
+        let allowed = runtime
+            .request("com.attson.aria2", "download.tasks.list", json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(allowed.code, "NATIVE_SERVICE_NOT_CONNECTED");
+
+        let denied = runtime
+            .request("com.attson.aria2", "download.process.spawn", json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code, "NATIVE_SERVICE_METHOD_NOT_FOUND");
     }
 
     #[tokio::test]
@@ -1507,15 +2041,17 @@ mod tests {
         let expected_data_directory = data_directory.to_string_lossy().to_string();
         let server = tokio::spawn(fake_service(listener, expected_data_directory));
         let (event_sender, mut event_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let runtime = HttpServiceRuntime::with_event_sink(
+        let runtime = NativeServiceRuntime::with_event_sink(
             store,
-            data_directory,
+            directory.path().to_path_buf(),
             Arc::new(RecordingEventSink {
                 sender: event_sender,
             }),
         );
 
         runtime.connect("com.attson.http").await.unwrap();
+        assert!(runtime.accepts_event("com.attson.http", "0.1.0-alpha.0"));
+        assert!(!runtime.accepts_event("com.attson.http", "0.2.0"));
         let result = runtime
             .request("com.attson.http", "data.tabs.list", json!({}))
             .await
@@ -1525,7 +2061,224 @@ mod tests {
         assert_eq!(result, json!([{"id": "tab-1"}]));
         assert_eq!(app_id, "com.attson.http");
         assert_eq!(event["sessionId"], "session-1");
+        runtime.disconnect("com.attson.http").await.unwrap();
+        assert!(!runtime.accepts_event("com.attson.http", "0.1.0-alpha.0"));
         server.await.unwrap();
+    }
+
+    #[test]
+    fn runtime_selects_only_enabled_background_services() {
+        let directory = tempdir().unwrap();
+        let store_root = directory.path().join("plugins");
+        let store = native_service_store(&store_root, b"signed-service", b"signed-service");
+        let connection = rusqlite::Connection::open(store_root.join("registry.sqlite3")).unwrap();
+        let metadata = json!({
+            "entry": "native/service",
+            "version": "0.1.0-alpha.0",
+            "sha256": hex::encode(Sha256::digest(b"signed-service")),
+            "protocolVersion": 1,
+            "lifecycle": "background"
+        });
+        connection
+            .execute(
+                "UPDATE installed_plugins SET native_service_json = ?1 WHERE app_id = ?2",
+                rusqlite::params![metadata.to_string(), "com.attson.http"],
+            )
+            .unwrap();
+        drop(connection);
+        let runtime = NativeServiceRuntime::with_event_sink(
+            store,
+            directory.path().to_path_buf(),
+            Arc::new(NoopEventSink),
+        );
+
+        assert_eq!(runtime.background_app_ids().unwrap(), ["com.attson.http"]);
+        runtime
+            .store
+            .lock()
+            .unwrap()
+            .set_enabled("com.attson.http", false)
+            .unwrap();
+        assert!(runtime.background_app_ids().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_connects_for_one_app_reuse_one_service_connection() {
+        let directory = tempdir().unwrap();
+        let store_root = directory.path().join("plugins");
+        let store = native_service_store(&store_root, b"signed-service", b"signed-service");
+        let data_directory = directory.path().join("http");
+        std::fs::create_dir_all(&data_directory).unwrap();
+        let endpoint_path = data_directory.join("service.endpoint.json");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        std::fs::write(
+            &endpoint_path,
+            serde_json::to_vec(&json!({
+                "port": listener.local_addr().unwrap().port(),
+                "token": "secret-token",
+                "serviceVersion": "0.1.0-alpha.0"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let server = tokio::spawn(fake_service(
+            listener,
+            data_directory.to_string_lossy().to_string(),
+        ));
+        let runtime = NativeServiceRuntime::with_event_sink(
+            store,
+            directory.path().to_path_buf(),
+            Arc::new(NoopEventSink),
+        );
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (first, second) = tokio::join!(
+                runtime.connect("com.attson.http"),
+                runtime.connect("com.attson.http")
+            );
+            first.unwrap();
+            second.unwrap();
+            runtime
+                .request("com.attson.http", "data.tabs.list", json!({}))
+                .await
+                .unwrap();
+            server.await.unwrap();
+        })
+        .await
+        .expect("same-app connects should complete within the caller budget");
+    }
+
+    #[tokio::test]
+    async fn connects_for_different_apps_reach_their_services_in_parallel() {
+        let directory = tempdir().unwrap();
+        let store_root = directory.path().join("plugins");
+        let _ = native_service_store_for(
+            &store_root,
+            "com.attson.http",
+            &["host.http.request", "host.http.stream", "host.http.data"],
+            b"signed-http-service",
+            b"signed-http-service",
+        );
+        let store = native_service_store_for(
+            &store_root,
+            "com.attson.aria2",
+            &["host.download.tasks"],
+            b"signed-aria2-service",
+            b"signed-aria2-service",
+        );
+        let barrier = Arc::new(Barrier::new(2));
+        let mut servers = Vec::new();
+        for (app_id, data_directory) in [
+            ("com.attson.http", directory.path().join("http")),
+            ("com.attson.aria2", directory.path().join("aria2")),
+        ] {
+            std::fs::create_dir_all(&data_directory).unwrap();
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            std::fs::write(
+                data_directory.join("service.endpoint.json"),
+                serde_json::to_vec(&json!({
+                    "port": listener.local_addr().unwrap().port(),
+                    "token": "secret-token",
+                    "serviceVersion": "0.1.0-alpha.0"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            servers.push(tokio::spawn(fake_service_for_app_with_barrier(
+                listener,
+                data_directory.to_string_lossy().to_string(),
+                app_id,
+                Arc::clone(&barrier),
+            )));
+        }
+        let runtime = NativeServiceRuntime::with_event_sink(
+            store,
+            directory.path().to_path_buf(),
+            Arc::new(NoopEventSink),
+        );
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (http, aria2) = tokio::join!(
+                runtime.connect("com.attson.http"),
+                runtime.connect("com.attson.aria2")
+            );
+            http.unwrap();
+            aria2.unwrap();
+            let (http_result, aria2_result) = tokio::join!(
+                runtime.request("com.attson.http", "data.tabs.list", json!({})),
+                runtime.request("com.attson.aria2", "download.tasks.list", json!({}))
+            );
+            http_result.unwrap();
+            aria2_result.unwrap();
+            for server in servers {
+                server.await.unwrap();
+            }
+        })
+        .await
+        .expect("different apps should not be serialized by a global connect lock");
+    }
+
+    #[tokio::test]
+    async fn disconnect_terminates_only_the_host_owned_process_and_allows_retry() {
+        let directory = tempdir().unwrap();
+        let store_root = directory.path().join("plugins");
+        let store = native_service_store(&store_root, b"signed-service", b"signed-service");
+        let data_directory = directory.path().join("http");
+        std::fs::create_dir_all(&data_directory).unwrap();
+        let endpoint_path = data_directory.join("service.endpoint.json");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        std::fs::write(
+            &endpoint_path,
+            serde_json::to_vec(&json!({
+                "port": listener.local_addr().unwrap().port(),
+                "token": "secret-token",
+                "serviceVersion": "0.1.0-alpha.0"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let server = Arc::new(Mutex::new(Some(tokio::spawn(fake_service(
+            listener,
+            data_directory.to_string_lossy().to_string(),
+        )))));
+        let client = ServiceClient::connect(
+            &endpoint_path,
+            &data_directory,
+            "com.attson.http",
+            "attool-test",
+        )
+        .await
+        .unwrap();
+        let stops = Arc::new(AtomicUsize::new(0));
+        let runtime = NativeServiceRuntime::with_event_sink(
+            store,
+            directory.path().to_path_buf(),
+            Arc::new(NoopEventSink),
+        );
+        runtime.clients.lock().unwrap().insert(
+            "com.attson.http".to_string(),
+            ConnectedService {
+                version: "0.1.0-alpha.0".to_string(),
+                client,
+                process: Some(Box::new(OwnedTestProcess {
+                    server: Arc::clone(&server),
+                    stops: Arc::clone(&stops),
+                })),
+            },
+        );
+        assert!(runtime.is_connected("com.attson.http"));
+
+        runtime.disconnect("com.attson.http").await.unwrap();
+
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        assert!(!runtime.is_connected("com.attson.http"));
+        assert!(runtime.clients.lock().unwrap().is_empty());
+        let error = runtime
+            .request("com.attson.http", "data.tabs.list", json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "NATIVE_SERVICE_NOT_CONNECTED");
+        runtime.disconnect("com.attson.http").await.unwrap();
     }
 
     #[cfg(unix)]
@@ -1554,9 +2307,9 @@ mod tests {
         assert!(installed.native_service.is_some());
 
         let data_directory = directory.path().join("http");
-        let runtime = HttpServiceRuntime::with_event_sink(
+        let runtime = NativeServiceRuntime::with_event_sink(
             store,
-            data_directory.clone(),
+            directory.path().to_path_buf(),
             Arc::new(NoopEventSink),
         );
         runtime.connect("com.attson.http").await.unwrap();
@@ -1582,6 +2335,7 @@ mod tests {
         let second_client = ServiceClient::connect(
             &data_directory.join("service.endpoint.json"),
             &data_directory,
+            "com.attson.http",
             "standalone-test",
         )
         .await
@@ -1629,6 +2383,894 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires ATARIA2_TEST_PACKAGE"]
+    async fn packaged_aria2_plugin_installs_downloads_and_shares_history() {
+        let package =
+            std::env::var("ATARIA2_TEST_PACKAGE").expect("ATARIA2_TEST_PACKAGE is required");
+        let directory = tempdir().unwrap();
+        let store = PluginStore::open(directory.path().join("plugins")).unwrap();
+        let public_key = VerifyingKey::from_bytes(&[
+            0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64,
+            0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68,
+            0xf7, 0x07, 0x51, 0x1a,
+        ])
+        .unwrap();
+        let keys = HashMap::from([("attool-p0-test".to_string(), public_key)]);
+        let installed = store
+            .install(
+                Path::new(&package),
+                &HostEnvironment::current("2.0.0"),
+                &keys,
+            )
+            .unwrap();
+        assert_eq!(installed.app_id, "com.attson.aria2");
+
+        let runtime = NativeServiceRuntime::with_event_sink(
+            store,
+            directory.path().to_path_buf(),
+            Arc::new(NoopEventSink),
+        );
+        runtime.connect("com.attson.aria2").await.unwrap();
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut request = Vec::new();
+            BufReader::new(&mut stream)
+                .read_until(b'\n', &mut request)
+                .await
+                .unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nataria2-smoke")
+                .await
+                .unwrap();
+        });
+        let output = directory.path().join("downloads");
+        std::fs::create_dir_all(&output).unwrap();
+        let started = runtime
+            .request(
+                "com.attson.aria2",
+                "download.tasks.start",
+                json!({ "request": {
+                    "url": format!("http://{upstream_address}/payload.bin"),
+                    "downloadDir": output,
+                    "fileName": "payload.bin"
+                }}),
+            )
+            .await
+            .unwrap();
+        let id = started["id"].as_str().unwrap().to_string();
+        upstream_task.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let listed = runtime
+                    .request("com.attson.aria2", "download.tasks.list", json!({}))
+                    .await
+                    .unwrap();
+                if listed["tasks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|task| task["id"] == id && task["status"] == "completed")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(output.join("payload.bin")).unwrap(),
+            b"ataria2-smoke"
+        );
+
+        let data_directory = directory.path().join("aria2");
+        let second_client = ServiceClient::connect(
+            &data_directory.join("service.endpoint.json"),
+            &data_directory,
+            "com.attson.aria2",
+            "standalone-test",
+        )
+        .await
+        .unwrap();
+        let listed = second_client
+            .request("download.tasks.list", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(listed["tasks"][0]["id"], id);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires ATCLIPBOARD_TEST_PACKAGE"]
+    async fn packaged_clipboard_plugin_preserves_owned_data_across_lifecycle_changes() {
+        let package = std::env::var("ATCLIPBOARD_TEST_PACKAGE")
+            .expect("ATCLIPBOARD_TEST_PACKAGE is required");
+        let directory = tempdir().unwrap();
+        let store = PluginStore::open(directory.path().join("plugins")).unwrap();
+        let public_key = VerifyingKey::from_bytes(&[
+            0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64,
+            0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68,
+            0xf7, 0x07, 0x51, 0x1a,
+        ])
+        .unwrap();
+        let keys = HashMap::from([("attool-p0-test".to_string(), public_key)]);
+        let environment = HostEnvironment::current("2.0.0");
+        let installed = store
+            .install(Path::new(&package), &environment, &keys)
+            .unwrap();
+        assert_eq!(installed.app_id, "com.attson.clipboard");
+        assert_eq!(installed.publisher_key_id, "attool-p0-test");
+        assert_eq!(
+            installed.native_service.as_ref().unwrap().lifecycle,
+            "background"
+        );
+        assert_eq!(
+            installed.windows.get("history").unwrap().presentation,
+            "bottomPanel"
+        );
+        assert_eq!(
+            installed.windows.get("preview").unwrap().presentation,
+            "centeredDialog"
+        );
+        for entry in [None, Some("ui/history.html"), Some("ui/preview.html")] {
+            let asset = store.read_entry("com.attson.clipboard", entry).unwrap();
+            assert_eq!(asset.content_type, "text/html; charset=utf-8");
+            assert!(String::from_utf8(asset.bytes).unwrap().contains("<html"));
+        }
+
+        let data_directory = directory.path().join("clipboard");
+        let runtime = NativeServiceRuntime::with_event_sink(
+            store,
+            directory.path().to_path_buf(),
+            Arc::new(NoopEventSink),
+        );
+        runtime.connect("com.attson.clipboard").await.unwrap();
+        let settings = runtime
+            .request("com.attson.clipboard", "clipboard.settings.get", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(settings["retentionLimit"], 500);
+        let history = runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.history.list",
+                json!({ "limit": 20 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(history["items"], json!([]));
+        runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.settings.update",
+                json!({ "settings": {
+                    "captureEnabled": false,
+                    "retentionLimit": 321,
+                    "shortcut": settings["shortcut"].as_str().unwrap()
+                }}),
+            )
+            .await
+            .unwrap();
+
+        let marker_path = data_directory.join("clipboard-takeover.json");
+        let marker: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&marker_path).unwrap()).unwrap();
+        assert_eq!(marker["state"], "owned");
+        let marker_bytes = std::fs::read(&marker_path).unwrap();
+        assert!(data_directory.join("clipboard_history.sqlite3").is_file());
+
+        runtime.disconnect("com.attson.clipboard").await.unwrap();
+        runtime
+            .store
+            .lock()
+            .unwrap()
+            .set_enabled("com.attson.clipboard", false)
+            .unwrap();
+        assert!(!runtime.is_connected("com.attson.clipboard"));
+        let disabled = runtime
+            .request("com.attson.clipboard", "clipboard.settings.get", json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(disabled.code, "NATIVE_SERVICE_PLUGIN_DISABLED");
+
+        runtime
+            .store
+            .lock()
+            .unwrap()
+            .set_enabled("com.attson.clipboard", true)
+            .unwrap();
+        runtime.connect("com.attson.clipboard").await.unwrap();
+        let settings = runtime
+            .request("com.attson.clipboard", "clipboard.settings.get", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(settings["retentionLimit"], 321);
+
+        runtime.disconnect("com.attson.clipboard").await.unwrap();
+        runtime
+            .store
+            .lock()
+            .unwrap()
+            .uninstall("com.attson.clipboard", false)
+            .unwrap();
+        assert_eq!(std::fs::read(&marker_path).unwrap(), marker_bytes);
+        assert!(data_directory.join("clipboard_history.sqlite3").is_file());
+
+        runtime
+            .store
+            .lock()
+            .unwrap()
+            .install(Path::new(&package), &environment, &keys)
+            .unwrap();
+        runtime.connect("com.attson.clipboard").await.unwrap();
+        let settings = runtime
+            .request("com.attson.clipboard", "clipboard.settings.get", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(settings["retentionLimit"], 321);
+        assert_eq!(std::fs::read(&marker_path).unwrap(), marker_bytes);
+
+        stop_packaged_service(&data_directory);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires ATCLIPBOARD_REAL_FLOW_ROOT and ATCLIPBOARD_TEST_PACKAGE"]
+    async fn packaged_clipboard_plugin_captures_and_restores_the_real_wayland_clipboard() {
+        let app_data_root = std::path::PathBuf::from(
+            std::env::var("ATCLIPBOARD_REAL_FLOW_ROOT")
+                .expect("ATCLIPBOARD_REAL_FLOW_ROOT is required"),
+        );
+        assert!(
+            app_data_root.join("clipboard-real-flow-approved").is_file(),
+            "real clipboard flow is restricted to an explicitly approved root"
+        );
+        let _clipboard_snapshot = WaylandClipboardSnapshot::capture();
+        let package = std::env::var("ATCLIPBOARD_TEST_PACKAGE")
+            .expect("ATCLIPBOARD_TEST_PACKAGE is required");
+        let store = PluginStore::open(app_data_root.join("plugins")).unwrap();
+        let public_key = VerifyingKey::from_bytes(&[
+            0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64,
+            0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68,
+            0xf7, 0x07, 0x51, 0x1a,
+        ])
+        .unwrap();
+        let keys = HashMap::from([("attool-p0-test".to_string(), public_key)]);
+        if !store
+            .list()
+            .unwrap()
+            .iter()
+            .any(|plugin| plugin.app_id == "com.attson.clipboard")
+        {
+            store
+                .install(
+                    Path::new(&package),
+                    &HostEnvironment::current("2.0.0"),
+                    &keys,
+                )
+                .unwrap();
+        }
+        let runtime = NativeServiceRuntime::with_event_sink(
+            store,
+            app_data_root.clone(),
+            Arc::new(NoopEventSink),
+        );
+        runtime.connect("com.attson.clipboard").await.unwrap();
+        let mut service_cleanup = PackagedServiceCleanup::new(app_data_root.join("clipboard"));
+        cleanup_clipboard_query(&runtime, "atclipboard-real-").await;
+        let recovery_settings = runtime
+            .request("com.attson.clipboard", "clipboard.settings.get", json!({}))
+            .await
+            .unwrap();
+        runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.settings.update",
+                json!({ "settings": {
+                    "captureEnabled": true,
+                    "retentionLimit": 500,
+                    "shortcut": recovery_settings["shortcut"]
+                }}),
+            )
+            .await
+            .unwrap();
+        let original_ids = clipboard_all_ids(&runtime).await;
+        assert_eq!(original_ids.len(), 500);
+        let original_settings = runtime
+            .request("com.attson.clipboard", "clipboard.settings.get", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(original_settings["captureEnabled"], true);
+        assert_eq!(original_settings["retentionLimit"], 500);
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            assert!(original_settings["unavailableReason"].is_string());
+            assert_eq!(
+                original_settings["systemShortcutCommand"],
+                "atclipboard --history"
+            );
+        }
+        runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.settings.update",
+                json!({ "settings": {
+                    "captureEnabled": true,
+                    "retentionLimit": 1000,
+                    "shortcut": original_settings["shortcut"]
+                }}),
+            )
+            .await
+            .unwrap();
+
+        let flow = tempdir().unwrap();
+        let marker = uuid::Uuid::new_v4().to_string();
+        let mut test_ids = Vec::new();
+
+        let text = format!("atclipboard-real-text-{marker}");
+        wayland_copy("text/plain;charset=utf-8", text.as_bytes());
+        let text_item = wait_for_clipboard_query(&runtime, &text).await;
+        let text_id = text_item["id"].as_str().unwrap().to_string();
+        test_ids.push(text_id.clone());
+        runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.history.restore",
+                json!({ "id": text_id }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wayland_paste(None), text.as_bytes());
+
+        let long_prefix = format!("atclipboard-real-long-{marker}-");
+        let long_text = format!("{long_prefix}{}", "x".repeat(300_000));
+        wayland_copy("text/plain;charset=utf-8", long_text.as_bytes());
+        let long_item = wait_for_clipboard_query(&runtime, &long_prefix).await;
+        assert_eq!(long_item["contentTruncated"], true);
+        let long_id = long_item["id"].as_str().unwrap().to_string();
+        test_ids.push(long_id.clone());
+        let long_preview = runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.history.get",
+                json!({ "id": long_id }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(long_preview["contentTruncated"], true);
+        assert!(long_preview["contentText"].as_str().unwrap().len() <= 256 * 1024);
+        runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.history.restore",
+                json!({ "id": long_id }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wayland_paste(None), long_text.as_bytes());
+
+        let file_path = flow
+            .path()
+            .join(format!("atclipboard-real-file-{marker}.txt"));
+        std::fs::write(&file_path, b"atclipboard real flow").unwrap();
+        let file_uri = format!("file://{}\r\n", file_path.to_string_lossy());
+        wayland_copy("text/uri-list", file_uri.as_bytes());
+        let file_item =
+            wait_for_clipboard_query(&runtime, &format!("atclipboard-real-file-{marker}.txt"))
+                .await;
+        assert_eq!(file_item["kind"], "files");
+        let file_id = file_item["id"].as_str().unwrap().to_string();
+        test_ids.push(file_id.clone());
+        let file_preview = runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.history.get",
+                json!({ "id": file_id }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            file_preview["filePaths"][0],
+            file_path.to_string_lossy().as_ref()
+        );
+        runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.history.restore",
+                json!({ "id": file_id }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wayland_paste(None), file_path.to_string_lossy().as_bytes());
+
+        let known_images = clipboard_kind_ids(&runtime, "image").await;
+        let image_path = flow.path().join("large.png");
+        let image = RgbaImage::from_fn(1200, 900, |x, y| {
+            Rgba([
+                ((x * 31 + y * 17) % 251) as u8,
+                ((x * 13 + y * 47) % 253) as u8,
+                ((x * 7 + y * 19) % 255) as u8,
+                255,
+            ])
+        });
+        image.save(&image_path).unwrap();
+        wayland_copy("image/png", &std::fs::read(&image_path).unwrap());
+        let image_item = wait_for_new_clipboard_kind(&runtime, "image", &known_images).await;
+        assert!(image_item["previewDataUrl"].as_str().unwrap().len() <= 2 * 1024 * 1024);
+        let image_id = image_item["id"].as_str().unwrap().to_string();
+        test_ids.push(image_id.clone());
+        let image_preview = runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.history.get",
+                json!({ "id": image_id }),
+            )
+            .await
+            .unwrap();
+        assert!(image_preview["previewDataUrl"].as_str().unwrap().len() <= 2 * 1024 * 1024);
+        runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.history.restore",
+                json!({ "id": image_id }),
+            )
+            .await
+            .unwrap();
+        let restored_image = image::load_from_memory(&wayland_paste(Some("image/png"))).unwrap();
+        assert_eq!(restored_image.width(), 1200);
+        assert_eq!(restored_image.height(), 900);
+
+        runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.settings.update",
+                json!({ "settings": {
+                    "captureEnabled": false,
+                    "retentionLimit": 1000,
+                    "shortcut": original_settings["shortcut"]
+                }}),
+            )
+            .await
+            .unwrap();
+        let paused_text = format!("atclipboard-real-paused-{marker}");
+        wayland_copy("text/plain;charset=utf-8", paused_text.as_bytes());
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(clipboard_query_items(&runtime, &paused_text)
+            .await
+            .is_empty());
+        runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.settings.update",
+                json!({ "settings": {
+                    "captureEnabled": true,
+                    "retentionLimit": 1000,
+                    "shortcut": original_settings["shortcut"]
+                }}),
+            )
+            .await
+            .unwrap();
+        let resumed_item = wait_for_clipboard_query(&runtime, &paused_text).await;
+        test_ids.push(resumed_item["id"].as_str().unwrap().to_string());
+
+        for id in test_ids {
+            runtime
+                .request(
+                    "com.attson.clipboard",
+                    "clipboard.history.delete",
+                    json!({ "id": id }),
+                )
+                .await
+                .unwrap();
+        }
+        runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.settings.update",
+                json!({ "settings": {
+                    "captureEnabled": true,
+                    "retentionLimit": 500,
+                    "shortcut": original_settings["shortcut"]
+                }}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(clipboard_all_ids(&runtime).await, original_ids);
+        runtime.disconnect("com.attson.clipboard").await.unwrap();
+        service_cleanup.stop();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(app_data_root.join("clipboard/clipboard-takeover.json")).unwrap()
+            )
+            .unwrap()["state"],
+            "owned"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires ATCLIPBOARD_DESTRUCTIVE_FLOW_ROOT and ATCLIPBOARD_TEST_PACKAGE"]
+    async fn packaged_clipboard_plugin_applies_retention_and_clears_only_unpinned_history() {
+        let app_data_root = PathBuf::from(
+            std::env::var("ATCLIPBOARD_DESTRUCTIVE_FLOW_ROOT")
+                .expect("ATCLIPBOARD_DESTRUCTIVE_FLOW_ROOT is required"),
+        );
+        assert!(
+            app_data_root
+                .join("clipboard-destructive-flow-approved")
+                .is_file(),
+            "destructive clipboard flow is restricted to an explicitly approved disposable root"
+        );
+        let package = std::env::var("ATCLIPBOARD_TEST_PACKAGE")
+            .expect("ATCLIPBOARD_TEST_PACKAGE is required");
+        let store = PluginStore::open(app_data_root.join("plugins")).unwrap();
+        let public_key = VerifyingKey::from_bytes(&[
+            0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64,
+            0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68,
+            0xf7, 0x07, 0x51, 0x1a,
+        ])
+        .unwrap();
+        let keys = HashMap::from([("attool-p0-test".to_string(), public_key)]);
+        store
+            .install(
+                Path::new(&package),
+                &HostEnvironment::current("2.0.0"),
+                &keys,
+            )
+            .unwrap();
+        let runtime = NativeServiceRuntime::with_event_sink(
+            store,
+            app_data_root.clone(),
+            Arc::new(NoopEventSink),
+        );
+        runtime.connect("com.attson.clipboard").await.unwrap();
+        let mut service_cleanup = PackagedServiceCleanup::new(app_data_root.join("clipboard"));
+        let original_settings = runtime
+            .request("com.attson.clipboard", "clipboard.settings.get", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(clipboard_all_ids(&runtime).await.len(), 500);
+        let initial_image_count = clipboard_kind_ids(&runtime, "image").await.len();
+        let initial_asset_count = std::fs::read_dir(app_data_root.join("clipboard/assets"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_file())
+            .count();
+        let unreferenced_asset_count = initial_asset_count
+            .checked_sub(initial_image_count)
+            .expect("every image item must have one owned asset");
+        let first_page = runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.history.list",
+                json!({ "limit": 100 }),
+            )
+            .await
+            .unwrap();
+        let pinned = first_page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["isPinned"] == true)
+            .unwrap();
+        let pinned_id = pinned["id"].as_str().unwrap().to_string();
+        let pinned_is_image = pinned["kind"] == "image";
+
+        runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.settings.update",
+                json!({ "settings": {
+                    "captureEnabled": false,
+                    "retentionLimit": 50,
+                    "shortcut": original_settings["shortcut"]
+                }}),
+            )
+            .await
+            .unwrap();
+        let retained = clipboard_all_ids(&runtime).await;
+        assert_eq!(retained.len(), 50);
+        assert!(retained.contains(&pinned_id));
+
+        let cleared = runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.history.clearUnpinned",
+                json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleared["deletedCount"], 49);
+        assert_eq!(
+            clipboard_all_ids(&runtime).await,
+            HashSet::from([pinned_id])
+        );
+        let remaining_assets = std::fs::read_dir(app_data_root.join("clipboard/assets"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_file())
+            .count();
+        assert_eq!(
+            remaining_assets,
+            unreferenced_asset_count + usize::from(pinned_is_image)
+        );
+
+        runtime.disconnect("com.attson.clipboard").await.unwrap();
+        service_cleanup.stop();
+    }
+
+    #[cfg(target_os = "linux")]
+    struct WaylandClipboardSnapshot {
+        value: Option<(String, Vec<u8>)>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl WaylandClipboardSnapshot {
+        fn capture() -> Self {
+            let types = Command::new("wl-paste")
+                .arg("--list-types")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let mime = [
+                "image/png",
+                "text/uri-list",
+                "text/plain;charset=utf-8",
+                "text/plain",
+            ]
+            .into_iter()
+            .find(|candidate| types.iter().any(|value| value == candidate))
+            .map(str::to_string)
+            .or_else(|| types.into_iter().find(|value| !value.is_empty()));
+            let value = mime.and_then(|mime| {
+                let output = Command::new("wl-paste")
+                    .args(["--no-newline", "--type", &mime])
+                    .output()
+                    .ok()?;
+                output.status.success().then_some((mime, output.stdout))
+            });
+            Self { value }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for WaylandClipboardSnapshot {
+        fn drop(&mut self) {
+            if let Some((mime, bytes)) = self.value.as_ref() {
+                let _ = write_wayland_clipboard(mime, bytes);
+            } else {
+                let _ = Command::new("wl-copy")
+                    .arg("--clear")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct PackagedServiceCleanup {
+        data_directory: PathBuf,
+        armed: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl PackagedServiceCleanup {
+        fn new(data_directory: PathBuf) -> Self {
+            Self {
+                data_directory,
+                armed: true,
+            }
+        }
+
+        fn stop(&mut self) {
+            let lease = std::fs::read_to_string(self.data_directory.join("service.lock")).unwrap();
+            let pid = lease.lines().nth(1).unwrap();
+            let running = Command::new("kill")
+                .args(["-0", pid])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            if running {
+                assert!(Command::new("kill")
+                    .args(["-TERM", pid])
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            self.armed = false;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for PackagedServiceCleanup {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            let Ok(lease) = std::fs::read_to_string(self.data_directory.join("service.lock"))
+            else {
+                return;
+            };
+            let Some(pid) = lease.lines().nth(1) else {
+                return;
+            };
+            let _ = Command::new("kill").args(["-TERM", pid]).status();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wayland_copy(mime: &str, bytes: &[u8]) {
+        assert!(write_wayland_clipboard(mime, bytes).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_wayland_clipboard(mime: &str, bytes: &[u8]) -> io::Result<bool> {
+        let mut child = Command::new("wl-copy")
+            .args(["--type", mime])
+            .stdin(Stdio::piped())
+            .spawn()?;
+        std::io::Write::write_all(child.stdin.as_mut().unwrap(), bytes)?;
+        drop(child.stdin.take());
+        Ok(child.wait()?.success())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wayland_paste(mime: Option<&str>) -> Vec<u8> {
+        let mut command = Command::new("wl-paste");
+        command.arg("--no-newline");
+        if let Some(mime) = mime {
+            command.args(["--type", mime]);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        output.stdout
+    }
+
+    async fn clipboard_query_items(runtime: &NativeServiceRuntime, query: &str) -> Vec<Value> {
+        runtime
+            .request(
+                "com.attson.clipboard",
+                "clipboard.history.list",
+                json!({ "query": query, "limit": 20 }),
+            )
+            .await
+            .unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    async fn cleanup_clipboard_query(runtime: &NativeServiceRuntime, query: &str) {
+        loop {
+            let items = clipboard_query_items(runtime, query).await;
+            if items.is_empty() {
+                return;
+            }
+            for item in items {
+                runtime
+                    .request(
+                        "com.attson.clipboard",
+                        "clipboard.history.delete",
+                        json!({ "id": item["id"] }),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    async fn clipboard_all_ids(runtime: &NativeServiceRuntime) -> HashSet<String> {
+        let mut ids = HashSet::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut params = json!({ "limit": 100 });
+            if let Some(value) = cursor.as_ref() {
+                params["cursor"] = Value::String(value.clone());
+            }
+            let page = runtime
+                .request("com.attson.clipboard", "clipboard.history.list", params)
+                .await
+                .unwrap();
+            ids.extend(
+                page["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["id"].as_str().unwrap().to_string()),
+            );
+            cursor = page["nextCursor"].as_str().map(str::to_string);
+            if cursor.is_none() {
+                return ids;
+            }
+        }
+    }
+
+    async fn wait_for_clipboard_query(runtime: &NativeServiceRuntime, query: &str) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(item) = clipboard_query_items(runtime, query)
+                    .await
+                    .into_iter()
+                    .next()
+                {
+                    return item;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("clipboard item should be captured")
+    }
+
+    async fn clipboard_kind_ids(runtime: &NativeServiceRuntime, kind: &str) -> HashSet<String> {
+        let mut ids = HashSet::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut params = json!({ "kind": kind, "limit": 100 });
+            if let Some(value) = cursor.as_ref() {
+                params["cursor"] = Value::String(value.clone());
+            }
+            let page = runtime
+                .request("com.attson.clipboard", "clipboard.history.list", params)
+                .await
+                .unwrap();
+            ids.extend(
+                page["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["id"].as_str().unwrap().to_string()),
+            );
+            cursor = page["nextCursor"].as_str().map(str::to_string);
+            if cursor.is_none() {
+                return ids;
+            }
+        }
+    }
+
+    async fn wait_for_new_clipboard_kind(
+        runtime: &NativeServiceRuntime,
+        kind: &str,
+        known: &HashSet<String>,
+    ) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let listed = runtime
+                    .request(
+                        "com.attson.clipboard",
+                        "clipboard.history.list",
+                        json!({ "kind": kind, "limit": 100 }),
+                    )
+                    .await
+                    .unwrap();
+                if let Some(item) = listed["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["id"].as_str().is_some_and(|id| !known.contains(id)))
+                {
+                    return item.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("clipboard item kind should be captured")
+    }
+
+    #[cfg(unix)]
     fn stop_packaged_service(data_directory: &Path) {
         let lease = std::fs::read_to_string(data_directory.join("service.lock")).unwrap();
         let pid = lease.lines().nth(1).unwrap();
@@ -1644,10 +3286,26 @@ mod tests {
         service_bytes: &[u8],
         signed_bytes: &[u8],
     ) -> PluginStore {
+        native_service_store_for(
+            store_root,
+            "com.attson.http",
+            &["host.http.request", "host.http.stream", "host.http.data"],
+            service_bytes,
+            signed_bytes,
+        )
+    }
+
+    fn native_service_store_for(
+        store_root: &Path,
+        app_id: &str,
+        permissions: &[&str],
+        service_bytes: &[u8],
+        signed_bytes: &[u8],
+    ) -> PluginStore {
         let store = PluginStore::open(store_root.to_path_buf()).unwrap();
         let version = "0.1.0-alpha.0";
-        let plugin_root = store_root.join("apps/com.attson.http").join(version);
-        let service_entry = "native/athttp-service";
+        let plugin_root = store_root.join("apps").join(app_id).join(version);
+        let service_entry = "native/service";
         std::fs::create_dir_all(plugin_root.join("native")).unwrap();
         std::fs::write(plugin_root.join(service_entry), service_bytes).unwrap();
         std::fs::write(plugin_root.join("index.html"), b"<!doctype html>").unwrap();
@@ -1670,14 +3328,14 @@ mod tests {
                     entry, permissions_json, files_json, native_service_json, enabled, installed_at
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11)",
                 rusqlite::params![
-                    "com.attson.http",
-                    "AT HTTP",
+                    app_id,
+                    "Native Service Test",
                     version,
                     "attson",
                     "Attson",
                     "attool-p0-test",
                     "index.html",
-                    json!(["host.http.request", "host.http.stream", "host.http.data"]).to_string(),
+                    serde_json::to_string(permissions).unwrap(),
                     files.to_string(),
                     native_service.to_string(),
                     "2026-11-13T00:00:00Z"
@@ -1688,6 +3346,32 @@ mod tests {
     }
 
     async fn fake_service(listener: TcpListener, data_directory: String) {
+        fake_service_for_app(listener, data_directory, "com.attson.http").await;
+    }
+
+    async fn fake_service_for_app(
+        listener: TcpListener,
+        data_directory: String,
+        app_id: &'static str,
+    ) {
+        fake_service_for_app_inner(listener, data_directory, app_id, None).await;
+    }
+
+    async fn fake_service_for_app_with_barrier(
+        listener: TcpListener,
+        data_directory: String,
+        app_id: &'static str,
+        barrier: Arc<Barrier>,
+    ) {
+        fake_service_for_app_inner(listener, data_directory, app_id, Some(barrier)).await;
+    }
+
+    async fn fake_service_for_app_inner(
+        listener: TcpListener,
+        data_directory: String,
+        app_id: &'static str,
+        handshake_barrier: Option<Arc<Barrier>>,
+    ) {
         let (stream, _) = listener.accept().await.unwrap();
         let (read, mut write) = stream.into_split();
         let mut reader = BufReader::new(read);
@@ -1697,7 +3381,11 @@ mod tests {
         assert_eq!(handshake["kind"], "request");
         assert_eq!(handshake["token"], "secret-token");
         assert_eq!(handshake["dataDirectory"], data_directory);
+        assert_eq!(handshake["appId"], app_id);
         let handshake_id = handshake["requestId"].as_str().unwrap();
+        if let Some(barrier) = handshake_barrier {
+            barrier.wait().await;
+        }
         write
             .write_all(
                 format!(
@@ -1706,7 +3394,7 @@ mod tests {
                         "kind": "handshake",
                         "protocolVersion": 1,
                         "requestId": handshake_id,
-                        "appId": "com.attson.http",
+                        "appId": app_id,
                         "hostApi": "2.0.0",
                         "dataApi": "1.0.0",
                         "serviceApi": "1.0.0",

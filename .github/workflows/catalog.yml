@@ -116,10 +116,19 @@ jobs:
             }]
           }' "$RELEASE_SOURCE" > "$RELEASE_JSON"
           test "$(jq '.assets | length' "$RELEASE_JSON")" -eq 5
-          gh release download "$RELEASE_TAG" \
-            --repo "$APP_REPOSITORY" \
-            --pattern "${ARTIFACT_PREFIX}_*.atpkg" \
-            --dir "$ASSET_DIRECTORY"
+          while IFS=$'\t' read -r FILE_NAME DOWNLOAD_URL; do
+            if [[ "$FILE_NAME" == */* || "$FILE_NAME" == *\\* ]]; then
+              echo "Release asset name is unsafe: $FILE_NAME" >&2
+              exit 1
+            fi
+            if [[ ! "$DOWNLOAD_URL" =~ ^https://github.com/attsontools/[^/]+/releases/download/ ]]; then
+              echo "Release asset URL is not an immutable official GitHub URL: $DOWNLOAD_URL" >&2
+              exit 1
+            fi
+            curl --fail --location --retry 3 \
+              --output "$ASSET_DIRECTORY/$FILE_NAME" \
+              "https://gh-proxy.com/$DOWNLOAD_URL"
+          done < <(jq -r '.assets[] | [.fileName, .url] | @tsv' "$RELEASE_JSON")
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
           echo "release_json=$RELEASE_JSON" >> "$GITHUB_OUTPUT"

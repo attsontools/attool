@@ -11,7 +11,9 @@ use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
 use super::{
+    auxiliary_window::{AuxiliaryWindowError, AuxiliaryWindowRuntime},
     catalog::{CatalogError, CatalogInstallPlan, CatalogRuntime, CatalogSnapshot},
+    http_service::{NativeServiceError, NativeServiceRuntime},
     install::{
         InstallError, InstalledPlugin, PluginAsset, PluginHistoryRecord, PluginStore,
         PreparedPlugin,
@@ -152,6 +154,21 @@ impl PluginRuntime {
             .map_err(Into::into)
     }
 
+    fn read_entry_html(
+        &self,
+        app_id: &str,
+        entry: Option<&str>,
+    ) -> Result<String, PluginCommandError> {
+        let asset = self
+            .store
+            .lock()
+            .map_err(|_| {
+                PluginCommandError::new("PLUGIN_STORE_LOCK_FAILED", "Plugin store lock failed")
+            })?
+            .read_entry(app_id, entry)?;
+        entry_html(asset)
+    }
+
     pub(super) fn read_probe_asset(
         &self,
         operation_id: &str,
@@ -176,6 +193,33 @@ impl PluginRuntime {
             })?
             .read_prepared_asset(&operation.prepared, relative)
             .map_err(Into::into)
+    }
+
+    fn read_probe_entry_html(
+        &self,
+        operation_id: &str,
+        entry: Option<&str>,
+    ) -> Result<String, PluginCommandError> {
+        let pending = self.pending.lock().map_err(|_| {
+            PluginCommandError::new(
+                "PLUGIN_OPERATION_LOCK_FAILED",
+                "Plugin operation lock failed",
+            )
+        })?;
+        let operation = pending.get(operation_id).ok_or_else(|| {
+            PluginCommandError::new(
+                "PLUGIN_OPERATION_NOT_FOUND",
+                "Plugin operation was not found",
+            )
+        })?;
+        let asset = self
+            .store
+            .lock()
+            .map_err(|_| {
+                PluginCommandError::new("PLUGIN_STORE_LOCK_FAILED", "Plugin store lock failed")
+            })?
+            .read_prepared_entry(&operation.prepared, entry)?;
+        entry_html(asset)
     }
 
     async fn start_catalog_install(
@@ -324,6 +368,7 @@ impl PluginRuntime {
         if let Err(error) = self.update_operation(app, &operation_id, |state| {
             state.advance_to(OperationStage::Staging)?;
             state.entry = Some(prepared.package.entry.clone());
+            state.windows = prepared.package.windows.clone();
             state.native_service = prepared.package.native_service.clone();
             Ok(())
         }) {
@@ -848,11 +893,91 @@ impl From<RemoteInstallError> for PluginCommandError {
     }
 }
 
+impl From<NativeServiceError> for PluginCommandError {
+    fn from(error: NativeServiceError) -> Self {
+        Self::new(error.code, error.message)
+    }
+}
+
+impl From<AuxiliaryWindowError> for PluginCommandError {
+    fn from(error: AuxiliaryWindowError) -> Self {
+        Self::new(error.code, error.message)
+    }
+}
+
+fn is_background_plugin(plugin: &InstalledPlugin) -> bool {
+    plugin
+        .native_service
+        .as_ref()
+        .is_some_and(|service| service.lifecycle == "background")
+}
+
+fn should_connect_background(plugin: &InstalledPlugin) -> bool {
+    plugin.enabled && is_background_plugin(plugin)
+}
+
+async fn restore_native_service(
+    native_services: &NativeServiceRuntime,
+    app_id: &str,
+    was_connected: bool,
+) {
+    if !was_connected {
+        return;
+    }
+    if let Err(error) = native_services.connect(app_id).await {
+        eprintln!(
+            "cannot restore native service {app_id} after failed plugin operation [{}]: {}",
+            error.code, error.message
+        );
+    }
+}
+
+async fn connect_native_service_observed(native_services: &NativeServiceRuntime, app_id: &str) {
+    if let Err(error) = native_services.connect(app_id).await {
+        let correlation_id = native_services
+            .status_for(app_id)
+            .and_then(|status| status.correlation_id)
+            .unwrap_or_default();
+        eprintln!(
+            "native service {app_id} is unavailable after committed plugin state [{}] correlation_id={}: {}",
+            error.code, correlation_id, error.message
+        );
+    }
+}
+
+fn close_auxiliary_windows_observed(
+    auxiliary_windows: &AuxiliaryWindowRuntime,
+    app: &AppHandle,
+    app_id: &str,
+) {
+    if let Err(error) = auxiliary_windows.close_for_app(app, app_id) {
+        eprintln!(
+            "cannot close auxiliary windows for {app_id} after committed plugin state [{}]: {}",
+            error.code, error.message
+        );
+    }
+}
+
 fn join_error(error: tauri::Error) -> PluginCommandError {
     PluginCommandError::new(
         "PLUGIN_WORKER_FAILED",
         format!("Plugin worker failed: {error}"),
     )
+}
+
+fn entry_html(asset: PluginAsset) -> Result<String, PluginCommandError> {
+    if asset.content_type != "text/html; charset=utf-8" {
+        return Err(PluginCommandError::new(
+            "PLUGIN_ENTRY_NOT_HTML",
+            "Plugin UI entry must be an HTML document",
+        ));
+    }
+    String::from_utf8(asset.bytes).map_err(|_| {
+        PluginCommandError::new(
+            "PLUGIN_ENTRY_ENCODING_INVALID",
+            "Plugin UI entry must be valid UTF-8",
+        )
+    })
 }
 
 #[tauri::command]
@@ -870,11 +995,49 @@ pub async fn plugin_inspect_package(
 pub async fn plugin_install_package(
     path: String,
     runtime: State<'_, PluginRuntime>,
+    native_services: State<'_, NativeServiceRuntime>,
+    auxiliary_windows: State<'_, AuxiliaryWindowRuntime>,
+    app: AppHandle,
 ) -> Result<InstalledPlugin, PluginCommandError> {
     let runtime = runtime.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || runtime.install(PathBuf::from(path)))
+    let package_path = PathBuf::from(path);
+    let inspect_runtime = runtime.clone();
+    let inspect_path = package_path.clone();
+    let app_id =
+        tauri::async_runtime::spawn_blocking(move || inspect_runtime.inspect(inspect_path))
+            .await
+            .map_err(join_error)??
+            .app_id;
+    let replacing = runtime
+        .list()?
+        .into_iter()
+        .any(|plugin| plugin.app_id == app_id);
+    let was_connected = native_services.is_connected(&app_id);
+    if replacing {
+        native_services.disconnect(&app_id).await?;
+        if let Err(error) = auxiliary_windows.close_for_app(&app, &app_id) {
+            restore_native_service(&native_services, &app_id, was_connected).await;
+            return Err(error.into());
+        }
+    }
+    let worker = runtime.clone();
+    let installed = match tauri::async_runtime::spawn_blocking(move || worker.install(package_path))
         .await
         .map_err(join_error)?
+    {
+        Ok(installed) => installed,
+        Err(error) => {
+            restore_native_service(&native_services, &app_id, was_connected).await;
+            return Err(error.into());
+        }
+    };
+    if replacing {
+        close_auxiliary_windows_observed(&auxiliary_windows, &app, &app_id);
+    }
+    if was_connected || should_connect_background(&installed) {
+        connect_native_service_observed(&native_services, &installed.app_id).await;
+    }
+    Ok(installed)
 }
 
 #[tauri::command]
@@ -885,6 +1048,32 @@ pub async fn plugin_list_installed(
     tauri::async_runtime::spawn_blocking(move || runtime.list())
         .await
         .map_err(join_error)?
+}
+
+#[tauri::command]
+pub async fn plugin_read_entry_html(
+    app_id: String,
+    entry: Option<String>,
+    runtime: State<'_, PluginRuntime>,
+) -> Result<String, PluginCommandError> {
+    let runtime = runtime.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || runtime.read_entry_html(&app_id, entry.as_deref()))
+        .await
+        .map_err(join_error)?
+}
+
+#[tauri::command]
+pub async fn plugin_read_probe_entry_html(
+    operation_id: String,
+    entry: Option<String>,
+    runtime: State<'_, PluginRuntime>,
+) -> Result<String, PluginCommandError> {
+    let runtime = runtime.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        runtime.read_probe_entry_html(&operation_id, entry.as_deref())
+    })
+    .await
+    .map_err(join_error)?
 }
 
 #[tauri::command]
@@ -902,11 +1091,43 @@ pub async fn plugin_set_enabled(
     app_id: String,
     enabled: bool,
     runtime: State<'_, PluginRuntime>,
+    native_services: State<'_, NativeServiceRuntime>,
+    auxiliary_windows: State<'_, AuxiliaryWindowRuntime>,
+    app: AppHandle,
 ) -> Result<(), PluginCommandError> {
+    let was_connected = native_services.is_connected(&app_id);
+    if !enabled {
+        native_services.disconnect(&app_id).await?;
+        if let Err(error) = auxiliary_windows.close_for_app(&app, &app_id) {
+            restore_native_service(&native_services, &app_id, was_connected).await;
+            return Err(error.into());
+        }
+    }
+    let updated_app_id = app_id.clone();
     let runtime = runtime.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || runtime.set_enabled(app_id, enabled))
+    let worker = runtime.clone();
+    let update = tauri::async_runtime::spawn_blocking(move || worker.set_enabled(app_id, enabled))
         .await
-        .map_err(join_error)?
+        .map_err(join_error)
+        .and_then(|result| result);
+    if let Err(error) = update {
+        if !enabled {
+            restore_native_service(&native_services, &updated_app_id, was_connected).await;
+        }
+        return Err(error);
+    }
+    if enabled {
+        let plugin = runtime
+            .list()?
+            .into_iter()
+            .find(|plugin| plugin.app_id == updated_app_id);
+        if plugin.as_ref().is_some_and(should_connect_background) {
+            connect_native_service_observed(&native_services, &updated_app_id).await;
+        }
+    } else {
+        close_auxiliary_windows_observed(&auxiliary_windows, &app, &updated_app_id);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -914,11 +1135,29 @@ pub async fn plugin_uninstall(
     app_id: String,
     delete_data: bool,
     runtime: State<'_, PluginRuntime>,
+    native_services: State<'_, NativeServiceRuntime>,
+    auxiliary_windows: State<'_, AuxiliaryWindowRuntime>,
+    app: AppHandle,
 ) -> Result<(), PluginCommandError> {
+    let was_connected = native_services.is_connected(&app_id);
+    native_services.disconnect(&app_id).await?;
+    if let Err(error) = auxiliary_windows.close_for_app(&app, &app_id) {
+        restore_native_service(&native_services, &app_id, was_connected).await;
+        return Err(error.into());
+    }
+    let restore_app_id = app_id.clone();
     let runtime = runtime.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || runtime.uninstall(app_id, delete_data))
-        .await
-        .map_err(join_error)?
+    let result =
+        tauri::async_runtime::spawn_blocking(move || runtime.uninstall(app_id, delete_data))
+            .await
+            .map_err(join_error)
+            .and_then(|result| result);
+    if let Err(error) = result {
+        restore_native_service(&native_services, &restore_app_id, was_connected).await;
+        return Err(error);
+    }
+    close_auxiliary_windows_observed(&auxiliary_windows, &app, &restore_app_id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -967,14 +1206,37 @@ pub async fn plugin_update_catalog_app(
 pub async fn plugin_complete_catalog_install(
     operation_id: String,
     runtime: State<'_, PluginRuntime>,
+    native_services: State<'_, NativeServiceRuntime>,
+    auxiliary_windows: State<'_, AuxiliaryWindowRuntime>,
     app: AppHandle,
 ) -> Result<CatalogInstallResult, PluginCommandError> {
+    let app_id = runtime.operation(&operation_id)?.app_id;
+    let was_connected = native_services.is_connected(&app_id);
+    native_services.disconnect(&app_id).await?;
+    if let Err(error) = auxiliary_windows.close_for_app(&app, &app_id) {
+        restore_native_service(&native_services, &app_id, was_connected).await;
+        return Err(error.into());
+    }
     let runtime = runtime.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        runtime.complete_catalog_install(&operation_id, &app)
+    let worker = runtime.clone();
+    let worker_app = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        worker.complete_catalog_install(&operation_id, &worker_app)
     })
     .await
-    .map_err(join_error)?
+    .map_err(join_error)?;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            restore_native_service(&native_services, &app_id, was_connected).await;
+            return Err(error);
+        }
+    };
+    if was_connected || should_connect_background(&result.installed) {
+        connect_native_service_observed(&native_services, &app_id).await;
+    }
+    close_auxiliary_windows_observed(&auxiliary_windows, &app, &app_id);
+    Ok(result)
 }
 
 #[tauri::command]
@@ -1018,9 +1280,37 @@ pub async fn plugin_rollback_plugin_launch(
     app_id: String,
     version: String,
     runtime: State<'_, PluginRuntime>,
+    native_services: State<'_, NativeServiceRuntime>,
+    auxiliary_windows: State<'_, AuxiliaryWindowRuntime>,
     app: AppHandle,
 ) -> Result<Option<InstalledPlugin>, PluginCommandError> {
-    runtime.rollback_plugin_launch(&app_id, &version, &app)
+    let current = runtime
+        .list()?
+        .into_iter()
+        .find(|plugin| plugin.app_id == app_id);
+    let was_connected = native_services.is_connected(&app_id);
+    native_services.disconnect(&app_id).await?;
+    if let Err(error) = auxiliary_windows.close_for_app(&app, &app_id) {
+        restore_native_service(&native_services, &app_id, was_connected).await;
+        return Err(error.into());
+    }
+    let rolled_back = match runtime.rollback_plugin_launch(&app_id, &version, &app) {
+        Ok(rolled_back) => rolled_back,
+        Err(error) => {
+            restore_native_service(&native_services, &app_id, was_connected).await;
+            return Err(error);
+        }
+    };
+    if was_connected
+        || rolled_back
+            .as_ref()
+            .or(current.as_ref())
+            .is_some_and(should_connect_background)
+    {
+        connect_native_service_observed(&native_services, &app_id).await;
+    }
+    close_auxiliary_windows_observed(&auxiliary_windows, &app, &app_id);
+    Ok(rolled_back)
 }
 
 #[cfg(test)]
@@ -1043,6 +1333,7 @@ mod tests {
             publisher_name: "Attson".to_string(),
             publisher_key_id: "codec-key".to_string(),
             entry: None,
+            windows: std::collections::BTreeMap::new(),
             permissions: vec!["host.theme.read".to_string()],
             native_service: None,
             stage,

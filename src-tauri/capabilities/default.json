@@ -7,7 +7,8 @@
     "clipboard-history",
     "clipboard-preview",
     "capture-overlay",
-    "capture-pin-*"
+    "capture-pin-*",
+    "plugin-aux-*"
   ],
   "permissions": [
     "core:default",

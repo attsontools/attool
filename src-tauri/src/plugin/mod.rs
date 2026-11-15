@@ -1,3 +1,4 @@
+pub mod auxiliary_window;
 pub mod catalog;
 pub mod commands;
 mod github_proxy;

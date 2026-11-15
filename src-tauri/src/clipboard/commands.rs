@@ -7,6 +7,7 @@ use super::{
         ClipboardHistoryItem, ClipboardHistorySettings, ClipboardItemKind,
         DEFAULT_CLIPBOARD_SHORTCUT,
     },
+    owner::LegacyClipboardOwner,
     storage::ClipboardStore,
     watcher::ClipboardWatcherState,
 };
@@ -23,7 +24,10 @@ pub struct ClipboardShortcutInfo {
 #[tauri::command]
 pub async fn get_clipboard_shortcut_info(
     store: State<'_, ClipboardStore>,
+    owner: State<'_, LegacyClipboardOwner>,
 ) -> Result<ClipboardShortcutInfo, String> {
+    let _owner_guard = owner.enter()?;
+    store.ensure_initialized()?;
     let settings = store.load_settings()?;
     Ok(ClipboardShortcutInfo {
         shortcut: settings.shortcut,
@@ -48,7 +52,10 @@ pub async fn list_clipboard_items(
     kind: Option<ClipboardItemKind>,
     query: Option<String>,
     store: State<'_, ClipboardStore>,
+    owner: State<'_, LegacyClipboardOwner>,
 ) -> Result<Vec<ClipboardHistoryItem>, String> {
+    let _owner_guard = owner.enter()?;
+    store.ensure_initialized()?;
     store.list_items(kind, query.as_deref())
 }
 
@@ -56,7 +63,10 @@ pub async fn list_clipboard_items(
 pub async fn delete_clipboard_item(
     id: String,
     store: State<'_, ClipboardStore>,
+    owner: State<'_, LegacyClipboardOwner>,
 ) -> Result<(), String> {
+    let _owner_guard = owner.enter()?;
+    store.ensure_initialized()?;
     store.delete_item(&id)
 }
 
@@ -65,19 +75,30 @@ pub async fn set_clipboard_item_pinned(
     id: String,
     is_pinned: bool,
     store: State<'_, ClipboardStore>,
+    owner: State<'_, LegacyClipboardOwner>,
 ) -> Result<(), String> {
+    let _owner_guard = owner.enter()?;
+    store.ensure_initialized()?;
     store.set_pinned(&id, is_pinned)
 }
 
 #[tauri::command]
-pub async fn clear_clipboard_history(store: State<'_, ClipboardStore>) -> Result<(), String> {
+pub async fn clear_clipboard_history(
+    store: State<'_, ClipboardStore>,
+    owner: State<'_, LegacyClipboardOwner>,
+) -> Result<(), String> {
+    let _owner_guard = owner.enter()?;
+    store.ensure_initialized()?;
     store.clear_unpinned()
 }
 
 #[tauri::command]
 pub async fn get_clipboard_settings(
     store: State<'_, ClipboardStore>,
+    owner: State<'_, LegacyClipboardOwner>,
 ) -> Result<ClipboardHistorySettings, String> {
+    let _owner_guard = owner.enter()?;
+    store.ensure_initialized()?;
     store.load_settings()
 }
 
@@ -87,9 +108,15 @@ pub async fn save_clipboard_settings(
     settings: ClipboardHistorySettings,
     watcher: State<'_, ClipboardWatcherState>,
     store: State<'_, ClipboardStore>,
+    owner: State<'_, LegacyClipboardOwner>,
 ) -> Result<ClipboardHistorySettings, String> {
+    let _owner_guard = owner.enter()?;
+    store.ensure_initialized()?;
     // 若快捷键有变化,先尝试重新注册(失败则整体报错,不落库,让前端提示用户换一个)
-    let previous = store.load_settings().map(|s| s.shortcut).unwrap_or_default();
+    let previous = store
+        .load_settings()
+        .map(|s| s.shortcut)
+        .unwrap_or_default();
     if settings.shortcut.trim() != previous.trim() {
         super::watcher::reregister_clipboard_shortcut(&app, &settings.shortcut)?;
     }
@@ -98,13 +125,15 @@ pub async fn save_clipboard_settings(
     Ok(settings)
 }
 
-
 #[tauri::command]
 pub async fn restore_clipboard_item(
     id: String,
     app: AppHandle,
     store: State<'_, ClipboardStore>,
+    owner: State<'_, LegacyClipboardOwner>,
 ) -> Result<(), String> {
+    let _owner_guard = owner.enter()?;
+    store.ensure_initialized()?;
     let item = store
         .list_items(None, None)?
         .into_iter()
@@ -121,9 +150,11 @@ pub async fn restore_clipboard_item(
             .write_text(item.file_paths.join("\n"))
             .map_err(|error| error.to_string()),
         ClipboardItemKind::Image => {
-            let path = item.asset_path.ok_or_else(|| "剪贴板图片资源不存在".to_string())?;
-            let decoded = image::open(path)
-                .map_err(|error| format!("读取剪贴板图片失败：{error}"))?;
+            let path = item
+                .asset_path
+                .ok_or_else(|| "剪贴板图片资源不存在".to_string())?;
+            let decoded =
+                image::open(path).map_err(|error| format!("读取剪贴板图片失败：{error}"))?;
             super::image_writer::write_image(&app, &decoded)
         }
     };

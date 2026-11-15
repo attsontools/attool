@@ -7,7 +7,8 @@ const nativeService: NativeService = {
   entry: 'native/athttp-service',
   version: '0.1.0-alpha.1',
   sha256: 'a'.repeat(64),
-  protocolVersion: 1
+  protocolVersion: 1,
+  lifecycle: 'onDemand'
 };
 
 function operation(service: NativeService | null): PluginOperationSnapshot {
@@ -21,6 +22,7 @@ function operation(service: NativeService | null): PluginOperationSnapshot {
     publisherName: 'Attson',
     publisherKeyId: 'publisher-2026-01',
     entry: 'ui/index.html',
+    windows: {},
     permissions: service
       ? ['host.theme.read', 'host.http.request', 'host.http.stream', 'host.http.data']
       : ['host.theme.read'],
@@ -48,5 +50,19 @@ describe('createPluginProbeConfig', () => {
 
     expect(config.apiVersion).toBe('1.0');
     expect(config.app.nativeService).toBeNull();
+  });
+
+  it('checks the main entry and every signed auxiliary entry', () => {
+    const target = operation(nativeService);
+    target.windows = {
+      history: { entry: 'ui/history.html', presentation: 'bottomPanel' },
+      preview: { entry: 'ui/preview.html', presentation: 'centeredDialog' }
+    };
+
+    expect(createPluginProbeConfig(target).entries).toEqual([
+      'ui/index.html',
+      'ui/history.html',
+      'ui/preview.html'
+    ]);
   });
 });

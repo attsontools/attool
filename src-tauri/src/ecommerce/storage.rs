@@ -3,7 +3,10 @@ use std::{fs, path::PathBuf};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use rusqlite::{params, Connection};
 
-use super::models::{TemplateAsset, TemplateProject, TemplateSummary};
+use super::{
+    models::{TemplateAsset, TemplateProject, TemplateSummary},
+    owner::{LegacyTemplateOwner, TEMPLATE_TAKEN_OVER},
+};
 
 #[derive(Clone, Debug)]
 pub struct EcommerceStore {
@@ -19,6 +22,20 @@ impl EcommerceStore {
         let store = Self { root_dir, db_path };
         store.init_database()?;
         Ok(store)
+    }
+
+    pub fn new_for_legacy(
+        root_dir: PathBuf,
+        owner: &LegacyTemplateOwner,
+    ) -> Result<Self, String> {
+        match owner.enter() {
+            Ok(_guard) => Self::new(root_dir),
+            Err(error) if error == TEMPLATE_TAKEN_OVER => Ok(Self {
+                db_path: root_dir.join("ecommerce_templates.sqlite3"),
+                root_dir,
+            }),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn root_dir(&self) -> &PathBuf {

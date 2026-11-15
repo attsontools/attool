@@ -6,6 +6,7 @@ import type {
   CatalogSnapshot,
   InstalledPlugin,
   InspectedPluginPackage,
+  NativeServiceStatus,
   PluginApi,
   PluginCommandError,
   PluginHistoryRecord,
@@ -35,6 +36,7 @@ export function usePluginStore(api: PluginApi = createPluginApi()) {
   const apps = ref<InstalledPlugin[]>([]);
   const preview = ref<InspectedPluginPackage | null>(null);
   const history = ref<PluginHistoryRecord[]>([]);
+  const nativeServiceStatuses = ref<Map<string, NativeServiceStatus>>(new Map());
   const catalog = ref<CatalogSnapshot | null>(null);
   const loading = ref(false);
   const catalogLoading = ref(false);
@@ -44,20 +46,34 @@ export function usePluginStore(api: PluginApi = createPluginApi()) {
   const catalogError = ref<PluginCommandError | null>(null);
   const operation = ref<PluginOperationSnapshot | null>(null);
   let operationUnlisten: (() => void) | null = null;
+  let nativeServiceStatusUnlisten: (() => void) | null = null;
+
+  function applyNativeServiceStatus(status: NativeServiceStatus) {
+    const current = nativeServiceStatuses.value.get(status.appId);
+    if (current && current.updatedAt > status.updatedAt) return;
+    const next = new Map(nativeServiceStatuses.value);
+    next.set(status.appId, status);
+    nativeServiceStatuses.value = next;
+  }
 
   const navigationTools = computed<Tool[]>(() =>
     apps.value
       .filter((app) => app.enabled)
-      .map((app) => ({
-        id: `plugin:${app.appId}`,
-        name: app.name,
-        description: `${app.publisherName} 提供的独立应用`,
-        status: 'ready',
-        icon: 'apps',
-        group: 'utility',
-        source: 'plugin',
-        pluginAppId: app.appId
-      }))
+      .map((app) => {
+        const serviceStatus = nativeServiceStatuses.value.get(app.appId);
+        return {
+          id: `plugin:${app.appId}`,
+          name: app.name,
+          description: serviceStatus?.state === 'unavailable'
+            ? `后台服务不可用 · ${serviceStatus.errorCode ?? 'NATIVE_SERVICE_UNAVAILABLE'}`
+            : `${app.publisherName} 提供的独立应用`,
+          status: 'ready',
+          icon: 'apps',
+          group: 'utility',
+          source: 'plugin',
+          pluginAppId: app.appId
+        } as Tool;
+      })
   );
   const catalogApps = computed(() =>
     catalog.value ? mergeCatalogApps(catalog.value, apps.value) : []
@@ -87,7 +103,19 @@ export function usePluginStore(api: PluginApi = createPluginApi()) {
           error.value = commandError(reason);
         }
       }
+      if (!nativeServiceStatusUnlisten) {
+        try {
+          nativeServiceStatusUnlisten = await api.listenNativeServiceStatuses(
+            applyNativeServiceStatus
+          );
+        } catch (reason) {
+          error.value = commandError(reason);
+        }
+      }
       apps.value = await api.listInstalled();
+      for (const status of await api.listNativeServiceStatuses()) {
+        applyNativeServiceStatus(status);
+      }
       await refreshHistory();
       try {
         operation.value = await api.getLatestOperation();
@@ -253,6 +281,7 @@ export function usePluginStore(api: PluginApi = createPluginApi()) {
 
   return {
     apps,
+    nativeServiceStatuses,
     history,
     catalog,
     preview,

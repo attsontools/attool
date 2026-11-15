@@ -2,17 +2,29 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import { NButton, NSpin, useMessage } from 'naive-ui';
 
 import type { ThemeName } from '../../composables/useTheme';
-import { createPluginHostSession, type HostFileSaveRequest, type PluginHostSession } from './pluginHost';
+import {
+  createPluginHostSession,
+  type HostFileSaveRequest,
+  type HostTemplateFilePickRequest,
+  type HostUiOpenRequest,
+  type PluginHostSession
+} from './pluginHost';
+import { createLatestActivationDispatcher } from './auxiliaryActivation';
+import { buildPluginFrameDocument, pluginAssetBaseUrl } from './pluginFrameDocument';
 import type { InstalledPlugin } from './types';
 
 const props = defineProps<{
   app: InstalledPlugin;
   theme: ThemeName;
+  entry?: string;
+  windowId?: string;
+  auxiliary?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -26,24 +38,43 @@ const frame = ref<HTMLIFrameElement | null>(null);
 const state = ref<FrameState>('loading');
 const errorMessage = ref('');
 const reloadRevision = ref(0);
-const serviceReady = ref(!props.app.nativeService);
+const serviceReady = ref(false);
+const frameHtml = ref('');
+const frameEntry = computed(() => props.entry ?? props.app.entry);
 let session: PluginHostSession | null = null;
 let handshakeTimer: ReturnType<typeof setTimeout> | null = null;
 let handlingFailure = false;
-let httpEventUnlisten: UnlistenFn | null = null;
+let nativeServiceEventUnlisten: UnlistenFn | null = null;
+let auxiliaryActivationUnlisten: UnlistenFn | null = null;
 let disposed = false;
 
-const source = computed(() => {
-  const entry = props.app.entry
-    .split('/')
-    .map((segment) => encodeURIComponent(segment))
-    .join('/');
-  return `attool-plugin://${props.app.appId}/${entry}?revision=${reloadRevision.value}`;
+type AuxiliaryActivation = {
+  activationId: string;
+  appId: string;
+  windowId: string;
+  payload: unknown;
+};
+
+const activationDispatcher = createLatestActivationDispatcher<AuxiliaryActivation>({
+  fetchLatest: () => invoke<AuxiliaryActivation | null>(
+    'plugin_get_auxiliary_activation',
+    { appId: props.app.appId, windowId: props.windowId }
+  ),
+  deliver: (activation) => session?.notifyActivated(activation.payload),
+  acknowledge: async (activation) => {
+    await invoke<boolean>('plugin_ack_auxiliary_activation', {
+      appId: props.app.appId,
+      windowId: props.windowId,
+      activationId: activation.activationId
+    });
+  },
+  onError: () => message.error('无法同步应用窗口激活状态')
 });
 
 function clearSession() {
   session?.terminate();
   session = null;
+  activationDispatcher.reset();
   if (handshakeTimer) clearTimeout(handshakeTimer);
   handshakeTimer = null;
 }
@@ -62,34 +93,89 @@ async function pickPluginFile() {
   return { path, name: path.split(/[\\/]/).pop() || 'file' };
 }
 
+async function pickPluginDirectory(defaultPath?: string) {
+  const path = await open({ directory: true, multiple: false, defaultPath });
+  return typeof path === 'string' ? path : null;
+}
+
+async function pickTemplateFiles(input: HostTemplateFilePickRequest) {
+  const selected = await open({
+    multiple: input.multiple,
+    filters: input.kind === 'psd'
+      ? [{ name: 'PSD', extensions: ['psd'] }]
+      : [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp'] }]
+  });
+  const paths = typeof selected === 'string' ? [selected] : selected;
+  if (!paths?.length) return null;
+  return paths.map((path) => ({ path, name: pathName(path) }));
+}
+
+async function pickTemplateDirectory() {
+  const path = await open({ directory: true, multiple: false });
+  return typeof path === 'string' ? { path, name: pathName(path) } : null;
+}
+
+function pathName(path: string) {
+  return path.split(/[\\/]/).filter(Boolean).pop() || 'file';
+}
+
 async function prepareFrame() {
-  if (!props.app.nativeService) {
-    serviceReady.value = true;
-    return;
-  }
-  state.value = 'connecting';
+  serviceReady.value = false;
+  state.value = props.app.nativeService ? 'connecting' : 'loading';
   errorMessage.value = '';
   try {
-    if (!httpEventUnlisten) {
+    if (props.app.nativeService && !nativeServiceEventUnlisten) {
       const unlisten = await listen<{ appId: string; event: unknown }>(
-        'plugin://http-service-event',
+        'plugin://native-service-event',
         ({ payload }) => {
-          if (payload.appId === props.app.appId) session?.notifyHttpEvent(payload.event);
+          if (payload.appId === props.app.appId) session?.notifyNativeServiceEvent(payload.event);
         }
       );
       if (disposed) {
         unlisten();
         return;
       }
-      httpEventUnlisten = unlisten;
+      nativeServiceEventUnlisten = unlisten;
     }
-    await invoke('plugin_connect_http_service', { appId: props.app.appId });
+    if (props.auxiliary && props.windowId && !auxiliaryActivationUnlisten) {
+      const unlisten = await listen<AuxiliaryActivation>(
+        'plugin://auxiliary-activation',
+        ({ payload }) => {
+          if (payload.appId !== props.app.appId || payload.windowId !== props.windowId) return;
+          activationDispatcher.enqueue(payload);
+        }
+      );
+      if (disposed) {
+        unlisten();
+        return;
+      }
+      auxiliaryActivationUnlisten = unlisten;
+    }
+    if (props.app.nativeService) {
+      await invoke('plugin_connect_native_service', { appId: props.app.appId });
+    }
+    const html = await invoke<string>('plugin_read_entry_html', {
+      appId: props.app.appId,
+      entry: frameEntry.value
+    });
     if (disposed) return;
+    frameHtml.value = `${buildPluginFrameDocument(
+      html,
+      pluginAssetBaseUrl('attool-plugin', props.app.appId, frameEntry.value)
+    )}\n<!-- reload:${reloadRevision.value} -->`;
     state.value = 'loading';
     serviceReady.value = true;
   } catch (reason) {
     await handleLaunchFailure(serviceErrorMessage(reason));
   }
+}
+
+async function openAuxiliaryWindow(input: HostUiOpenRequest) {
+  return invoke('plugin_open_auxiliary_window', {
+    appId: props.app.appId,
+    windowId: input.windowId,
+    payload: input.payload
+  });
 }
 
 function handleLoad() {
@@ -106,15 +192,23 @@ function handleLoad() {
   session = createPluginHostSession({
     app: props.app,
     port: channel.port1,
+    windowId: props.windowId,
     theme: () => props.theme,
     notify: async ({ title, message: body, kind }) => {
       message[kind](title ? `${title}: ${body}` : body);
     },
     saveFile: savePluginFile,
     pickFile: pickPluginFile,
+    pickDirectory: pickPluginDirectory,
+    pickTemplateFiles,
+    pickTemplateDirectory,
     copyText: writeText,
-    requestHttpService: props.app.nativeService
-      ? (method, params) => invoke('plugin_http_service_request', {
+    openAuxiliaryWindow,
+    closeAuxiliaryWindow: props.auxiliary
+      ? () => getCurrentWindow().close()
+      : undefined,
+    requestNativeService: props.app.nativeService
+      ? (method, params) => invoke('plugin_native_service_request', {
           appId: props.app.appId,
           method,
           params
@@ -123,7 +217,12 @@ function handleLoad() {
     onHandshake: () => {
       if (handshakeTimer) clearTimeout(handshakeTimer);
       handshakeTimer = null;
-      void confirmLaunch();
+      if (props.auxiliary) {
+        state.value = 'ready';
+        void activationDispatcher.setReady();
+      } else {
+        void confirmLaunch();
+      }
     }
   });
   contentWindow.postMessage(
@@ -157,6 +256,10 @@ async function confirmLaunch() {
 async function handleLaunchFailure(reason: string) {
   if (handlingFailure) return;
   handlingFailure = true;
+  if (props.auxiliary) {
+    fail(reason);
+    return;
+  }
   try {
     const rolledBack = await invoke<InstalledPlugin | null>('plugin_rollback_plugin_launch', {
       appId: props.app.appId,
@@ -184,7 +287,8 @@ function reload() {
   state.value = 'loading';
   errorMessage.value = '';
   handlingFailure = false;
-  serviceReady.value = !props.app.nativeService;
+  serviceReady.value = false;
+  frameHtml.value = '';
   reloadRevision.value += 1;
   void prepareFrame();
 }
@@ -216,19 +320,22 @@ onMounted(() => void prepareFrame());
 onBeforeUnmount(() => {
   disposed = true;
   clearSession();
-  httpEventUnlisten?.();
-  httpEventUnlisten = null;
+  nativeServiceEventUnlisten?.();
+  nativeServiceEventUnlisten = null;
+  auxiliaryActivationUnlisten?.();
+  auxiliaryActivationUnlisten = null;
+  activationDispatcher.dispose();
 });
 </script>
 
 <template>
-  <section class="plugin-frame">
+  <section class="plugin-frame" :class="{ auxiliary }">
     <iframe
       v-if="serviceReady"
       ref="frame"
-      :src="source"
-      :title="app.name"
-      sandbox="allow-scripts allow-same-origin"
+      :srcdoc="frameHtml"
+      :title="windowId ? `${app.name} ${windowId}` : app.name"
+      sandbox="allow-scripts"
       referrerpolicy="no-referrer"
       @load="handleLoad"
       @error="handleLaunchFailure('应用资源加载失败')"
@@ -257,6 +364,13 @@ onBeforeUnmount(() => {
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
   background: var(--bg-elevated);
+}
+
+.plugin-frame.auxiliary,
+.plugin-frame.auxiliary iframe {
+  min-height: 100vh;
+  border: 0;
+  border-radius: 0;
 }
 
 iframe {

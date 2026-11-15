@@ -3,10 +3,10 @@
 ## 业务域
 
 - 项目名称：AT Tool（仓库 `attool`）。
-- 项目定位：基于 Tauri 2 + Vue 3 的个人桌面工具箱，提供下载、剪贴板、图片与录屏、HTTP 调试、AI 对话等本地工具。
+- 项目定位：基于 Tauri 2 + Vue 3 的个人桌面工具箱，提供内置工具与可按需安装的隔离应用；HTTP 调试由官方独立应用提供。
 - 主要调用方：安装在 macOS、Windows、Linux 上的单个终端用户；前端通过 Tauri command 调用同进程 Rust 后端。
-- 核心业务对象：工具注册项、下载任务、剪贴板历史、截图/录屏产物、主图模板、HTTP tab/历史/环境/集合、SSE/WS session、AI 会话、更新任务。
-- 关键状态流转：下载任务 `queued → running → completed|failed|cancelled`；更新器 `idle → checking → up-to-date|available|error → downloading → verifying → ready → applying`；流 session `idle → connecting → open → closed|error`。
+- 核心业务对象：工具注册项、插件 registry/Catalog、下载任务、剪贴板历史、截图/录屏产物、主图模板、AI 会话、更新任务。
+- 关键状态流转：下载任务 `queued → running → completed|failed|cancelled`；更新器 `idle → checking → up-to-date|available|error → downloading → verifying → ready → applying`；插件安装 `download → verify → staging → health-check → activate → complete|rolled-back|error`。
 
 ## 关键约定
 
@@ -15,11 +15,12 @@
 - SQLite 持久化结构必须兼容用户已有本地数据库；字段新增需要迁移或兼容读取，禁止通过删库、清表或静默丢弃旧数据解决升级问题。
 - 自研 updater 的 Ed25519 签名、SHA256 校验和平台 apply 链路不得绕过、降级或恢复 `tauri-plugin-updater` / `tauri-plugin-process`；空公钥仅表示 dev build 禁用更新。
 - 发布资产命名、平台架构映射、校验清单和 updater archive 内容必须在客户端选择逻辑、stage 脚本与 CI release job 间完全一致。
-- HTTP/SSE/WS、AI 流式会话和取消句柄的状态必须可收口；错误、取消、关 tab 或窗口退出后不得残留“进行中”状态、监听器或后台 session。
+- 插件 Host API session、Native Service supervisor、AI 流式会话和取消句柄必须可收口；错误、停用、卸载或窗口退出后不得残留监听器、无主进程或“进行中”状态。
 - UI 颜色、圆角和字号必须使用已有语义 token；明暗主题下都要可读，不在组件中新增散装 hex、`rgba(...)` 或未定义圆角。
 - 纯逻辑模块按 colocated Vitest 覆盖；需要 DOM/storage 的逻辑通过依赖注入测试，不引入 jsdom。
 - 不新增依赖，除非需求明确且现有能力不能完成；依赖或 native runtime 变化必须同时审查锁文件、打包体积和五平台构建影响。
 - 不把已弃用的“电商图片处理”前端功能加回；主图模板是该场景的现行入口。
+- 不把 HTTP 内置 UI、Store、旧 Tauri commands 或宿主 SQLite owner 加回；HTTP 业务属于 `attsontools/athttp`，平台只保留 Host API 2.x 与 service supervisor。
 
 ## 高风险路径
 
@@ -27,9 +28,9 @@
 - `.github/workflows/build.yml`、`.github/scripts/stage-bundles.sh`、`.github/scripts/sign-checksums.mjs`：五平台构建、签名和公开发布链路。
 - `src-tauri/tauri.conf.json`、`src-tauri/capabilities/**`：桌面权限、可访问文件范围、窗口能力和打包内容。
 - `src-tauri/src/lib.rs`：应用初始化、共享状态和全部 Tauri command 注册入口。
-- `src-tauri/src/**/storage.rs`、`src-tauri/src/http/storage.rs`：用户本地数据、迁移、清理和历史兼容。
+- `src-tauri/src/**/storage.rs`、`src-tauri/src/plugin/**`：用户本地数据、插件 registry/Catalog、安装回滚和历史兼容。
 - `src-tauri/src/clipboard/**`、`src-tauri/src/imaging/**`、`src-tauri/src/recording/**`：剪贴板、屏幕内容、文件写入、全局快捷键和跨平台 native 行为。
-- `src-tauri/src/http/**`、`src/components/http/**`、`src/composables/useHttpStore.ts`：任意网络请求、认证信息、长连接、取消和持久化 tab。
+- `src-tauri/src/plugin/http_service.rs`、`src/components/plugins/**`：隔离边界、Host API 权限、Native Service 生命周期、HTTP 数据目录和事件转发。
 - `src-tauri/src/ai/**`、`src/components/ai/**`：第三方模型端点、API key、流式输出和会话存储。
 - `.github/scripts/*runtime*`、`src-tauri/runtime-manifest.json`：内置二进制来源、哈希、目标平台与正式包完整性。
 
@@ -42,13 +43,12 @@
 
 ## 独立发布范围
 
-无独立发布范围；前端、Rust 后端、sidecar、内置 runtime 和 apply 脚本随同一桌面应用版本发布。
+AT Tool 前端、Rust 后端、sidecar、内置 runtime 和 apply 脚本随同一桌面应用版本发布。Catalog 应用由各自仓库独立发布，平台只消费签名 `.atpkg` 契约。
 
 ## 领域术语
 
-- 当前环境：HTTP 工具中唯一激活的环境；其同名变量覆盖全局变量，不等于操作系统环境变量。
-- HTTP tab kind：`http`、`sse`、`ws` 三种持久化 tab 类型；SSE/WS 消息仅驻内存，不写历史数据库。
-- 集合：OpenAPI 导入后的目录与请求树；不是发送历史，用户对集合请求的改动可能在同步 merge 时被保留。
+- Native/Data Service：随 `com.attson.http` 包分发、独占 HTTP SQLite 与网络 session 的本地进程；平台通过 Host API 2.x 代理访问。
+- HTTP 数据目录：`${app_data_dir}/http`，升级前后保持原路径；停用/卸载默认保留，宿主启动不得打开或迁移其 SQLite。
 - updater archive：应用内升级使用的压缩包，不等于给用户手工安装的 dmg/deb/nsis 产物。
 - PSD sidecar：正式包内置的 PyInstaller 程序与运行时，不要求最终用户安装 Python。
 - capture overlay：截图与录屏共用的全屏浮层窗口；截图需要桌面帧，录屏源选择不应强制先截图。
@@ -57,25 +57,25 @@
 
 ### 业务约束
 
-- 用户输入和本地历史默认不得被隐式改写、清空或迁移丢失；自动解析应作用于执行副本，除非需求明确要求持久化变更。
+- 用户输入和本地历史默认不得被隐式改写、清空或迁移丢失；尤其不得通过删除 HTTP 数据目录解决插件升级或退场问题。
 - 取消、失败和窗口关闭必须清除任务/session/listener 状态；成功与失败路径都检查资源释放和 UI 状态复位。
-- 剪贴板、截图、录屏和 AI/HTTP 凭证属于敏感本地数据；不得新增日志、错误信息或远端请求泄露内容。
+- 剪贴板、截图、录屏、AI 凭证和经 Host API 代理的 HTTP 凭证属于敏感本地数据；不得新增日志、错误信息或非预期远端泄露。
 
 ### 架构边界
 
 - `App.vue` 只承担工具注册、路由壳和现存 Aria2 UI；新业务进入独立组件/composable/Rust module。
-- 前端单例 store 与 Rust session/storage 各自拥有明确状态；不得绕过公共 store 另建不一致的持久化或连接状态。
+- 内置前端 Store 与 Rust session/storage 各自拥有明确状态；独立应用状态不得复制回宿主。HTTP 数据只能由 Native/Data Service 持有。
 - OS 分支必须用 `cfg`/目标依赖隔离，并保留 macOS、Windows、Linux 的编译路径；Linux 同时考虑 X11 与 Wayland。
 
 ### 数据与兼容性
 
 - 审查 SQLite 表/列变化、旧 JSON 反序列化、默认字段和历史数据；新枚举值需考虑旧版本数据和回滚读取。
 - 窗口 label、Tauri event 名、command 名、环境变量名和持久化字段属于跨前后端契约。
-- OpenAPI 定时同步必须保留用户改动并防止已删除集合被 in-flight 任务复活。
+- 插件 registry、pending/current/previous 版本、Host API 版本、权限和 native service metadata 必须保持一致；失败激活不得覆盖上一可用版本。
 
 ### 外部依赖
 
-- GitHub Releases、Ollama、AI provider、任意 HTTP/SSE/WS 地址和视频站点均为不可信外部输入；检查超时、取消、大小限制和错误暴露。
+- GitHub Releases、Catalog、Ollama、AI provider、插件包和视频站点均为不可信外部输入；检查签名/hash、超时、取消、大小限制和错误暴露。
 - 外部命令与 sidecar 路径必须来自受控安装目录或明确的 debug 环境变量；参数不得经 shell 拼接造成注入。
 - updater 下载的清单、签名与单文件哈希必须在 apply 前全部验证，失败应停止而非继续安装。
 
@@ -91,7 +91,7 @@
 - `CREATE TABLE`、`ALTER TABLE`、序列化 enum/struct：核对旧库、旧记录、迁移、回滚和默认值。
 - `Command::new`、sidecar、PowerShell、`.bat`、`.sh`：核对路径、参数注入、退出码、清理和平台差异。
 - `ATTOOL_UPDATE_*`、`SHA256SUMS`、`verify`、`apply`：核对信任链没有跳过或静默降级。
-- `listen`、`spawn`、`HashMap<session`、cancel token：核对取消、重复打开、关闭和异常释放。
+- `listen`、`spawn`、`service.lock`、`nativeService`、cancel token：核对权限、重复启动、停用/卸载、owned child 边界和异常释放。
 - `clipboard`、`capture`、`recording`、`apiKey`、`token`：核对敏感内容不会进入日志、历史或非预期远端。
 - `setTimeout`、debounce、worker、buffer：核对卸载清理、竞态、防陈旧结果和容量上限。
 
@@ -113,11 +113,11 @@ cargo test --manifest-path src-tauri/Cargo.toml
 - 迁移要求：本地数据库和设置必须原地升级且保留用户数据；无法兼容时需要明确迁移、备份、失败回滚和用户提示。
 - 发布影响：平台脚本、runtime、sidecar、签名或配置变更必须经目标矩阵构建；tag 发布会直接创建公开 release，不把未验证行为留给发版时发现。
 - 安全/权限：重点关注 updater 信任链、Tauri capability、asset protocol、本地文件路径、命令执行、剪贴板/屏幕内容和 API key 泄露。
-- 性能/容量：关注 Monaco/OpenAPI JSON 大文件、SSE/WS 2000 条与 5 MB buffer、录屏分块落盘、图片批处理和下载并发；避免主线程或 Tauri async runtime 被阻塞。
+- 性能/容量：关注插件 Host API 8 MiB 帧、Native Service 请求并发、录屏分块落盘、图片批处理和下载并发；避免主线程或 Tauri async runtime 被阻塞。
 
 ## 跨仓库联动
 
-- 无已知代码仓库联动；发布依赖 GitHub Environment `prod` 中的 updater 公私钥和 GitHub Releases 资产约定。
+- HTTP 契约联动 `attsontools/athttp` 与 `attsontools/attool-plugin-sdk`；平台发布另依赖 GitHub Environment `prod` 中的 updater 公私钥和 GitHub Releases 资产约定。
 
 ## Review Routing
 
@@ -141,6 +141,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 - `src/App.vue`、`src/composables/**`：前端装配、共享状态和持久化入口。
 - `src-tauri/src/lib.rs`、`src-tauri/src/**/commands.rs`：Tauri 初始化与 command 契约。
 - `src-tauri/src/**/storage.rs`：本地数据库所有权与迁移。
+- `src-tauri/src/plugin/**`、`src/components/plugins/**`：应用安装、隔离运行时、Host API 和 Native Service supervisor。
 - `.github/workflows/build.yml`、`.github/scripts/**`：五平台打包、runtime、签名和发布。
 
 ## 维护规则

@@ -2,36 +2,8 @@ import { computed, ref } from 'vue';
 import type { ComputedRef, Ref } from 'vue';
 import type { Tool } from '../types/tool';
 
-export interface HistoryEntry {
-  method: string;
-  url: string;
-  ts: number;
-}
-
-export interface EnvEntry {
-  id?: string;
-  name: string;
-  active: boolean;
-}
-
-export interface CollectionRequestEntry {
-  id: string;
-  name: string;
-  method: string;
-  url: string;
-  collectionName: string;
-}
-
-export interface CommandActionEntry {
-  id: string;
-  title: string;
-  subtitle?: string;
-  groupLabel: string;
-  onSelect: () => void;
-}
-
 export interface CommandItem {
-  kind: 'tool' | 'env' | 'history' | 'collection-request' | 'action';
+  kind: 'tool';
   id: string;
   title: string;
   subtitle?: string;
@@ -42,13 +14,6 @@ export interface CommandItem {
 export interface UseCommandPaletteInput {
   tools: () => Tool[];
   onOpenTool: (id: string) => void;
-  envs?: () => EnvEntry[];
-  onSwitchEnv?: (name: string) => void;
-  httpHistory?: () => HistoryEntry[];
-  onOpenHistory?: (entry: HistoryEntry) => void;
-  collectionRequests?: () => CollectionRequestEntry[];
-  onOpenCollectionRequest?: (id: string) => void;
-  actions?: () => CommandActionEntry[];
 }
 
 export interface UseCommandPaletteReturn {
@@ -61,7 +26,6 @@ export interface UseCommandPaletteReturn {
 }
 
 const PER_SECTION_LIMIT = 20;
-const EMPTY_HISTORY_LIMIT = 5;
 
 // 拼音首字母映射（简版，覆盖常见工具名首字）。命中失败落回 substring。
 const PINYIN_INITIAL: Record<string, string> = {
@@ -106,10 +70,7 @@ export function useCommandPalette(input: UseCommandPaletteInput): UseCommandPale
 
   const results = computed<CommandItem[]>(() => {
     const q = query.value.trim();
-    const out: CommandItem[] = [];
-
-    // Tools
-    const toolMatches = input.tools()
+    return input.tools()
       .filter((t) =>
         matches(t.name, q) ||
         matches(t.description, q) ||
@@ -124,87 +85,6 @@ export function useCommandPalette(input: UseCommandPaletteInput): UseCommandPale
         groupLabel: '工具',
         onSelect: () => input.onOpenTool(t.id)
       }));
-    out.push(...toolMatches);
-
-    // Envs (仅 HTTP 上下文)
-    if (input.envs && input.onSwitchEnv) {
-      const switchEnv = input.onSwitchEnv;
-      const envMatches = input.envs()
-        .filter((e) => matches(e.name, q))
-        .slice(0, PER_SECTION_LIMIT)
-        .map((e) => ({
-          kind: 'env' as const,
-          id: e.id ?? e.name,
-          title: e.name + (e.active ? ' (当前)' : ''),
-          subtitle: '切换到此环境',
-          groupLabel: '环境',
-          onSelect: () => switchEnv(e.id ?? e.name)
-        }));
-      out.push(...envMatches);
-    }
-
-    // HTTP history (仅 HTTP 上下文)
-    if (input.httpHistory && input.onOpenHistory) {
-      const openHist = input.onOpenHistory;
-      const items = input.httpHistory();
-      const filtered = items.filter((h) =>
-        matches(h.method + ' ' + h.url, q)
-      );
-      const limit = q ? PER_SECTION_LIMIT : EMPTY_HISTORY_LIMIT;
-      const histMatches = filtered
-        .slice(0, limit)
-        .map((h) => ({
-          kind: 'history' as const,
-          id: `${h.ts}`,
-          title: `${h.method} ${h.url}`,
-          subtitle: new Date(h.ts).toLocaleTimeString(),
-          groupLabel: 'HTTP 历史',
-          onSelect: () => openHist(h)
-        }));
-      out.push(...histMatches);
-    }
-
-    if (input.collectionRequests && input.onOpenCollectionRequest) {
-      const openRequest = input.onOpenCollectionRequest;
-      const requestMatches = input.collectionRequests()
-        .filter((r) =>
-          matches(r.name, q) ||
-          matches(r.method, q) ||
-          matches(r.url, q) ||
-          matches(r.collectionName, q)
-        )
-        .slice(0, PER_SECTION_LIMIT)
-        .map((r) => ({
-          kind: 'collection-request' as const,
-          id: r.id,
-          title: `${r.method} ${r.name}`,
-          subtitle: `${r.collectionName} · ${r.url}`,
-          groupLabel: 'HTTP 集合',
-          onSelect: () => openRequest(r.id)
-        }));
-      out.push(...requestMatches);
-    }
-
-    if (input.actions) {
-      const actionMatches = input.actions()
-        .filter((a) =>
-          matches(a.title, q) ||
-          matches(a.subtitle ?? '', q) ||
-          matches(a.id, q)
-        )
-        .slice(0, PER_SECTION_LIMIT)
-        .map((a) => ({
-          kind: 'action' as const,
-          id: a.id,
-          title: a.title,
-          subtitle: a.subtitle,
-          groupLabel: a.groupLabel,
-          onSelect: a.onSelect
-        }));
-      out.push(...actionMatches);
-    }
-
-    return out;
   });
 
   return { open, query, results, show, hide, toggle };

@@ -17,13 +17,17 @@ const CATALOG_BASE_URL: &str =
     "https://raw.githubusercontent.com/attsontools/attool/main/catalog/v1";
 const METADATA_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 const SIGNATURE_LIMIT_BYTES: usize = 1024;
-const KNOWN_PERMISSIONS: [&str; 6] = [
+const KNOWN_PERMISSIONS: [&str; 10] = [
     "host.theme.read",
     "host.file.save",
     "host.notification.show",
     "host.http.request",
     "host.http.stream",
     "host.http.data",
+    "host.download.tasks",
+    "host.template.project",
+    "host.ui.auxiliary",
+    "host.clipboard.history",
 ];
 
 #[derive(Debug, Clone)]
@@ -1137,10 +1141,15 @@ fn validate_release(release: &CatalogRelease, sha256_pattern: &Regex) -> Result<
                 "Catalog release contains duplicate permissions",
             ));
         }
-        if permission.starts_with("host.http.") && host_api_major != Some(2) {
+        if (permission.starts_with("host.http.")
+            || permission == "host.download.tasks"
+            || permission == "host.template.project"
+            || permission == "host.clipboard.history")
+            && host_api_major != Some(2)
+        {
             return Err(CatalogError::new(
                 "CATALOG_PERMISSION_UNKNOWN",
-                "HTTP Catalog permissions require Host API 2.x",
+                "Native service Catalog permissions require Host API 2.x",
             ));
         }
     }
@@ -1375,6 +1384,125 @@ mod tests {
             .unwrap();
 
         assert_eq!(verified.catalog.apps[0].channels.stable.host_api.max, "2.x");
+    }
+
+    #[test]
+    fn accepts_host_api_two_download_release() {
+        let mut catalog: Value = serde_json::from_str(CATALOG_JSON).unwrap();
+        catalog["apps"][0]["channels"]["stable"]["hostApi"] =
+            serde_json::json!({ "min": "2.0.0", "max": "2.x" });
+        catalog["apps"][0]["channels"]["stable"]["permissions"] =
+            serde_json::json!(["host.theme.read", "host.download.tasks"]);
+        let signature = sign_value(&catalog);
+
+        let verified = CatalogVerifier::from_base64(ROOT_PUBLIC_KEY)
+            .unwrap()
+            .verify(
+                ROOT_JSON,
+                ROOT_SIGNATURE,
+                &catalog.to_string(),
+                &signature,
+                Utc.with_ymd_and_hms(2026, 11, 11, 0, 0, 0).unwrap(),
+                0,
+                0,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(
+            verified.catalog.apps[0].channels.stable.permissions,
+            ["host.theme.read", "host.download.tasks"]
+        );
+    }
+
+    #[test]
+    fn accepts_host_api_two_template_release() {
+        let mut catalog: Value = serde_json::from_str(CATALOG_JSON).unwrap();
+        catalog["apps"][0]["channels"]["stable"]["hostApi"] =
+            serde_json::json!({ "min": "2.0.0", "max": "2.x" });
+        catalog["apps"][0]["channels"]["stable"]["permissions"] =
+            serde_json::json!(["host.theme.read", "host.template.project"]);
+        let signature = sign_value(&catalog);
+
+        let verified = CatalogVerifier::from_base64(ROOT_PUBLIC_KEY)
+            .unwrap()
+            .verify(
+                ROOT_JSON,
+                ROOT_SIGNATURE,
+                &catalog.to_string(),
+                &signature,
+                Utc.with_ymd_and_hms(2026, 11, 11, 0, 0, 0).unwrap(),
+                0,
+                0,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(
+            verified.catalog.apps[0].channels.stable.permissions,
+            ["host.theme.read", "host.template.project"]
+        );
+    }
+
+    #[test]
+    fn accepts_auxiliary_ui_and_clipboard_permissions_on_host_api_two() {
+        let mut catalog: Value = serde_json::from_str(CATALOG_JSON).unwrap();
+        catalog["apps"][0]["channels"]["stable"]["hostApi"] =
+            serde_json::json!({ "min": "2.0.0", "max": "2.x" });
+        catalog["apps"][0]["channels"]["stable"]["permissions"] = serde_json::json!([
+            "host.theme.read",
+            "host.ui.auxiliary",
+            "host.clipboard.history"
+        ]);
+        let signature = sign_value(&catalog);
+
+        let verified = CatalogVerifier::from_base64(ROOT_PUBLIC_KEY)
+            .unwrap()
+            .verify(
+                ROOT_JSON,
+                ROOT_SIGNATURE,
+                &catalog.to_string(),
+                &signature,
+                Utc.with_ymd_and_hms(2026, 11, 11, 0, 0, 0).unwrap(),
+                0,
+                0,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(
+            verified.catalog.apps[0].channels.stable.permissions,
+            [
+                "host.theme.read",
+                "host.ui.auxiliary",
+                "host.clipboard.history"
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_clipboard_permission_on_host_api_one() {
+        let mut catalog: Value = serde_json::from_str(CATALOG_JSON).unwrap();
+        catalog["apps"][0]["channels"]["stable"]["permissions"] =
+            serde_json::json!(["host.clipboard.history"]);
+        let signature = sign_value(&catalog);
+
+        let error = CatalogVerifier::from_base64(ROOT_PUBLIC_KEY)
+            .unwrap()
+            .verify(
+                ROOT_JSON,
+                ROOT_SIGNATURE,
+                &catalog.to_string(),
+                &signature,
+                Utc.with_ymd_and_hms(2026, 11, 11, 0, 0, 0).unwrap(),
+                0,
+                0,
+                true,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "CATALOG_PERMISSION_UNKNOWN");
+        assert!(error.message.contains("Host API 2.x"));
     }
 
     #[test]

@@ -14,7 +14,9 @@ use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, WebviewWi
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
-use super::{models::DEFAULT_CLIPBOARD_SHORTCUT, storage::ClipboardStore};
+use super::{
+    models::DEFAULT_CLIPBOARD_SHORTCUT, owner::LegacyClipboardOwner, storage::ClipboardStore,
+};
 use crate::imaging::capture::primary_or_first_monitor;
 
 const CLIPBOARD_EVENT: &str = "clipboard-history-updated";
@@ -28,7 +30,10 @@ fn registered_slot() -> &'static Mutex<String> {
 }
 
 fn current_clipboard_shortcut() -> String {
-    registered_slot().lock().map(|g| g.clone()).unwrap_or_default()
+    registered_slot()
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default()
 }
 
 #[derive(Clone, Debug)]
@@ -56,10 +61,58 @@ pub fn start_clipboard_watcher(
     app: AppHandle,
     store: ClipboardStore,
     state: ClipboardWatcherState,
+    owner: LegacyClipboardOwner,
 ) {
     thread::spawn(move || {
         let mut last_text = String::new();
+        let mut ownership_suspended = false;
+        let mut shortcut_resume_error_reported = false;
         loop {
+            let owner_guard = match owner.enter() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    if !ownership_suspended {
+                        unregister_clipboard_shortcut(&app);
+                        ownership_suspended = true;
+                    }
+                    if owner.is_permanently_taken_over() {
+                        state.set_enabled(false);
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(800));
+                    continue;
+                }
+            };
+            if store.ensure_initialized().is_err() {
+                drop(owner_guard);
+                thread::sleep(Duration::from_millis(800));
+                continue;
+            }
+            if ownership_suspended {
+                let shortcut = match store.load_settings() {
+                    Ok(settings) => settings.shortcut,
+                    Err(error) => {
+                        if !shortcut_resume_error_reported {
+                            eprintln!("{error}");
+                            shortcut_resume_error_reported = true;
+                        }
+                        drop(owner_guard);
+                        thread::sleep(Duration::from_millis(800));
+                        continue;
+                    }
+                };
+                match register_clipboard_shortcut(&app, &shortcut) {
+                    Ok(()) => {
+                        ownership_suspended = false;
+                        shortcut_resume_error_reported = false;
+                    }
+                    Err(error) if !shortcut_resume_error_reported => {
+                        eprintln!("{error}");
+                        shortcut_resume_error_reported = true;
+                    }
+                    Err(_) => {}
+                }
+            }
             if state.is_enabled() {
                 if let Ok(text) = app.clipboard().read_text() {
                     if text != last_text {
@@ -91,6 +144,7 @@ pub fn start_clipboard_watcher(
                     }
                 }
             }
+            drop(owner_guard);
             thread::sleep(Duration::from_millis(800));
         }
     });
@@ -152,6 +206,18 @@ pub fn reregister_clipboard_shortcut(app: &AppHandle, next: &str) -> Result<(), 
     Ok(())
 }
 
+pub fn unregister_clipboard_shortcut(app: &AppHandle) {
+    let current = current_clipboard_shortcut();
+    if !current.is_empty() {
+        if let Ok(shortcut) = current.parse::<Shortcut>() {
+            let _ = app.global_shortcut().unregister(shortcut);
+        }
+    }
+    if let Ok(mut registered) = registered_slot().lock() {
+        registered.clear();
+    }
+}
+
 fn install_clipboard_handler(app: &AppHandle, shortcut: Shortcut) -> Result<(), String> {
     let handle = app.clone();
     app.global_shortcut()
@@ -164,6 +230,10 @@ fn install_clipboard_handler(app: &AppHandle, shortcut: Shortcut) -> Result<(), 
 }
 
 pub(crate) fn show_clipboard_history(app: &AppHandle) -> Result<(), String> {
+    let owner = app
+        .try_state::<LegacyClipboardOwner>()
+        .ok_or_else(|| "剪贴板 owner 状态不可用".to_string())?;
+    let _owner_guard = owner.enter()?;
     let window = app
         .get_webview_window("clipboard-history")
         .ok_or_else(|| "找不到剪贴板快捷面板".to_string())?;

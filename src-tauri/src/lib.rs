@@ -10,7 +10,6 @@ mod embedded_runtime;
 mod gpu_linux;
 pub mod ai;
 pub mod ecommerce;
-pub mod http;
 pub mod imaging;
 pub mod network;
 mod recording;
@@ -19,9 +18,9 @@ mod plugin;
 mod xhs;
 mod youtube;
 
-use ecommerce::EcommerceStore;
+use ecommerce::{EcommerceStore, LegacyTemplateOwner};
 use regex::Regex;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -75,6 +74,9 @@ struct DownloadState {
     db_path: PathBuf,
     tasks: Mutex<HashMap<String, oneshot::Sender<()>>>,
 }
+
+const DOWNLOAD_TAKEN_OVER: &str =
+    "DOWNLOAD_SERVICE_TAKEN_OVER: 下载数据已由 Aria2 服务接管";
 
 impl DownloadState {
     fn new(db_path: PathBuf, next_id: u64) -> Self {
@@ -205,6 +207,7 @@ fn get_default_download_dir() -> Result<String, String> {
 async fn list_download_tasks(
     state: State<'_, DownloadTasks>,
 ) -> Result<Vec<DownloadTaskRecord>, String> {
+    ensure_legacy_download_owner(&state.db_path)?;
     let db_path = state.db_path.clone();
     tauri::async_runtime::spawn_blocking(move || load_download_tasks(&db_path))
         .await
@@ -217,6 +220,7 @@ async fn start_download(
     app: AppHandle,
     state: State<'_, DownloadTasks>,
 ) -> Result<DownloadStarted, String> {
+    ensure_legacy_download_owner(&state.db_path)?;
     let url = request.url.trim().to_string();
     if url.is_empty() {
         return Err("请输入下载链接".to_string());
@@ -402,6 +406,7 @@ async fn start_download(
 
 #[tauri::command]
 async fn cancel_download(id: String, state: State<'_, DownloadTasks>) -> Result<(), String> {
+    ensure_legacy_download_owner(&state.db_path)?;
     let mut tasks = state.tasks.lock().await;
     if let Some(cancel_tx) = tasks.remove(&id) {
         let _ = cancel_tx.send(());
@@ -413,6 +418,7 @@ async fn cancel_download(id: String, state: State<'_, DownloadTasks>) -> Result<
 
 #[tauri::command]
 async fn open_download_folder(id: String, state: State<'_, DownloadTasks>) -> Result<(), String> {
+    ensure_legacy_download_owner(&state.db_path)?;
     let db_path = state.db_path.clone();
     let folder = tauri::async_runtime::spawn_blocking(move || find_download_dir(&db_path, &id))
         .await
@@ -423,6 +429,7 @@ async fn open_download_folder(id: String, state: State<'_, DownloadTasks>) -> Re
 
 #[tauri::command]
 async fn clear_completed_downloads(state: State<'_, DownloadTasks>) -> Result<u64, String> {
+    ensure_legacy_download_owner(&state.db_path)?;
     let db_path = state.db_path.clone();
     tauri::async_runtime::spawn_blocking(move || delete_completed_tasks(&db_path))
         .await
@@ -434,6 +441,7 @@ async fn delete_download_task(
     id: String,
     state: State<'_, DownloadTasks>,
 ) -> Result<(), String> {
+    ensure_legacy_download_owner(&state.db_path)?;
     // Refuse to delete a task that is still active — cancel first.
     let running = state.tasks.lock().await.contains_key(&id);
     if running {
@@ -556,7 +564,11 @@ fn parse_complete_line(line: &str) -> Option<String> {
 
 #[cfg(test)]
 mod parse_complete_line_tests {
-    use super::parse_complete_line;
+    use super::{
+        ensure_legacy_download_owner, init_database, insert_download_task_with_owner_check,
+        parse_complete_line, DOWNLOAD_TAKEN_OVER,
+    };
+    use rusqlite::Connection;
 
     #[test]
     fn extracts_absolute_path_from_standard_notice() {
@@ -583,6 +595,69 @@ mod parse_complete_line_tests {
     fn returns_none_when_notice_is_not_download_complete() {
         let line = "12/25 15:23:11 [NOTICE] IPv4 dht: listening on UDP port 6881";
         assert!(parse_complete_line(line).is_none());
+    }
+
+    #[test]
+    fn legacy_download_owner_remains_active_without_a_takeover_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("aria2-tasks.sqlite3");
+
+        assert_eq!(ensure_legacy_download_owner(&db_path), Ok(()));
+    }
+
+    #[test]
+    fn legacy_download_owner_rejects_migrating_and_owned_markers() {
+        for state in ["migrating", "owned"] {
+            let directory = tempfile::tempdir().unwrap();
+            let service_directory = directory.path().join("aria2");
+            std::fs::create_dir_all(&service_directory).unwrap();
+            std::fs::write(
+                service_directory.join("takeover.json"),
+                format!(r#"{{"protocolVersion":1,"state":"{state}"}}"#),
+            )
+            .unwrap();
+
+            assert_eq!(
+                ensure_legacy_download_owner(&directory.path().join("aria2-tasks.sqlite3")),
+                Err(DOWNLOAD_TAKEN_OVER.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_download_insert_rechecks_takeover_after_acquiring_the_write_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("aria2-tasks.sqlite3");
+        let service_directory = directory.path().join("aria2");
+        init_database(&db_path).unwrap();
+
+        let mut checks = 0;
+        let result = insert_download_task_with_owner_check(
+            &db_path,
+            "dl-1",
+            "https://example.com/file.bin",
+            "/tmp",
+            None,
+            |path| {
+                checks += 1;
+                if checks == 2 {
+                    std::fs::create_dir_all(&service_directory).unwrap();
+                    std::fs::write(
+                        service_directory.join("takeover.json"),
+                        r#"{"protocolVersion":1,"state":"migrating"}"#,
+                    )
+                    .unwrap();
+                }
+                ensure_legacy_download_owner(path)
+            },
+        );
+
+        assert_eq!(result, Err(DOWNLOAD_TAKEN_OVER.to_string()));
+        let connection = Connection::open(&db_path).unwrap();
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM download_tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }
 
@@ -643,11 +718,38 @@ fn create_download_state(app: &AppHandle) -> Result<DownloadTasks, String> {
     fs::create_dir_all(&app_data_dir).map_err(|error| format!("创建应用数据目录失败：{error}"))?;
 
     let db_path = app_data_dir.join("aria2-tasks.sqlite3");
+    let service_data_dir = app_data_dir.join("aria2");
+    fs::create_dir_all(&service_data_dir)
+        .map_err(|error| format!("创建 Aria2 服务数据目录失败：{error}"))?;
+    fs::write(service_data_dir.join("takeover-capability-v1"), b"1\n")
+        .map_err(|error| format!("写入 Aria2 接管能力标记失败：{error}"))?;
+    if ensure_legacy_download_owner(&db_path).is_err() {
+        return Ok(Arc::new(DownloadState::new(db_path, 1)));
+    }
     init_database(&db_path)?;
     mark_interrupted_tasks(&db_path)?;
     let next_id = next_download_id(&db_path)?;
 
     Ok(Arc::new(DownloadState::new(db_path, next_id)))
+}
+
+fn ensure_legacy_download_owner(db_path: &Path) -> Result<(), String> {
+    let marker = db_path
+        .parent()
+        .ok_or_else(|| "下载数据库路径缺少父目录".to_string())?
+        .join("aria2")
+        .join("takeover.json");
+    if !marker.exists() {
+        return Ok(());
+    }
+    let value: serde_json::Value = serde_json::from_slice(
+        &fs::read(&marker).map_err(|error| format!("读取 Aria2 接管标记失败：{error}"))?,
+    )
+    .map_err(|error| format!("解析 Aria2 接管标记失败：{error}"))?;
+    match value.get("state").and_then(serde_json::Value::as_str) {
+        Some("migrating" | "owned") => Err(DOWNLOAD_TAKEN_OVER.to_string()),
+        _ => Ok(()),
+    }
 }
 
 fn init_database(db_path: &Path) -> Result<(), String> {
@@ -712,9 +814,13 @@ fn init_database(db_path: &Path) -> Result<(), String> {
 }
 
 fn mark_interrupted_tasks(db_path: &Path) -> Result<(), String> {
-    let connection =
+    let mut connection =
         Connection::open(db_path).map_err(|error| format!("打开任务数据库失败：{error}"))?;
-    connection
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| format!("锁定任务数据库失败：{error}"))?;
+    ensure_legacy_download_owner(db_path)?;
+    transaction
         .execute(
             r#"
             UPDATE download_tasks
@@ -729,6 +835,9 @@ fn mark_interrupted_tasks(db_path: &Path) -> Result<(), String> {
             [],
         )
         .map_err(|error| format!("更新中断任务失败：{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("提交中断任务更新失败：{error}"))?;
     Ok(())
 }
 
@@ -763,9 +872,35 @@ fn insert_download_task(
     download_dir: &str,
     file_name: Option<&str>,
 ) -> Result<(), String> {
-    let connection =
+    insert_download_task_with_owner_check(
+        db_path,
+        id,
+        url,
+        download_dir,
+        file_name,
+        ensure_legacy_download_owner,
+    )
+}
+
+fn insert_download_task_with_owner_check<F>(
+    db_path: &Path,
+    id: &str,
+    url: &str,
+    download_dir: &str,
+    file_name: Option<&str>,
+    mut owner_check: F,
+) -> Result<(), String>
+where
+    F: FnMut(&Path) -> Result<(), String>,
+{
+    owner_check(db_path)?;
+    let mut connection =
         Connection::open(db_path).map_err(|error| format!("打开任务数据库失败：{error}"))?;
-    connection
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| format!("锁定任务数据库失败：{error}"))?;
+    owner_check(db_path)?;
+    transaction
         .execute(
             r#"
             INSERT INTO download_tasks (
@@ -776,10 +911,14 @@ fn insert_download_task(
             params![id, url, download_dir, file_name],
         )
         .map_err(|error| format!("保存任务记录失败：{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("提交任务记录失败：{error}"))?;
     Ok(())
 }
 
 fn load_download_tasks(db_path: &Path) -> Result<Vec<DownloadTaskRecord>, String> {
+    ensure_legacy_download_owner(db_path)?;
     let connection =
         Connection::open(db_path).map_err(|error| format!("打开任务数据库失败：{error}"))?;
     let mut statement = connection
@@ -823,24 +962,41 @@ fn load_download_tasks(db_path: &Path) -> Result<Vec<DownloadTaskRecord>, String
 }
 
 fn delete_completed_tasks(db_path: &Path) -> Result<u64, String> {
-    let connection =
+    ensure_legacy_download_owner(db_path)?;
+    let mut connection =
         Connection::open(db_path).map_err(|error| format!("打开任务数据库失败：{error}"))?;
-    let count = connection
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| format!("锁定任务数据库失败：{error}"))?;
+    ensure_legacy_download_owner(db_path)?;
+    let count = transaction
         .execute("DELETE FROM download_tasks WHERE status = 'completed'", [])
         .map_err(|error| format!("清理已完成任务失败：{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("提交清理任务失败：{error}"))?;
     Ok(count as u64)
 }
 
 fn delete_download_task_by_id(db_path: &Path, id: &str) -> Result<(), String> {
-    let connection =
+    ensure_legacy_download_owner(db_path)?;
+    let mut connection =
         Connection::open(db_path).map_err(|error| format!("打开任务数据库失败：{error}"))?;
-    connection
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| format!("锁定任务数据库失败：{error}"))?;
+    ensure_legacy_download_owner(db_path)?;
+    transaction
         .execute("DELETE FROM download_tasks WHERE id = ?1", params![id])
         .map_err(|error| format!("删除任务失败：{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("提交删除任务失败：{error}"))?;
     Ok(())
 }
 
 fn find_download_dir(db_path: &Path, id: &str) -> Result<String, String> {
+    ensure_legacy_download_owner(db_path)?;
     let connection =
         Connection::open(db_path).map_err(|error| format!("打开任务数据库失败：{error}"))?;
     connection
@@ -1046,11 +1202,20 @@ fn open_folder(folder: &str) -> Result<(), String> {
 }
 
 fn persist_download_event(db_path: &Path, payload: &DownloadEventPayload) {
-    let Ok(connection) = Connection::open(db_path) else {
+    if ensure_legacy_download_owner(db_path).is_err() {
+        return;
+    }
+    let Ok(mut connection) = Connection::open(db_path) else {
         return;
     };
-
-    let _ = connection.execute(
+    let Ok(transaction) = connection.transaction_with_behavior(TransactionBehavior::Immediate)
+    else {
+        return;
+    };
+    if ensure_legacy_download_owner(db_path).is_err() {
+        return;
+    }
+    if transaction.execute(
         r#"
         UPDATE download_tasks
         SET status = ?2,
@@ -1085,7 +1250,9 @@ fn persist_download_event(db_path: &Path, payload: &DownloadEventPayload) {
             payload.message,
             payload.local_path
         ],
-    );
+    ).is_ok() {
+        let _ = transaction.commit();
+    }
 }
 
 fn emit_download_event(app: &AppHandle, payload: DownloadEventPayload) {
@@ -1119,7 +1286,7 @@ pub fn run() {
     #[cfg(target_os = "linux")]
     let external_command = capture_command::requested_command();
     #[cfg(target_os = "linux")]
-    if let Some(request) = external_command {
+    if let Some(request) = external_command.as_ref() {
         if capture_command::forward_if_running(request) {
             return;
         }
@@ -1203,36 +1370,54 @@ pub fn run() {
                 .app_data_dir()
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?
                 .join("ecommerce");
-            let ecommerce_store = EcommerceStore::new(ecommerce_dir)
+            let ecommerce_owner = LegacyTemplateOwner::new(ecommerce_dir.clone())
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+            let ecommerce_store = EcommerceStore::new_for_legacy(ecommerce_dir, &ecommerce_owner)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+            app.manage(ecommerce_owner);
             app.manage(ecommerce_store);
             let clipboard_dir = app
                 .path()
                 .app_data_dir()
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?
                 .join("clipboard");
-            let clipboard_store = clipboard::storage::ClipboardStore::new(clipboard_dir)
+            let clipboard_owner = clipboard::owner::LegacyClipboardOwner::new(clipboard_dir.clone())
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+            let clipboard_store = clipboard::storage::ClipboardStore::new_for_legacy(
+                clipboard_dir,
+                &clipboard_owner,
+            )
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
             let clipboard_watcher_state = clipboard::watcher::ClipboardWatcherState::new();
             let clipboard_store_for_watcher = clipboard_store.clone();
             app.manage(clipboard_watcher_state.clone());
-            clipboard::watcher::start_clipboard_watcher(
-                app.handle().clone(),
-                clipboard_store_for_watcher,
-                clipboard_watcher_state,
-            );
+            app.manage(clipboard_owner.clone());
             let shortcut_errors = ShortcutRegisterState::default();
-            let clipboard_shortcut = clipboard_store
-                .load_settings()
-                .map(|s| s.shortcut)
-                .unwrap_or_default();
-            if let Err(error) =
-                clipboard::watcher::register_clipboard_shortcut(app.handle(), &clipboard_shortcut)
-            {
-                eprintln!("{error}");
-                if let Ok(mut slot) = shortcut_errors.clipboard.lock() {
-                    *slot = Some(error);
+            if !clipboard_owner.is_permanently_taken_over() {
+                if let Ok(_owner_guard) = clipboard_owner.enter() {
+                    clipboard_store.ensure_initialized().map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::Other, error)
+                    })?;
+                    let clipboard_shortcut = clipboard_store
+                        .load_settings()
+                        .map(|settings| settings.shortcut)
+                        .unwrap_or_default();
+                    if let Err(error) = clipboard::watcher::register_clipboard_shortcut(
+                        app.handle(),
+                        &clipboard_shortcut,
+                    ) {
+                        eprintln!("{error}");
+                        if let Ok(mut slot) = shortcut_errors.clipboard.lock() {
+                            *slot = Some(error);
+                        }
+                    }
                 }
+                clipboard::watcher::start_clipboard_watcher(
+                    app.handle().clone(),
+                    clipboard_store_for_watcher,
+                    clipboard_watcher_state,
+                    clipboard_owner,
+                );
             }
             if let Err(error) = imaging::capture::register_capture_shortcut(app.handle()) {
                 eprintln!("{error}");
@@ -1248,21 +1433,6 @@ pub fn run() {
             }
             app.manage(shortcut_errors);
             app.manage(clipboard_store);
-
-            let http_dir = app
-                .path()
-                .app_data_dir()
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?
-                .join("http");
-            let http_store = http::storage::HttpStore::new(http_dir)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            if let Err(error) = http_store.cleanup_history(now_ms) {
-                eprintln!("清理 http 历史失败：{error}");
-            }
-            app.manage(http_store);
-            app.manage(http::cancel::HttpCancelState::new());
-            app.manage(std::sync::Arc::new(http::stream::session::HttpStreamState::new()));
 
             let ai_dir = app
                 .path()
@@ -1298,15 +1468,32 @@ pub fn run() {
             let plugin_runtime = plugin::commands::PluginRuntime::p0(plugin_store.clone())
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
             app.manage(plugin_runtime);
-            let plugin_http_runtime = plugin::http_service::HttpServiceRuntime::new(
+            app.manage(plugin::auxiliary_window::AuxiliaryWindowRuntime::new(
+                plugin_store.clone(),
+            ));
+            let plugin_native_service_runtime = plugin::http_service::NativeServiceRuntime::new(
                 plugin_store,
                 app.path()
                     .app_data_dir()
-                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?
-                    .join("http"),
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?,
                 app.handle().clone(),
             );
-            app.manage(plugin_http_runtime);
+            let background_runtime = plugin_native_service_runtime.clone();
+            app.manage(plugin_native_service_runtime);
+            tauri::async_runtime::spawn(async move {
+                for (app_id, result) in background_runtime.start_background_services().await {
+                    if let Err(error) = result {
+                        let correlation_id = background_runtime
+                            .status_for(&app_id)
+                            .and_then(|status| status.correlation_id)
+                            .unwrap_or_default();
+                        eprintln!(
+                            "background native service {app_id} failed [{}] correlation_id={}: {}",
+                            error.code, correlation_id, error.message
+                        );
+                    }
+                }
+            });
             let catalog_runtime = plugin::catalog::CatalogRuntime::production(
                 app.path()
                     .app_data_dir()
@@ -1376,37 +1563,6 @@ pub fn run() {
             recording::resume_native_recording,
             recording::stop_native_recording,
             recording::cancel_native_recording,
-            http::commands::send_http,
-            http::commands::cancel_http,
-            http::commands::list_http_tabs,
-            http::commands::upsert_http_tab,
-            http::commands::delete_http_tab,
-            http::commands::set_active_http_tab,
-            http::commands::list_http_history,
-            http::commands::insert_http_history,
-            http::commands::delete_http_history,
-            http::commands::clear_http_history,
-            http::commands::list_http_envs,
-            http::commands::upsert_http_env,
-            http::commands::delete_http_env,
-            http::commands::set_active_http_env,
-            http::commands::list_http_env_vars,
-            http::commands::upsert_http_env_var,
-            http::commands::delete_http_env_var,
-            http::commands::list_http_collections,
-            http::commands::list_http_collection_folders,
-            http::commands::list_http_collection_requests,
-            http::commands::upsert_http_collection,
-            http::commands::upsert_http_collection_folder,
-            http::commands::upsert_http_collection_request,
-            http::commands::delete_http_collection,
-            http::commands::delete_http_collection_request,
-            http::commands::delete_http_collection_folder,
-            http::openapi_fetch::fetch_openapi_url,
-            http::stream::commands::open_stream,
-            http::stream::commands::close_stream,
-            http::stream::commands::send_ws_message,
-            http::stream::commands::list_stream_messages,
             ai::commands::ai_list_providers,
             ai::commands::ai_upsert_provider,
             ai::commands::ai_delete_provider,
@@ -1434,6 +1590,8 @@ pub fn run() {
             plugin::commands::plugin_inspect_package,
             plugin::commands::plugin_install_package,
             plugin::commands::plugin_list_installed,
+            plugin::commands::plugin_read_entry_html,
+            plugin::commands::plugin_read_probe_entry_html,
             plugin::commands::plugin_list_history,
             plugin::commands::plugin_set_enabled,
             plugin::commands::plugin_uninstall,
@@ -1447,8 +1605,13 @@ pub fn run() {
             plugin::commands::plugin_get_latest_operation,
             plugin::commands::plugin_confirm_plugin_launch,
             plugin::commands::plugin_rollback_plugin_launch,
-            plugin::http_service::plugin_connect_http_service,
-            plugin::http_service::plugin_http_service_request,
+            plugin::auxiliary_window::plugin_open_auxiliary_window,
+            plugin::auxiliary_window::plugin_get_auxiliary_activation,
+            plugin::auxiliary_window::plugin_ack_auxiliary_activation,
+            plugin::http_service::plugin_connect_native_service,
+            plugin::http_service::plugin_disconnect_native_service,
+            plugin::http_service::plugin_list_native_service_statuses,
+            plugin::http_service::plugin_native_service_request,
             ecommerce::commands::import_psd_template,
             ecommerce::commands::list_ecommerce_templates,
             ecommerce::commands::load_ecommerce_template,

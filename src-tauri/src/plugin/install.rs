@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    package::{extract_package, HostEnvironment, NativeService, PackageError},
+    package::{extract_package, AuxiliaryWindow, HostEnvironment, NativeService, PackageError},
     remote_install::{OperationSnapshot, OperationStage},
 };
 
@@ -33,6 +33,7 @@ pub struct InstalledPlugin {
     pub publisher_name: String,
     pub publisher_key_id: String,
     pub entry: String,
+    pub windows: BTreeMap<String, AuxiliaryWindow>,
     pub permissions: Vec<String>,
     pub native_service: Option<NativeService>,
     pub enabled: bool,
@@ -83,6 +84,7 @@ struct StoredOperation {
     publisher_name: String,
     publisher_key_id: String,
     entry: Option<String>,
+    windows_json: String,
     permissions_json: String,
     native_service_json: Option<String>,
     stage: String,
@@ -353,6 +355,7 @@ impl PluginStore {
                 format!("Cannot serialize plugin files: {error}"),
             )
         })?;
+        let windows_json = serialize_windows(&package.windows)?;
         let native_service_json = serialize_native_service(&package.native_service)?;
         let write_result = self.connection().and_then(|mut connection| {
             let transaction = connection.transaction().map_err(|error| {
@@ -365,8 +368,9 @@ impl PluginStore {
                 .execute(
                     "INSERT INTO installed_plugins (
                         app_id, name, version, publisher_id, publisher_name, publisher_key_id,
-                        entry, permissions_json, files_json, native_service_json, enabled, installed_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11)",
+                        entry, windows_json, permissions_json, files_json, native_service_json,
+                        enabled, installed_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12)",
                     params![
                         package.app_id,
                         package.name,
@@ -375,6 +379,7 @@ impl PluginStore {
                         package.publisher_name,
                         package.publisher_key_id,
                         package.entry,
+                        windows_json,
                         permissions_json,
                         files_json,
                         native_service_json,
@@ -600,6 +605,7 @@ impl PluginStore {
         let files_json = serde_json::to_string(&package.files).map_err(|error| {
             InstallError::new("PLUGIN_REGISTRY_WRITE_FAILED", error.to_string())
         })?;
+        let windows_json = serialize_windows(&package.windows)?;
         let native_service_json = serialize_native_service(&package.native_service)?;
         let installed_at = Utc::now().to_rfc3339();
         let mut connection = self.connection()?;
@@ -621,13 +627,13 @@ impl PluginStore {
             .execute(
                 "UPDATE installed_plugins SET
                     name = ?1, version = ?2, publisher_id = ?3, publisher_name = ?4,
-                    publisher_key_id = ?5, entry = ?6, permissions_json = ?7,
-                    files_json = ?8, native_service_json = ?9, installed_at = ?10, previous_version = ?11,
+                    publisher_key_id = ?5, entry = ?6, windows_json = ?7, permissions_json = ?8,
+                    files_json = ?9, native_service_json = ?10, installed_at = ?11, previous_version = ?12,
                     pending_version = NULL, pending_operation_id = NULL,
                     pending_correlation_id = NULL, awaiting_launch = 1,
-                    launch_operation_id = ?12, launch_correlation_id = ?13
-                 WHERE app_id = ?14 AND version = ?11 AND pending_version = ?2
-                       AND pending_operation_id = ?12",
+                    launch_operation_id = ?13, launch_correlation_id = ?14
+                 WHERE app_id = ?15 AND version = ?12 AND pending_version = ?2
+                       AND pending_operation_id = ?13",
                 params![
                     package.name,
                     package.version,
@@ -635,6 +641,7 @@ impl PluginStore {
                     package.publisher_name,
                     package.publisher_key_id,
                     package.entry,
+                    windows_json,
                     permissions_json,
                     files_json,
                     native_service_json,
@@ -794,6 +801,7 @@ impl PluginStore {
                 format!("Cannot restore previous plugin files: {error}"),
             )
         })?;
+        let windows_json = serialize_windows(&previous.windows)?;
         let native_service_json = serialize_native_service(&previous.native_service)?;
 
         let rollback_root = self
@@ -838,11 +846,11 @@ impl PluginStore {
                 .execute(
                     "UPDATE installed_plugins SET
                     name = ?1, version = ?2, publisher_id = ?3, publisher_name = ?4,
-                    publisher_key_id = ?5, entry = ?6, permissions_json = ?7,
-                    files_json = ?8, native_service_json = ?9, installed_at = ?10, previous_version = NULL,
+                    publisher_key_id = ?5, entry = ?6, windows_json = ?7, permissions_json = ?8,
+                    files_json = ?9, native_service_json = ?10, installed_at = ?11, previous_version = NULL,
                     awaiting_launch = 0, launch_operation_id = NULL,
                     launch_correlation_id = NULL
-                 WHERE app_id = ?11 AND version = ?12 AND awaiting_launch = 1",
+                 WHERE app_id = ?12 AND version = ?13 AND awaiting_launch = 1",
                     params![
                         previous.name,
                         previous.version,
@@ -850,6 +858,7 @@ impl PluginStore {
                         previous.publisher_name,
                         previous.publisher_key_id,
                         previous.entry,
+                        windows_json,
                         permissions_json,
                         files_json,
                         native_service_json,
@@ -947,12 +956,34 @@ impl PluginStore {
         })
     }
 
+    pub fn read_prepared_entry(
+        &self,
+        prepared: &PreparedPlugin,
+        relative: Option<&str>,
+    ) -> Result<PluginAsset, InstallError> {
+        let entry = relative.unwrap_or(&prepared.package.entry);
+        if entry != prepared.package.entry
+            && !prepared
+                .package
+                .windows
+                .values()
+                .any(|window| window.entry == entry)
+        {
+            return Err(InstallError::new(
+                "PLUGIN_ENTRY_NOT_DECLARED",
+                "Plugin UI entry is not declared as a signed window",
+            ));
+        }
+        self.read_prepared_asset(prepared, entry)
+    }
+
     pub fn list(&self) -> Result<Vec<InstalledPlugin>, InstallError> {
         let connection = self.connection()?;
         let mut statement = connection
             .prepare(
                 "SELECT app_id, name, version, publisher_id, publisher_name, publisher_key_id,
-                        entry, permissions_json, files_json, native_service_json, enabled, installed_at
+                        entry, windows_json, permissions_json, files_json, native_service_json,
+                        enabled, installed_at
                  FROM installed_plugins ORDER BY name, app_id",
             )
             .map_err(registry_read_error)?;
@@ -968,9 +999,10 @@ impl PluginStore {
                     row.get::<_, String>(6)?,
                     row.get::<_, String>(7)?,
                     row.get::<_, String>(8)?,
-                    row.get::<_, Option<String>>(9)?,
-                    row.get::<_, bool>(10)?,
-                    row.get::<_, String>(11)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, bool>(11)?,
+                    row.get::<_, String>(12)?,
                 ))
             })
             .map_err(registry_read_error)?;
@@ -984,12 +1016,14 @@ impl PluginStore {
                 publisher_name,
                 publisher_key_id,
                 entry,
+                windows_json,
                 permissions_json,
                 files_json,
                 native_service_json,
                 enabled,
                 installed_at,
             ) = row.map_err(registry_read_error)?;
+            let windows = deserialize_windows(&windows_json)?;
             let permissions = serde_json::from_str(&permissions_json).map_err(|error| {
                 InstallError::new(
                     "PLUGIN_REGISTRY_READ_FAILED",
@@ -1012,6 +1046,7 @@ impl PluginStore {
                 publisher_name,
                 publisher_key_id,
                 entry,
+                windows,
                 permissions,
                 native_service,
                 enabled,
@@ -1067,6 +1102,24 @@ impl PluginStore {
             bytes,
             content_type: content_type(relative),
         })
+    }
+
+    pub fn read_entry(
+        &self,
+        app_id: &str,
+        relative: Option<&str>,
+    ) -> Result<PluginAsset, InstallError> {
+        let plugin = self.find(app_id)?.ok_or_else(|| {
+            InstallError::new("PLUGIN_NOT_FOUND", "Installed plugin was not found")
+        })?;
+        let entry = relative.unwrap_or(&plugin.entry);
+        if entry != plugin.entry && !plugin.windows.values().any(|window| window.entry == entry) {
+            return Err(InstallError::new(
+                "PLUGIN_ENTRY_NOT_DECLARED",
+                "Plugin UI entry is not declared as a signed window",
+            ));
+        }
+        self.read_asset(app_id, &entry)
     }
 
     pub fn set_enabled(&self, app_id: &str, enabled: bool) -> Result<(), InstallError> {
@@ -1343,6 +1396,7 @@ impl PluginStore {
     }
 
     pub fn save_operation(&self, operation: &OperationSnapshot) -> Result<(), InstallError> {
+        let windows_json = serialize_windows(&operation.windows)?;
         let permissions_json = serde_json::to_string(&operation.permissions).map_err(|error| {
             InstallError::new(
                 "PLUGIN_REGISTRY_WRITE_FAILED",
@@ -1374,13 +1428,15 @@ impl PluginStore {
                 "INSERT INTO plugin_operations (
                     operation_id, correlation_id, action, app_id, name, version,
                     publisher_id, publisher_name, publisher_key_id, entry,
-                    permissions_json, native_service_json, stage, steps_json, downloaded_bytes,
-                    total_bytes, error_code, message, final_available_version, created_at, updated_at
+                    windows_json, permissions_json, native_service_json, stage, steps_json,
+                    downloaded_bytes, total_bytes, error_code, message, final_available_version,
+                    created_at, updated_at
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                    ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?20
+                    ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?21
                  ) ON CONFLICT(operation_id) DO UPDATE SET
                     entry = excluded.entry,
+                    windows_json = excluded.windows_json,
                     native_service_json = excluded.native_service_json,
                     stage = excluded.stage,
                     steps_json = excluded.steps_json,
@@ -1401,6 +1457,7 @@ impl PluginStore {
                     operation.publisher_name,
                     operation.publisher_key_id,
                     operation.entry,
+                    windows_json,
                     permissions_json,
                     native_service_json,
                     operation.stage.as_str(),
@@ -1466,6 +1523,7 @@ impl PluginStore {
                     publisher_name TEXT NOT NULL,
                     publisher_key_id TEXT NOT NULL,
                     entry TEXT NOT NULL,
+                    windows_json TEXT NOT NULL DEFAULT '{}',
                     permissions_json TEXT NOT NULL,
                     files_json TEXT NOT NULL DEFAULT '{}',
                     native_service_json TEXT,
@@ -1493,6 +1551,7 @@ impl PluginStore {
                     publisher_name TEXT NOT NULL,
                     publisher_key_id TEXT NOT NULL,
                     entry TEXT NOT NULL,
+                    windows_json TEXT NOT NULL DEFAULT '{}',
                     permissions_json TEXT NOT NULL,
                     files_json TEXT NOT NULL,
                     native_service_json TEXT,
@@ -1511,6 +1570,7 @@ impl PluginStore {
                     publisher_name TEXT NOT NULL,
                     publisher_key_id TEXT NOT NULL,
                     entry TEXT,
+                    windows_json TEXT NOT NULL DEFAULT '{}',
                     permissions_json TEXT NOT NULL,
                     native_service_json TEXT,
                     stage TEXT NOT NULL,
@@ -1590,6 +1650,7 @@ impl PluginStore {
             ("launch_correlation_id", "TEXT"),
             ("awaiting_launch", "INTEGER NOT NULL DEFAULT 0"),
             ("native_service_json", "TEXT"),
+            ("windows_json", "TEXT NOT NULL DEFAULT '{}'"),
         ] {
             let exists: bool = connection
                 .query_row(
@@ -1610,6 +1671,32 @@ impl PluginStore {
                         InstallError::new(
                             "PLUGIN_STORE_OPEN_FAILED",
                             format!("Cannot migrate plugin version state: {error}"),
+                        )
+                    })?;
+            }
+        }
+        for table in ["plugin_versions", "plugin_operations"] {
+            let has_windows: bool = connection
+                .query_row(
+                    &format!(
+                        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name = 'windows_json')"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(registry_read_error)?;
+            if !has_windows {
+                connection
+                    .execute(
+                        &format!(
+                            "ALTER TABLE {table} ADD COLUMN windows_json TEXT NOT NULL DEFAULT '{{}}'"
+                        ),
+                        [],
+                    )
+                    .map_err(|error| {
+                        InstallError::new(
+                            "PLUGIN_STORE_OPEN_FAILED",
+                            format!("Cannot migrate plugin window metadata: {error}"),
                         )
                     })?;
             }
@@ -1664,10 +1751,10 @@ impl PluginStore {
             .execute(
                 "INSERT OR IGNORE INTO plugin_versions (
                     app_id, version, name, publisher_id, publisher_name, publisher_key_id,
-                    entry, permissions_json, files_json, native_service_json, installed_at
+                    entry, windows_json, permissions_json, files_json, native_service_json, installed_at
                  )
                  SELECT app_id, version, name, publisher_id, publisher_name, publisher_key_id,
-                        entry, permissions_json, files_json, native_service_json, installed_at
+                        entry, windows_json, permissions_json, files_json, native_service_json, installed_at
                  FROM installed_plugins",
                 [],
             )
@@ -1824,7 +1911,8 @@ impl PluginStore {
 fn operation_select_sql() -> &'static str {
     "SELECT action, operation_id, correlation_id, app_id, name, version,
             publisher_id, publisher_name, publisher_key_id, entry,
-            permissions_json, native_service_json, stage, steps_json, downloaded_bytes, total_bytes,
+            windows_json, permissions_json, native_service_json, stage, steps_json,
+            downloaded_bytes, total_bytes,
             error_code, message, final_available_version
      FROM plugin_operations"
 }
@@ -1841,15 +1929,16 @@ fn stored_operation_from_row(row: &Row<'_>) -> rusqlite::Result<StoredOperation>
         publisher_name: row.get(7)?,
         publisher_key_id: row.get(8)?,
         entry: row.get(9)?,
-        permissions_json: row.get(10)?,
-        native_service_json: row.get(11)?,
-        stage: row.get(12)?,
-        steps_json: row.get(13)?,
-        downloaded_bytes: row.get(14)?,
-        total_bytes: row.get(15)?,
-        error_code: row.get(16)?,
-        message: row.get(17)?,
-        final_available_version: row.get(18)?,
+        windows_json: row.get(10)?,
+        permissions_json: row.get(11)?,
+        native_service_json: row.get(12)?,
+        stage: row.get(13)?,
+        steps_json: row.get(14)?,
+        downloaded_bytes: row.get(15)?,
+        total_bytes: row.get(16)?,
+        error_code: row.get(17)?,
+        message: row.get(18)?,
+        final_available_version: row.get(19)?,
     })
 }
 
@@ -1866,6 +1955,7 @@ fn decode_operation(stored: StoredOperation) -> Result<OperationSnapshot, Instal
             format!("Plugin operation permissions are corrupted: {error}"),
         )
     })?;
+    let windows = deserialize_windows(&stored.windows_json)?;
     let native_service = deserialize_native_service(stored.native_service_json.as_deref())?;
     let steps = serde_json::from_str(&stored.steps_json).map_err(|error| {
         InstallError::new(
@@ -1896,6 +1986,7 @@ fn decode_operation(stored: StoredOperation) -> Result<OperationSnapshot, Instal
         publisher_name: stored.publisher_name,
         publisher_key_id: stored.publisher_key_id,
         entry: stored.entry,
+        windows,
         permissions,
         native_service,
         stage,
@@ -2063,13 +2154,14 @@ fn insert_plugin_version(
         .map_err(|error| InstallError::new("PLUGIN_REGISTRY_WRITE_FAILED", error.to_string()))?;
     let files_json = serde_json::to_string(&package.files)
         .map_err(|error| InstallError::new("PLUGIN_REGISTRY_WRITE_FAILED", error.to_string()))?;
+    let windows_json = serialize_windows(&package.windows)?;
     let native_service_json = serialize_native_service(&package.native_service)?;
     transaction
         .execute(
             "INSERT INTO plugin_versions (
                 app_id, version, name, publisher_id, publisher_name, publisher_key_id,
-                entry, permissions_json, files_json, native_service_json, installed_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                entry, windows_json, permissions_json, files_json, native_service_json, installed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 package.app_id,
                 package.version,
@@ -2078,6 +2170,7 @@ fn insert_plugin_version(
                 package.publisher_name,
                 package.publisher_key_id,
                 package.entry,
+                windows_json,
                 permissions_json,
                 files_json,
                 native_service_json,
@@ -2103,6 +2196,24 @@ fn serialize_native_service(
         })
 }
 
+fn serialize_windows(windows: &BTreeMap<String, AuxiliaryWindow>) -> Result<String, InstallError> {
+    serde_json::to_string(windows).map_err(|error| {
+        InstallError::new(
+            "PLUGIN_REGISTRY_WRITE_FAILED",
+            format!("Cannot serialize auxiliary window metadata: {error}"),
+        )
+    })
+}
+
+fn deserialize_windows(value: &str) -> Result<BTreeMap<String, AuxiliaryWindow>, InstallError> {
+    serde_json::from_str(value).map_err(|error| {
+        InstallError::new(
+            "PLUGIN_REGISTRY_READ_FAILED",
+            format!("Plugin auxiliary window metadata is corrupted: {error}"),
+        )
+    })
+}
+
 fn deserialize_native_service(value: Option<&str>) -> Result<Option<NativeService>, InstallError> {
     value
         .map(serde_json::from_str)
@@ -2125,7 +2236,7 @@ fn plugin_version(
     let row = transaction
         .query_row(
             "SELECT name, publisher_id, publisher_name, publisher_key_id, entry,
-                    permissions_json, files_json, native_service_json, installed_at
+                    windows_json, permissions_json, files_json, native_service_json, installed_at
              FROM plugin_versions WHERE app_id = ?1 AND version = ?2",
             params![app_id, version],
             |row| {
@@ -2137,25 +2248,27 @@ fn plugin_version(
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(9)?,
                 ))
             },
         )
         .map_err(registry_read_error)?;
-    let permissions = serde_json::from_str(&row.5).map_err(|error| {
+    let windows = deserialize_windows(&row.5)?;
+    let permissions = serde_json::from_str(&row.6).map_err(|error| {
         InstallError::new(
             "PLUGIN_REGISTRY_READ_FAILED",
             format!("Plugin permissions are corrupted: {error}"),
         )
     })?;
-    let files = serde_json::from_str(&row.6).map_err(|error| {
+    let files = serde_json::from_str(&row.7).map_err(|error| {
         InstallError::new(
             "PLUGIN_REGISTRY_READ_FAILED",
             format!("Plugin files are corrupted: {error}"),
         )
     })?;
-    let native_service = deserialize_native_service(row.7.as_deref())?;
+    let native_service = deserialize_native_service(row.8.as_deref())?;
     Ok(InstalledPlugin {
         app_id: app_id.to_string(),
         name: row.0,
@@ -2164,10 +2277,11 @@ fn plugin_version(
         publisher_name: row.2,
         publisher_key_id: row.3,
         entry: row.4,
+        windows,
         permissions,
         native_service,
         enabled,
-        installed_at: row.8,
+        installed_at: row.9,
         files,
         root: root.join("apps").join(app_id).join(version),
     })
@@ -2302,27 +2416,37 @@ mod tests {
         let path = directory.join(format!("http-{version}.atpkg"));
         let signing_key = SigningKey::from_bytes(&TEST_KEY_SEED);
         let index = b"<!doctype html><title>HTTP</title>";
+        let history = b"<!doctype html><title>History</title>";
         let service = b"native-service";
         let service_hash = sha256(service);
         let manifest = serde_json::json!({
             "appId": "com.attson.http",
             "files": {
                 "native/athttp-service": service_hash,
+                "ui/history.html": sha256(history),
                 "ui/index.html": sha256(index)
             },
             "hostApi": { "max": "2.x", "min": "2.0.0" },
             "name": "HTTP request",
             "nativeService": {
                 "entry": "native/athttp-service",
+                "lifecycle": "background",
                 "protocolVersion": 1,
                 "sha256": service_hash,
                 "version": version
             },
-            "permissions": ["host.http.request", "host.http.stream", "host.http.data"],
+            "permissions": [
+                "host.http.request", "host.http.stream", "host.http.data", "host.ui.auxiliary"
+            ],
             "publisher": { "id": "com.attson", "keyId": "attool-p0-test", "name": "Attson" },
             "schemaVersion": 1,
             "target": { "arch": std::env::consts::ARCH, "os": std::env::consts::OS },
-            "ui": { "entry": "ui/index.html" },
+            "ui": {
+                "entry": "ui/index.html",
+                "windows": {
+                    "history": { "entry": "ui/history.html", "presentation": "bottomPanel" }
+                }
+            },
             "version": version
         });
         let manifest = serde_json::to_string(&manifest).unwrap();
@@ -2332,6 +2456,7 @@ mod tests {
         for (name, bytes) in [
             ("manifest.json", manifest.as_bytes()),
             ("manifest.sig", signature.as_bytes()),
+            ("ui/history.html", history.as_slice()),
             ("ui/index.html", index.as_slice()),
             ("native/athttp-service", service.as_slice()),
         ] {
@@ -2393,8 +2518,11 @@ mod tests {
         let reopened = PluginStore::open(store_root).unwrap();
         let installed = reopened.list().unwrap().pop().unwrap();
         let service = installed.native_service.unwrap();
+        assert_eq!(service.lifecycle, "background");
         assert_eq!(service.version, installed.version);
         assert_eq!(service.sha256, installed.files[&service.entry]);
+        assert_eq!(installed.windows["history"].entry, "ui/history.html");
+        assert_eq!(installed.windows["history"].presentation, "bottomPanel");
     }
 
     #[test]
@@ -2420,6 +2548,10 @@ mod tests {
                 .read_prepared_asset(&prepared, "ui/index.html")
                 .unwrap()
                 .bytes,
+            b"<!doctype html><title>Codec</title>"
+        );
+        assert_eq!(
+            store.read_prepared_entry(&prepared, None).unwrap().bytes,
             b"<!doctype html><title>Codec</title>"
         );
 
@@ -2485,6 +2617,10 @@ mod tests {
             .unwrap();
         assert_eq!(asset.bytes, b"<!doctype html><title>Codec</title>");
         assert_eq!(asset.content_type, "text/html; charset=utf-8");
+
+        let entry = store.read_entry("com.attson.codec", None).unwrap();
+        assert_eq!(entry.bytes, b"<!doctype html><title>Codec</title>");
+        assert_eq!(entry.content_type, "text/html; charset=utf-8");
 
         let undeclared = store
             .read_asset("com.attson.codec", "ui/other.js")
@@ -2701,12 +2837,14 @@ mod tests {
             publisher_name: "Attson".to_string(),
             publisher_key_id: "codec-key".to_string(),
             entry: Some("ui/index.html".to_string()),
+            windows: std::collections::BTreeMap::new(),
             permissions: vec!["host.theme.read".to_string()],
             native_service: Some(crate::plugin::package::NativeService {
                 entry: "native/athttp-service".to_string(),
                 version: "1.1.0".to_string(),
                 sha256: "a".repeat(64),
                 protocol_version: 1,
+                lifecycle: "onDemand".to_string(),
             }),
             stage: crate::plugin::remote_install::OperationStage::HealthCheck,
             steps: vec![
@@ -2928,8 +3066,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let (alpha_zero, signing_key) =
             native_service_package_version(directory.path(), "0.1.0-alpha.0");
-        let (alpha_one, _) =
-            native_service_package_version(directory.path(), "0.1.0-alpha.1");
+        let (alpha_one, _) = native_service_package_version(directory.path(), "0.1.0-alpha.1");
         let keys = HashMap::from([("attool-p0-test".to_string(), signing_key.verifying_key())]);
         let environment = HostEnvironment::current("2.0.0");
         let store_root = directory.path().join("plugins");
@@ -2957,9 +3094,7 @@ mod tests {
             )
             .unwrap();
         fs::remove_file(
-            store_root.join(
-                "apps/com.attson.http/0.1.0-alpha.1/native/athttp-service",
-            ),
+            store_root.join("apps/com.attson.http/0.1.0-alpha.1/native/athttp-service"),
         )
         .unwrap();
 
@@ -2978,11 +3113,7 @@ mod tests {
             .mark_pending_upgrade(&retry, "operation-http-retry", "correlation-http-retry")
             .unwrap();
         store
-            .activate_prepared_upgrade(
-                retry,
-                "operation-http-retry",
-                "correlation-http-retry",
-            )
+            .activate_prepared_upgrade(retry, "operation-http-retry", "correlation-http-retry")
             .unwrap();
         assert!(store
             .confirm_current_launch("com.attson.http", "0.1.0-alpha.1")

@@ -8,7 +8,10 @@ use std::{
 use base64::Engine;
 use ed25519_dalek::{Signature, VerifyingKey};
 use semver::Version;
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{MapAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use zip::ZipArchive;
@@ -16,6 +19,7 @@ use zip::ZipArchive;
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_SIGNATURE_BYTES: u64 = 1024;
 const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_NATIVE_FILE_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct HostEnvironment {
@@ -48,6 +52,7 @@ pub struct InspectedPackage {
     pub host_api_min: String,
     pub host_api_max: String,
     pub entry: String,
+    pub windows: BTreeMap<String, AuxiliaryWindow>,
     pub permissions: Vec<String>,
     pub native_service: Option<NativeService>,
     pub files: BTreeMap<String, String>,
@@ -60,6 +65,19 @@ pub struct NativeService {
     pub version: String,
     pub sha256: String,
     pub protocol_version: u32,
+    #[serde(default = "default_native_service_lifecycle")]
+    pub lifecycle: String,
+}
+
+fn default_native_service_lifecycle() -> String {
+    "onDemand".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuxiliaryWindow {
+    pub entry: String,
+    pub presentation: String,
 }
 
 #[derive(Debug)]
@@ -128,6 +146,42 @@ struct HostApi {
 #[serde(deny_unknown_fields)]
 struct Ui {
     entry: String,
+    #[serde(default, deserialize_with = "deserialize_auxiliary_windows")]
+    windows: BTreeMap<String, AuxiliaryWindow>,
+}
+
+fn deserialize_auxiliary_windows<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, AuxiliaryWindow>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct AuxiliaryWindowsVisitor;
+
+    impl<'de> Visitor<'de> for AuxiliaryWindowsVisitor {
+        type Value = BTreeMap<String, AuxiliaryWindow>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an object of auxiliary window declarations")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut windows = BTreeMap::new();
+            while let Some((window_id, window)) = map.next_entry::<String, AuxiliaryWindow>()? {
+                if windows.insert(window_id.clone(), window).is_some() {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate window ID: {window_id}"
+                    )));
+                }
+            }
+            Ok(windows)
+        }
+    }
+
+    deserializer.deserialize_map(AuxiliaryWindowsVisitor)
 }
 
 pub fn inspect_package(
@@ -149,16 +203,16 @@ pub fn inspect_package(
     })?;
     let manifest_bytes = read_entry(&mut archive, "manifest.json", MAX_MANIFEST_BYTES)?;
     let signature_bytes = read_entry(&mut archive, "manifest.sig", MAX_SIGNATURE_BYTES)?;
+    let manifest: Manifest = serde_json::from_slice(&manifest_bytes).map_err(|error| {
+        PackageError::new(
+            "PLUGIN_MANIFEST_INVALID",
+            format!("Invalid manifest: {error}"),
+        )
+    })?;
     let manifest_value: Value = serde_json::from_slice(&manifest_bytes).map_err(|error| {
         PackageError::new(
             "PLUGIN_MANIFEST_INVALID",
             format!("Invalid manifest JSON: {error}"),
-        )
-    })?;
-    let manifest: Manifest = serde_json::from_value(manifest_value.clone()).map_err(|error| {
-        PackageError::new(
-            "PLUGIN_MANIFEST_INVALID",
-            format!("Invalid manifest: {error}"),
         )
     })?;
 
@@ -179,6 +233,7 @@ pub fn inspect_package(
         host_api_min: manifest.host_api.min,
         host_api_max: manifest.host_api.max,
         entry: manifest.ui.entry,
+        windows: manifest.ui.windows,
         permissions: manifest.permissions,
         native_service: manifest.native_service,
         files: manifest.files,
@@ -219,7 +274,11 @@ pub fn extract_package(
             )
         })?;
         for relative in package.files.keys() {
-            let bytes = read_entry(&mut archive, relative, MAX_FILE_BYTES)?;
+            let bytes = read_entry(
+                &mut archive,
+                relative,
+                package_file_limit(relative, package.native_service.is_some()),
+            )?;
             let output = destination.join(relative);
             if let Some(parent) = output.parent() {
                 fs::create_dir_all(parent).map_err(|error| {
@@ -352,6 +411,10 @@ fn validate_manifest(
                 | "host.http.request"
                 | "host.http.stream"
                 | "host.http.data"
+                | "host.download.tasks"
+                | "host.template.project"
+                | "host.ui.auxiliary"
+                | "host.clipboard.history"
         )
     }) {
         return Err(PackageError::new(
@@ -392,12 +455,31 @@ fn validate_manifest(
             "UI entry is not declared in manifest files",
         ));
     }
+    let window_id_pattern =
+        regex::Regex::new(r"^[a-z0-9]+(?:-[a-z0-9]+)*$").expect("window ID pattern is valid");
+    if manifest.ui.windows.len() > 4
+        || manifest.ui.windows.iter().any(|(window_id, window)| {
+            !window_id_pattern.is_match(window_id)
+                || validate_package_path(&window.entry).is_err()
+                || !manifest.files.contains_key(&window.entry)
+                || !matches!(
+                    window.presentation.as_str(),
+                    "bottomPanel" | "centeredDialog"
+                )
+        })
+    {
+        return Err(PackageError::new(
+            "PLUGIN_UI_WINDOW_INVALID",
+            "Auxiliary window declaration is invalid",
+        ));
+    }
     if let Some(service) = &manifest.native_service {
         let service_hash = manifest.files.get(&service.entry);
         if validate_package_path(&service.entry).is_err()
             || service.version != manifest.version
             || service.protocol_version != 1
             || service_hash != Some(&service.sha256)
+            || !matches!(service.lifecycle.as_str(), "onDemand" | "background")
         {
             return Err(PackageError::new(
                 "PLUGIN_NATIVE_SERVICE_INVALID",
@@ -405,16 +487,29 @@ fn validate_manifest(
             ));
         }
     }
-    let requests_http_host = manifest
-        .permissions
-        .iter()
-        .any(|permission| permission.starts_with("host.http."));
-    if (manifest.native_service.is_some() && host_min.major != 2)
-        || (requests_http_host && manifest.native_service.is_none())
+    let requests_native_service = manifest.permissions.iter().any(|permission| {
+        permission.starts_with("host.http.")
+            || permission == "host.download.tasks"
+            || permission == "host.template.project"
+            || permission == "host.clipboard.history"
+    });
+    if (host_min.major == 2) != manifest.native_service.is_some()
+        || (requests_native_service && manifest.native_service.is_none())
     {
         return Err(PackageError::new(
             "PLUGIN_NATIVE_SERVICE_REQUIRED",
-            "Native services and HTTP Host permissions require Host API 2.x",
+            "Native services and their Host permissions require Host API 2.x",
+        ));
+    }
+    if manifest
+        .native_service
+        .as_ref()
+        .is_some_and(|service| service.lifecycle == "background")
+        && !requests_native_service
+    {
+        return Err(PackageError::new(
+            "PLUGIN_NATIVE_SERVICE_REQUIRED",
+            "Background native services require a Native Service Host permission",
         ));
     }
     Ok(())
@@ -464,7 +559,11 @@ fn verify_signature(
 fn verify_files(archive: &mut ZipArchive<File>, manifest: &Manifest) -> Result<(), PackageError> {
     for (path, expected_hash) in &manifest.files {
         validate_package_path(path)?;
-        let bytes = read_entry(archive, path, MAX_FILE_BYTES)?;
+        let bytes = read_entry(
+            archive,
+            path,
+            package_file_limit(path, manifest.native_service.is_some()),
+        )?;
         let actual_hash = hex::encode(Sha256::digest(&bytes));
         if &actual_hash != expected_hash {
             return Err(PackageError::new(
@@ -474,6 +573,14 @@ fn verify_files(archive: &mut ZipArchive<File>, manifest: &Manifest) -> Result<(
         }
     }
     Ok(())
+}
+
+fn package_file_limit(path: &str, has_native_service: bool) -> u64 {
+    if has_native_service && path.starts_with("native/") {
+        MAX_NATIVE_FILE_BYTES
+    } else {
+        MAX_FILE_BYTES
+    }
 }
 
 fn validate_package_path(path: &str) -> Result<(), PackageError> {
@@ -559,13 +666,23 @@ mod tests {
     use sha2::{Digest, Sha256};
     use zip::{write::SimpleFileOptions, ZipWriter};
 
-    use super::{canonical_json, extract_package, inspect_package, HostEnvironment};
+    use super::{
+        canonical_json, extract_package, inspect_package, package_file_limit, HostEnvironment,
+        MAX_FILE_BYTES, MAX_NATIVE_FILE_BYTES,
+    };
 
     const TEST_KEY_SEED: [u8; 32] = [
         0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
         0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
         0x7f, 0x60,
     ];
+
+    #[test]
+    fn larger_file_limit_is_scoped_to_native_service_payloads() {
+        assert_eq!(package_file_limit("native/aria2c", true), MAX_NATIVE_FILE_BYTES);
+        assert_eq!(package_file_limit("native/aria2c", false), MAX_FILE_BYTES);
+        assert_eq!(package_file_limit("ui/large.bin", true), MAX_FILE_BYTES);
+    }
 
     fn sha256(bytes: &[u8]) -> String {
         hex::encode(Sha256::digest(bytes))
@@ -578,6 +695,24 @@ mod tests {
         version: &str,
         permissions_json: &str,
     ) -> (tempfile::TempDir, std::path::PathBuf, SigningKey) {
+        package_with_index_host_api(
+            archived_index,
+            hashed_index,
+            app_id,
+            version,
+            permissions_json,
+            1,
+        )
+    }
+
+    fn package_with_index_host_api(
+        archived_index: &[u8],
+        hashed_index: &[u8],
+        app_id: &str,
+        version: &str,
+        permissions_json: &str,
+        host_api_major: u64,
+    ) -> (tempfile::TempDir, std::path::PathBuf, SigningKey) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("codec.atpkg");
         let signing_key = SigningKey::from_bytes(&TEST_KEY_SEED);
@@ -586,7 +721,7 @@ mod tests {
             concat!(
                 "{{\"appId\":\"{}\",",
                 "\"files\":{{\"LICENSE\":\"{}\",\"ui/index.html\":\"{}\"}},",
-                "\"hostApi\":{{\"max\":\"1.x\",\"min\":\"1.0.0\"}},",
+                "\"hostApi\":{{\"max\":\"{}.x\",\"min\":\"{}.0.0\"}},",
                 "\"name\":\"编码转换\",",
                 "\"permissions\":{},",
                 "\"publisher\":{{\"id\":\"com.attson\",\"keyId\":\"attool-p0-test\",\"name\":\"Attson\"}},",
@@ -598,6 +733,8 @@ mod tests {
             app_id,
             sha256(license),
             sha256(hashed_index),
+            host_api_major,
+            host_api_major,
             permissions_json,
             std::env::consts::ARCH,
             std::env::consts::OS,
@@ -691,6 +828,64 @@ mod tests {
         (directory, path, signing_key)
     }
 
+    fn clipboard_package(
+        lifecycle: &str,
+        windows: serde_json::Value,
+        permissions: serde_json::Value,
+    ) -> (tempfile::TempDir, std::path::PathBuf, SigningKey) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("clipboard.atpkg");
+        let signing_key = SigningKey::from_bytes(&TEST_KEY_SEED);
+        let index = b"<!doctype html><title>Clipboard</title>";
+        let history = b"<!doctype html><title>History</title>";
+        let preview = b"<!doctype html><title>Preview</title>";
+        let service = b"clipboard-service";
+        let service_hash = sha256(service);
+        let manifest = serde_json::json!({
+            "appId": "com.attson.clipboard",
+            "files": {
+                "native/atclipboard-service": service_hash,
+                "ui/history.html": sha256(history),
+                "ui/index.html": sha256(index),
+                "ui/preview.html": sha256(preview)
+            },
+            "hostApi": { "max": "2.x", "min": "2.0.0" },
+            "name": "Clipboard",
+            "nativeService": {
+                "entry": "native/atclipboard-service",
+                "lifecycle": lifecycle,
+                "protocolVersion": 1,
+                "sha256": service_hash,
+                "version": "0.1.0-alpha.0"
+            },
+            "permissions": permissions,
+            "publisher": { "id": "com.attson", "keyId": "attool-p0-test", "name": "Attson" },
+            "schemaVersion": 1,
+            "target": { "arch": std::env::consts::ARCH, "os": std::env::consts::OS },
+            "ui": { "entry": "ui/index.html", "windows": windows },
+            "version": "0.1.0-alpha.0"
+        });
+        let manifest = canonical_json(&manifest).unwrap();
+        let signature = base64::engine::general_purpose::STANDARD
+            .encode(signing_key.sign(manifest.as_bytes()).to_bytes());
+        let file = File::create(&path).unwrap();
+        let mut archive = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        for (name, bytes) in [
+            ("manifest.json", manifest.as_bytes()),
+            ("manifest.sig", signature.as_bytes()),
+            ("ui/index.html", index.as_slice()),
+            ("ui/history.html", history.as_slice()),
+            ("ui/preview.html", preview.as_slice()),
+            ("native/atclipboard-service", service.as_slice()),
+        ] {
+            archive.start_file(name, options).unwrap();
+            archive.write_all(bytes).unwrap();
+        }
+        archive.finish().unwrap();
+        (directory, path, signing_key)
+    }
+
     #[test]
     fn inspects_a_valid_signed_package() {
         let (_directory, path, signing_key) = valid_package();
@@ -723,6 +918,183 @@ mod tests {
         assert_eq!(service.version, package.version);
         assert_eq!(service.protocol_version, 1);
         assert_eq!(service.sha256, package.files["native/athttp-service"]);
+    }
+
+    #[test]
+    fn accepts_download_permissions_for_a_host_api_two_native_service() {
+        let (_directory, path, signing_key) = native_service_package(
+            "0.1.0-alpha.0",
+            1,
+            None,
+            "2.0.0",
+            serde_json::json!(["host.download.tasks"]),
+        );
+        let keys = HashMap::from([("attool-p0-test".to_string(), signing_key.verifying_key())]);
+
+        let package = inspect_package(&path, &HostEnvironment::current("2.0.0"), &keys).unwrap();
+
+        assert_eq!(package.permissions, ["host.download.tasks"]);
+    }
+
+    #[test]
+    fn accepts_template_permissions_for_a_host_api_two_native_service() {
+        let (_directory, path, signing_key) = native_service_package(
+            "0.1.0-alpha.0",
+            1,
+            None,
+            "2.0.0",
+            serde_json::json!(["host.template.project"]),
+        );
+        let keys = HashMap::from([("attool-p0-test".to_string(), signing_key.verifying_key())]);
+
+        let package = inspect_package(&path, &HostEnvironment::current("2.0.0"), &keys).unwrap();
+
+        assert_eq!(package.permissions, ["host.template.project"]);
+    }
+
+    #[test]
+    fn inspects_background_service_and_signed_auxiliary_windows() {
+        let (_directory, path, signing_key) = clipboard_package(
+            "background",
+            serde_json::json!({
+                "history": { "entry": "ui/history.html", "presentation": "bottomPanel" },
+                "preview": { "entry": "ui/preview.html", "presentation": "centeredDialog" }
+            }),
+            serde_json::json!(["host.ui.auxiliary", "host.clipboard.history"]),
+        );
+        let keys = HashMap::from([("attool-p0-test".to_string(), signing_key.verifying_key())]);
+
+        let package = inspect_package(&path, &HostEnvironment::current("2.0.0"), &keys).unwrap();
+
+        assert_eq!(package.native_service.unwrap().lifecycle, "background");
+        assert_eq!(package.windows["history"].entry, "ui/history.html");
+        assert_eq!(package.windows["history"].presentation, "bottomPanel");
+        assert_eq!(package.windows["preview"].presentation, "centeredDialog");
+        assert_eq!(
+            package.permissions,
+            ["host.ui.auxiliary", "host.clipboard.history"]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_auxiliary_window_declarations() {
+        for windows in [
+            serde_json::json!({
+                "History": { "entry": "ui/history.html", "presentation": "bottomPanel" }
+            }),
+            serde_json::json!({
+                "history": { "entry": "ui/history.html", "presentation": "floating" }
+            }),
+            serde_json::json!({
+                "history": { "entry": "ui/unsigned.html", "presentation": "bottomPanel" }
+            }),
+            serde_json::json!({
+                "one": { "entry": "ui/history.html", "presentation": "bottomPanel" },
+                "two": { "entry": "ui/history.html", "presentation": "bottomPanel" },
+                "three": { "entry": "ui/history.html", "presentation": "bottomPanel" },
+                "four": { "entry": "ui/history.html", "presentation": "bottomPanel" },
+                "five": { "entry": "ui/history.html", "presentation": "bottomPanel" }
+            }),
+        ] {
+            let (_directory, path, signing_key) = clipboard_package(
+                "background",
+                windows,
+                serde_json::json!(["host.ui.auxiliary", "host.clipboard.history"]),
+            );
+            let keys = HashMap::from([("attool-p0-test".to_string(), signing_key.verifying_key())]);
+
+            let error = inspect_package(&path, &HostEnvironment::current("2.0.0"), &keys)
+                .expect_err("invalid auxiliary windows must be rejected");
+
+            assert_eq!(error.code, "PLUGIN_UI_WINDOW_INVALID");
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_auxiliary_window_ids_in_the_manifest_json() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("duplicate-window.atpkg");
+        let signing_key = SigningKey::from_bytes(&TEST_KEY_SEED);
+        let index = b"<!doctype html><title>Clipboard</title>";
+        let history = b"<!doctype html><title>History</title>";
+        let preview = b"<!doctype html><title>Preview</title>";
+        let manifest = format!(
+            concat!(
+                "{{\"appId\":\"com.attson.clipboard\",",
+                "\"files\":{{\"ui/history.html\":\"{}\",\"ui/index.html\":\"{}\",\"ui/preview.html\":\"{}\"}},",
+                "\"hostApi\":{{\"max\":\"1.x\",\"min\":\"1.0.0\"}},",
+                "\"name\":\"Clipboard\",",
+                "\"permissions\":[\"host.theme.read\"],",
+                "\"publisher\":{{\"id\":\"com.attson\",\"keyId\":\"attool-p0-test\",\"name\":\"Attson\"}},",
+                "\"schemaVersion\":1,",
+                "\"target\":{{\"arch\":\"{}\",\"os\":\"{}\"}},",
+                "\"ui\":{{\"entry\":\"ui/index.html\",\"windows\":{{",
+                "\"history\":{{\"entry\":\"ui/history.html\",\"presentation\":\"bottomPanel\"}},",
+                "\"history\":{{\"entry\":\"ui/preview.html\",\"presentation\":\"centeredDialog\"}}",
+                "}}}},",
+                "\"version\":\"0.1.0-alpha.0\"}}"
+            ),
+            sha256(history),
+            sha256(index),
+            sha256(preview),
+            std::env::consts::ARCH,
+            std::env::consts::OS
+        );
+        let manifest_value: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+        let canonical = canonical_json(&manifest_value).unwrap();
+        let signature = base64::engine::general_purpose::STANDARD
+            .encode(signing_key.sign(canonical.as_bytes()).to_bytes());
+        let file = File::create(&path).unwrap();
+        let mut archive = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        for (name, bytes) in [
+            ("manifest.json", manifest.as_bytes()),
+            ("manifest.sig", signature.as_bytes()),
+            ("ui/index.html", index.as_slice()),
+            ("ui/history.html", history.as_slice()),
+            ("ui/preview.html", preview.as_slice()),
+        ] {
+            archive.start_file(name, options).unwrap();
+            archive.write_all(bytes).unwrap();
+        }
+        archive.finish().unwrap();
+        let keys = HashMap::from([("attool-p0-test".to_string(), signing_key.verifying_key())]);
+
+        let error = inspect_package(&path, &HostEnvironment::current("2.0.0"), &keys)
+            .expect_err("duplicate auxiliary window IDs must be rejected");
+
+        assert_eq!(error.code, "PLUGIN_MANIFEST_INVALID");
+        assert!(error.message.contains("duplicate window ID"));
+    }
+
+    #[test]
+    fn rejects_background_lifecycle_without_a_native_domain_permission() {
+        for (lifecycle, permissions, expected_code) in [
+            (
+                "always",
+                serde_json::json!(["host.ui.auxiliary", "host.clipboard.history"]),
+                "PLUGIN_NATIVE_SERVICE_INVALID",
+            ),
+            (
+                "background",
+                serde_json::json!(["host.ui.auxiliary"]),
+                "PLUGIN_NATIVE_SERVICE_REQUIRED",
+            ),
+        ] {
+            let (_directory, path, signing_key) = clipboard_package(
+                lifecycle,
+                serde_json::json!({
+                    "history": { "entry": "ui/history.html", "presentation": "bottomPanel" }
+                }),
+                permissions,
+            );
+            let keys = HashMap::from([("attool-p0-test".to_string(), signing_key.verifying_key())]);
+
+            let error = inspect_package(&path, &HostEnvironment::current("2.0.0"), &keys)
+                .expect_err("invalid background lifecycle must be rejected");
+
+            assert_eq!(error.code, expected_code);
+        }
     }
 
     #[test]
@@ -762,6 +1134,25 @@ mod tests {
 
         let error = inspect_package(&path, &HostEnvironment::current("2.0.0"), &keys)
             .expect_err("HTTP Host permissions require a signed native service");
+
+        assert_eq!(error.code, "PLUGIN_NATIVE_SERVICE_REQUIRED");
+    }
+
+    #[test]
+    fn rejects_host_api_two_without_a_native_service_like_the_sdk() {
+        let index = b"<!doctype html><title>Codec</title>";
+        let (_directory, path, signing_key) = package_with_index_host_api(
+            index,
+            index,
+            "com.attson.codec",
+            "0.1.0-alpha.0",
+            "[\"host.theme.read\"]",
+            2,
+        );
+        let keys = HashMap::from([("attool-p0-test".to_string(), signing_key.verifying_key())]);
+
+        let error = inspect_package(&path, &HostEnvironment::current("2.0.0"), &keys)
+            .expect_err("Host API 2 packages require a signed native service");
 
         assert_eq!(error.code, "PLUGIN_NATIVE_SERVICE_REQUIRED");
     }

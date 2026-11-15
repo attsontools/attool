@@ -3,6 +3,12 @@ export interface NativeService {
   version: string;
   sha256: string;
   protocolVersion: number;
+  lifecycle: 'onDemand' | 'background';
+}
+
+export interface PluginAuxiliaryWindow {
+  entry: string;
+  presentation: 'bottomPanel' | 'centeredDialog';
 }
 
 export interface InspectedPluginPackage {
@@ -17,6 +23,7 @@ export interface InspectedPluginPackage {
   hostApiMin: string;
   hostApiMax: string;
   entry: string;
+  windows: Record<string, PluginAuxiliaryWindow>;
   permissions: string[];
   nativeService?: NativeService | null;
   files: Record<string, string>;
@@ -30,10 +37,20 @@ export interface InstalledPlugin {
   publisherName: string;
   publisherKeyId: string;
   entry: string;
+  windows: Record<string, PluginAuxiliaryWindow>;
   permissions: string[];
   nativeService?: NativeService | null;
   enabled: boolean;
   installedAt: string;
+}
+
+export interface NativeServiceStatus {
+  appId: string;
+  state: 'connecting' | 'connected' | 'unavailable' | 'disconnected';
+  errorCode: string | null;
+  message: string | null;
+  correlationId: string | null;
+  updatedAt: number;
 }
 
 export type CatalogTargetOs = 'macos' | 'windows' | 'linux';
@@ -124,6 +141,7 @@ export interface PluginOperationSnapshot {
   publisherName: string;
   publisherKeyId: string;
   entry: string | null;
+  windows: Record<string, PluginAuxiliaryWindow>;
   permissions: string[];
   nativeService: NativeService | null;
   stage: PluginOperationStage;
@@ -144,6 +162,8 @@ export interface PluginApi {
   inspectPackage(path: string): Promise<InspectedPluginPackage>;
   installPackage(path: string): Promise<InstalledPlugin>;
   listInstalled(): Promise<InstalledPlugin[]>;
+  listNativeServiceStatuses(): Promise<NativeServiceStatus[]>;
+  listenNativeServiceStatuses(listener: (status: NativeServiceStatus) => void): Promise<() => void>;
   listHistory(): Promise<PluginHistoryRecord[]>;
   listCatalog(): Promise<CatalogSnapshot | null>;
   refreshCatalog(): Promise<CatalogSnapshot>;

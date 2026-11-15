@@ -3,6 +3,43 @@ import type { InstalledPlugin } from './types';
 type ApiVersion = '1.0' | '2.0';
 const LEGACY_MAX_MESSAGE_BYTES = 1024 * 1024;
 const HTTP_MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
+const AUXILIARY_PAYLOAD_MAX_BYTES = 64 * 1024;
+const CLIPBOARD_PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
+const CLIPBOARD_LIST_MAX_ITEMS = 100;
+const DOWNLOAD_TASK_METHODS = new Set([
+  'download.defaultDirectory',
+  'download.tasks.list',
+  'download.tasks.start',
+  'download.tasks.cancel',
+  'download.tasks.openFolder',
+  'download.tasks.clearCompleted',
+  'download.tasks.delete'
+]);
+const TEMPLATE_PROJECT_METHODS = new Set([
+  'template.templates.list',
+  'template.templates.load',
+  'template.templates.save',
+  'template.templates.rename',
+  'template.templates.delete',
+  'template.psd.import',
+  'template.assets.import',
+  'template.assets.save',
+  'template.assets.list',
+  'template.assets.delete',
+  'template.batch.sources.register',
+  'template.batch.run',
+  'template.batch.save'
+]);
+const CLIPBOARD_HISTORY_METHODS = new Set([
+  'clipboard.history.list',
+  'clipboard.history.get',
+  'clipboard.history.pin',
+  'clipboard.history.delete',
+  'clipboard.history.clearUnpinned',
+  'clipboard.history.restore',
+  'clipboard.settings.get',
+  'clipboard.settings.update'
+]);
 
 type RpcBase = {
   jsonrpc: '2.0';
@@ -50,25 +87,47 @@ export interface HostFileSaveRequest {
   encoding: 'utf8' | 'base64';
 }
 
+export interface HostTemplateFilePickRequest {
+  kind: 'psd' | 'image';
+  multiple: boolean;
+}
+
+export interface HostSelectedPath {
+  path: string;
+  name: string;
+}
+
+export interface HostUiOpenRequest {
+  windowId: string;
+  payload: unknown;
+}
+
 export interface PluginHostSession {
   readonly sessionId: string;
   readonly correlationId: string;
   notifyTheme(theme: 'dark' | 'light'): void;
-  notifyHttpEvent(event: unknown): void;
+  notifyNativeServiceEvent(event: unknown): void;
+  notifyActivated(payload: unknown): void;
   terminate(): void;
 }
 
 type SessionOptions = {
   app: InstalledPlugin;
   port: HostMessagePort;
+  windowId?: string;
   sessionId?: string;
   correlationId?: string;
   theme(): 'dark' | 'light';
   notify(input: { title?: string; message: string; kind: 'info' | 'success' | 'warning' | 'error' }): Promise<void>;
   saveFile(input: HostFileSaveRequest): Promise<{ cancelled: boolean; path?: string }>;
   pickFile?(): Promise<{ path: string; name: string } | null>;
+  pickDirectory?(defaultPath?: string): Promise<string | null>;
+  pickTemplateFiles?(input: HostTemplateFilePickRequest): Promise<HostSelectedPath[] | null>;
+  pickTemplateDirectory?(): Promise<HostSelectedPath | null>;
   copyText?(text: string): Promise<void>;
-  requestHttpService?(method: string, params: unknown): Promise<unknown>;
+  requestNativeService?(method: string, params: unknown): Promise<unknown>;
+  openAuxiliaryWindow?(input: HostUiOpenRequest): Promise<unknown>;
+  closeAuxiliaryWindow?(): Promise<void>;
   onHandshake?(): void;
   maxMessageBytes?: number;
 };
@@ -91,6 +150,11 @@ export function createPluginHostSession(options: SessionOptions): PluginHostSess
   const correlationId = options.correlationId ?? crypto.randomUUID();
   const cancelled = new Set<string>();
   const selectedFiles = new Map<string, string>();
+  const templateSelections = new Map<
+    string,
+    HostSelectedPath & { kind: HostTemplateFilePickRequest['kind'] | 'directory' }
+  >();
+  const consumedTemplateTokens = new Set<string>();
   let handshaken = false;
   let terminated = false;
 
@@ -223,6 +287,19 @@ export function createPluginHostSession(options: SessionOptions): PluginHostSess
         await options.copyText(text);
         return { copied: true };
       }
+      case 'host.download.pickDirectory': {
+        requirePermission('host.download.tasks');
+        if (!options.pickDirectory) {
+          throw new RpcDispatchError(
+            'HOST_DIRECTORY_PICK_UNAVAILABLE',
+            'Directory selection is unavailable'
+          );
+        }
+        const params = asRecord(request.params);
+        const defaultPath = optionalString(params.defaultPath, 'defaultPath', 4096);
+        const path = await options.pickDirectory(defaultPath);
+        return path ? { cancelled: false, path } : { cancelled: true };
+      }
       case 'host.http.request':
         return dispatchHttpRequest(request, 'host.http.request', (method) =>
           method === 'http.send' || method === 'http.cancel'
@@ -236,6 +313,98 @@ export function createPluginHostSession(options: SessionOptions): PluginHostSess
         );
       case 'host.http.data':
         return dispatchHttpRequest(request, 'host.http.data', (method) => method.startsWith('data.'));
+      case 'host.download.tasks':
+        return dispatchDownloadRequest(request);
+      case 'host.ui.open': {
+        requirePermission('host.ui.auxiliary');
+        const params = asRecord(request.params);
+        const windowId = requiredString(params.windowId, 'windowId', 64);
+        if (!Object.prototype.hasOwnProperty.call(options.app.windows, windowId)) {
+          throw new RpcDispatchError(
+            'HOST_UI_WINDOW_NOT_DECLARED',
+            'Auxiliary window is not declared by this application',
+            -32003
+          );
+        }
+        const payload = Object.prototype.hasOwnProperty.call(params, 'payload')
+          ? params.payload
+          : {};
+        if (messageBytes(payload) > AUXILIARY_PAYLOAD_MAX_BYTES) {
+          throw new RpcDispatchError(
+            'HOST_UI_PAYLOAD_TOO_LARGE',
+            'Auxiliary window payload is too large',
+            -32002
+          );
+        }
+        if (!options.openAuxiliaryWindow) {
+          throw new RpcDispatchError('HOST_UI_UNAVAILABLE', 'Auxiliary windows are unavailable');
+        }
+        return options.openAuxiliaryWindow({ windowId, payload });
+      }
+      case 'host.ui.close': {
+        requirePermission('host.ui.auxiliary');
+        if (!options.windowId || !options.closeAuxiliaryWindow) {
+          throw new RpcDispatchError(
+            'HOST_UI_UNAVAILABLE',
+            'The current Host session is not an auxiliary window'
+          );
+        }
+        await options.closeAuxiliaryWindow();
+        return { closed: true };
+      }
+      case 'host.clipboard.history':
+        return dispatchClipboardRequest(request);
+      case 'host.template.pickFiles': {
+        requirePermission('host.template.project');
+        if (!options.pickTemplateFiles) {
+          throw new RpcDispatchError(
+            'HOST_TEMPLATE_FILE_PICK_UNAVAILABLE',
+            'Template file selection is unavailable'
+          );
+        }
+        const params = asRecord(request.params);
+        const kind = params.kind;
+        if (kind !== 'psd' && kind !== 'image') throw invalidParams('kind');
+        const multiple = requiredBoolean(params.multiple, 'multiple');
+        if (kind === 'psd' && multiple) throw invalidParams('multiple');
+        const selected = await options.pickTemplateFiles({ kind, multiple });
+        if (!selected?.length) return { cancelled: true, files: [] };
+        if (
+          (kind === 'psd' && selected.length !== 1)
+          || selected.some((file) => !templateFileMatchesKind(file.path, kind))
+        ) {
+          throw new RpcDispatchError(
+            'HOST_TEMPLATE_FILE_TYPE_INVALID',
+            'Selected template file type is not allowed',
+            -32003
+          );
+        }
+        return {
+          cancelled: false,
+          files: selected.map((file) => {
+            const token = `host-template-file:${crypto.randomUUID()}`;
+            templateSelections.set(token, { ...file, kind });
+            return { token, name: file.name };
+          })
+        };
+      }
+      case 'host.template.pickDirectory': {
+        requirePermission('host.template.project');
+        if (!options.pickTemplateDirectory) {
+          throw new RpcDispatchError(
+            'HOST_TEMPLATE_DIRECTORY_PICK_UNAVAILABLE',
+            'Template directory selection is unavailable'
+          );
+        }
+        asRecord(request.params);
+        const selected = await options.pickTemplateDirectory();
+        if (!selected) return { cancelled: true };
+        const token = `host-template-directory:${crypto.randomUUID()}`;
+        templateSelections.set(token, { ...selected, kind: 'directory' });
+        return { cancelled: false, token, name: selected.name };
+      }
+      case 'host.template.project':
+        return dispatchTemplateRequest(request);
       default:
         throw new RpcDispatchError('HOST_METHOD_NOT_FOUND', 'Host API method was not found', -32601);
     }
@@ -247,8 +416,8 @@ export function createPluginHostSession(options: SessionOptions): PluginHostSess
     allows: (method: string) => boolean
   ) {
     requirePermission(permission);
-    if (!options.requestHttpService) {
-      throw new RpcDispatchError('HTTP_SERVICE_NOT_CONNECTED', 'HTTP service is unavailable');
+    if (!options.requestNativeService) {
+      throw new RpcDispatchError('NATIVE_SERVICE_NOT_CONNECTED', 'Native service is unavailable');
     }
     const params = asRecord(request.params);
     const method = requiredString(params.method, 'method', 128);
@@ -261,13 +430,111 @@ export function createPluginHostSession(options: SessionOptions): PluginHostSess
     }
     if (!Object.prototype.hasOwnProperty.call(params, 'params')) throw invalidParams('params');
     try {
-      return await options.requestHttpService(
+      return await options.requestNativeService(
         method,
         method === 'http.send' ? resolveSelectedFiles(params.params, selectedFiles) : params.params
       );
     } catch (reason) {
       throw serviceError(reason);
     }
+  }
+
+  async function dispatchDownloadRequest(request: RpcRequest) {
+    requirePermission('host.download.tasks');
+    if (!options.requestNativeService) {
+      throw new RpcDispatchError('NATIVE_SERVICE_NOT_CONNECTED', 'Native service is unavailable');
+    }
+    const params = asRecord(request.params);
+    const method = requiredString(params.method, 'method', 128);
+    if (!DOWNLOAD_TASK_METHODS.has(method)) {
+      throw new RpcDispatchError(
+        'HOST_DOWNLOAD_METHOD_DENIED',
+        'Download service method is not allowed for host.download.tasks',
+        -32003
+      );
+    }
+    if (!Object.prototype.hasOwnProperty.call(params, 'params')) throw invalidParams('params');
+    try {
+      return await options.requestNativeService(method, params.params);
+    } catch (reason) {
+      throw serviceError(reason);
+    }
+  }
+
+  async function dispatchClipboardRequest(request: RpcRequest) {
+    requirePermission('host.clipboard.history');
+    if (!options.requestNativeService) {
+      throw new RpcDispatchError('NATIVE_SERVICE_NOT_CONNECTED', 'Native service is unavailable');
+    }
+    const params = asRecord(request.params);
+    const method = requiredString(params.method, 'method', 128);
+    if (!CLIPBOARD_HISTORY_METHODS.has(method)) {
+      throw new RpcDispatchError(
+        'HOST_CLIPBOARD_METHOD_DENIED',
+        'Clipboard service method is not allowed for host.clipboard.history',
+        -32003
+      );
+    }
+    if (!Object.prototype.hasOwnProperty.call(params, 'params')) throw invalidParams('params');
+    try {
+      const serviceParams = validateClipboardParams(method, params.params);
+      const result = await options.requestNativeService(method, serviceParams);
+      assertClipboardResult(method, result);
+      return result;
+    } catch (reason) {
+      throw reason instanceof RpcDispatchError ? reason : serviceError(reason);
+    }
+  }
+
+  async function dispatchTemplateRequest(request: RpcRequest) {
+    requirePermission('host.template.project');
+    if (!options.requestNativeService) {
+      throw new RpcDispatchError('NATIVE_SERVICE_NOT_CONNECTED', 'Native service is unavailable');
+    }
+    const params = asRecord(request.params);
+    const method = requiredString(params.method, 'method', 128);
+    if (!TEMPLATE_PROJECT_METHODS.has(method)) {
+      throw new RpcDispatchError(
+        'HOST_TEMPLATE_METHOD_DENIED',
+        'Template service method is not allowed for host.template.project',
+        -32003
+      );
+    }
+    if (!Object.prototype.hasOwnProperty.call(params, 'params')) throw invalidParams('params');
+    try {
+      const serviceParams = resolveTemplateSelections(
+        method,
+        params.params,
+        templateSelections,
+        consumedTemplateTokens
+      );
+      const result = await options.requestNativeService(method, serviceParams);
+      if (method.startsWith('template.batch.')) {
+        assertTemplateResultHasNoPaths(result);
+      }
+      return result;
+    } catch (reason) {
+      throw reason instanceof RpcDispatchError ? reason : templateServiceError(reason);
+    }
+  }
+
+  function notifyNativeServiceEvent(event: unknown) {
+    if (!handshaken || terminated || apiVersion !== '2.0') return;
+    const method = nativeServiceEventMethod(event, options.app.permissions);
+    if (!method) return;
+    const params = method === 'host.clipboard.historyChanged'
+      ? {
+          type: 'clipboard.history.changed',
+          revision: (event as Record<string, unknown>).revision
+        }
+      : event;
+    post({
+      jsonrpc: '2.0',
+      apiVersion,
+      appId: options.app.appId,
+      method,
+      params
+    });
   }
 
   options.port.onmessage = (event) => {
@@ -334,19 +601,16 @@ export function createPluginHostSession(options: SessionOptions): PluginHostSess
         params: { theme }
       });
     },
-    notifyHttpEvent(event) {
-      if (
-        !handshaken
-        || terminated
-        || apiVersion !== '2.0'
-        || !options.app.permissions.includes('host.http.stream')
-      ) return;
+    notifyNativeServiceEvent,
+    notifyActivated(payload) {
+      if (!handshaken || terminated || !options.windowId) return;
+      if (messageBytes(payload) > AUXILIARY_PAYLOAD_MAX_BYTES) return;
       post({
         jsonrpc: '2.0',
         apiVersion,
         appId: options.app.appId,
-        method: 'host.http.streamEvent',
-        params: event
+        method: 'host.ui.activated',
+        params: { windowId: options.windowId, payload }
       });
     },
     terminate() {
@@ -354,10 +618,252 @@ export function createPluginHostSession(options: SessionOptions): PluginHostSess
       terminated = true;
       cancelled.clear();
       selectedFiles.clear();
+      templateSelections.clear();
+      consumedTemplateTokens.clear();
       options.port.onmessage = null;
       options.port.close();
     }
   };
+}
+
+function validateClipboardParams(method: string, value: unknown): unknown {
+  if (method !== 'clipboard.history.list') return value;
+  const params = asRecord(value);
+  if (
+    params.limit !== undefined
+    && (!Number.isSafeInteger(params.limit)
+      || (params.limit as number) < 1
+      || (params.limit as number) > CLIPBOARD_LIST_MAX_ITEMS)
+  ) {
+    throw invalidParams('params.limit');
+  }
+  return params;
+}
+
+function assertClipboardResult(method: string, value: unknown) {
+  if (method === 'clipboard.history.list') {
+    const items = Array.isArray(value)
+      ? value
+      : (typeof value === 'object' && value !== null && Array.isArray((value as { items?: unknown }).items)
+          ? (value as { items: unknown[] }).items
+          : null);
+    if (!items || items.length > CLIPBOARD_LIST_MAX_ITEMS) {
+      throw invalidClipboardResult();
+    }
+  }
+
+  const pending = [value];
+  while (pending.length) {
+    const current = pending.pop();
+    if (Array.isArray(current)) {
+      pending.push(...current);
+      continue;
+    }
+    if (typeof current !== 'object' || current === null) continue;
+    for (const [key, nested] of Object.entries(current)) {
+      const normalized = key.toLowerCase();
+      if (
+        normalized === 'assetpath'
+        || normalized === 'asseturl'
+        || normalized === 'databasepath'
+        || normalized === 'dbpath'
+        || normalized === 'cachepath'
+      ) {
+        throw invalidClipboardResult();
+      }
+      if (
+        normalized === 'previewdataurl'
+        && (typeof nested !== 'string'
+          || !/^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/]*={0,2}$/.test(nested)
+          || new TextEncoder().encode(nested).byteLength > CLIPBOARD_PREVIEW_MAX_BYTES)
+      ) {
+        throw invalidClipboardResult();
+      }
+      pending.push(nested);
+    }
+  }
+}
+
+function invalidClipboardResult() {
+  return new RpcDispatchError(
+    'HOST_CLIPBOARD_RESPONSE_INVALID',
+    'Clipboard service response violates the public data contract',
+    -32003
+  );
+}
+
+function assertTemplateResultHasNoPaths(value: unknown) {
+  const pending = [value];
+  while (pending.length) {
+    const current = pending.pop();
+    if (Array.isArray(current)) {
+      pending.push(...current);
+      continue;
+    }
+    if (typeof current === 'string') {
+      if (containsAbsolutePath(current)) {
+        throw new RpcDispatchError(
+          'HOST_TEMPLATE_PATH_EXPOSED',
+          'Template service responses must not expose local paths',
+          -32003
+        );
+      }
+      continue;
+    }
+    if (typeof current !== 'object' || current === null) continue;
+    for (const [key, nested] of Object.entries(current)) {
+      const normalized = key.toLowerCase();
+      if (normalized === 'path' || normalized.endsWith('path') || normalized === 'targetdirectory') {
+        throw new RpcDispatchError(
+          'HOST_TEMPLATE_PATH_EXPOSED',
+          'Template service responses must not expose local paths',
+          -32003
+        );
+      }
+      pending.push(nested);
+    }
+  }
+}
+
+function containsAbsolutePath(value: string): boolean {
+  return /file:\/\//i.test(value)
+    || /(?:^|[\s"'(=])\/(?!\/)/.test(value)
+    || /(?:^|[\s"'(=])[A-Za-z]:[\\/]/.test(value)
+    || /(?:^|[\s"'(=])\\\\[^\\]/.test(value);
+}
+
+function templateFileMatchesKind(
+  path: string,
+  kind: HostTemplateFilePickRequest['kind']
+): boolean {
+  const fileName = path.split(/[\\/]/).pop()?.toLowerCase() ?? '';
+  return kind === 'psd'
+    ? fileName.endsWith('.psd')
+    : ['.png', '.jpg', '.jpeg', '.webp'].some((extension) => fileName.endsWith(extension));
+}
+
+function resolveTemplateSelections(
+  method: string,
+  value: unknown,
+  selections: Map<
+    string,
+    HostSelectedPath & { kind: HostTemplateFilePickRequest['kind'] | 'directory' }
+  >,
+  consumed: Set<string>
+): Record<string, unknown> {
+  const params = asRecord(value);
+  if (method === 'template.psd.import' || method === 'template.assets.import') {
+    const token = requiredString(params.fileToken, 'params.fileToken', 256);
+    const expected = method === 'template.psd.import' ? 'psd' : 'image';
+    const selected = consumeTemplateSelection(token, expected, selections, consumed);
+    const { fileToken: _, ...rest } = params;
+    return { ...rest, sourcePath: selected.path };
+  }
+  if (method === 'template.batch.sources.register') {
+    if (!Array.isArray(params.fileTokens) || params.fileTokens.length === 0) {
+      throw invalidParams('params.fileTokens');
+    }
+    const tokens = params.fileTokens.map((token, index) =>
+      requiredString(token, `params.fileTokens[${index}]`, 256)
+    );
+    if (new Set(tokens).size !== tokens.length) throw invalidParams('params.fileTokens');
+    const selected = tokens.map((token) =>
+      inspectTemplateSelection(token, 'image', selections, consumed)
+    );
+    for (const token of tokens) {
+      selections.delete(token);
+      consumed.add(token);
+    }
+    const { fileTokens: _, ...rest } = params;
+    return { ...rest, sourcePaths: selected.map((file) => file.path) };
+  }
+  if (method === 'template.batch.save') {
+    const token = requiredString(params.directoryToken, 'params.directoryToken', 256);
+    const selected = consumeTemplateSelection(token, 'directory', selections, consumed);
+    const { directoryToken: _, ...rest } = params;
+    return { ...rest, targetDirectory: selected.path };
+  }
+  return params;
+}
+
+function inspectTemplateSelection(
+  token: string,
+  expected: HostTemplateFilePickRequest['kind'] | 'directory',
+  selections: Map<
+    string,
+    HostSelectedPath & { kind: HostTemplateFilePickRequest['kind'] | 'directory' }
+  >,
+  consumed: Set<string>
+) {
+  if (consumed.has(token)) {
+    throw new RpcDispatchError(
+      'HOST_TEMPLATE_TOKEN_CONSUMED',
+      'Template selection token has already been consumed',
+      -32003
+    );
+  }
+  const selected = selections.get(token);
+  if (!selected) {
+    throw new RpcDispatchError(
+      'HOST_TEMPLATE_TOKEN_REQUIRED',
+      'Template files and directories must be selected through the host',
+      -32003
+    );
+  }
+  if (selected.kind !== expected) {
+    throw new RpcDispatchError(
+      'HOST_TEMPLATE_TOKEN_TYPE_MISMATCH',
+      'Template selection token has the wrong type',
+      -32003
+    );
+  }
+  return selected;
+}
+
+function consumeTemplateSelection(
+  token: string,
+  expected: HostTemplateFilePickRequest['kind'] | 'directory',
+  selections: Map<
+    string,
+    HostSelectedPath & { kind: HostTemplateFilePickRequest['kind'] | 'directory' }
+  >,
+  consumed: Set<string>
+) {
+  const selected = inspectTemplateSelection(token, expected, selections, consumed);
+  selections.delete(token);
+  consumed.add(token);
+  return selected;
+}
+
+function nativeServiceEventMethod(event: unknown, permissions: string[]): string | null {
+  if (typeof event !== 'object' || event === null || Array.isArray(event)) return null;
+  const payload = event as Record<string, unknown>;
+  if (
+    permissions.includes('host.http.stream')
+    && typeof payload.sessionId === 'string'
+    && Number.isSafeInteger(payload.generation)
+    && Object.prototype.hasOwnProperty.call(payload, 'message')
+  ) {
+    return 'host.http.streamEvent';
+  }
+  if (
+    permissions.includes('host.download.tasks')
+    && typeof payload.id === 'string'
+    && ['queued', 'running', 'completed', 'failed', 'cancelled'].includes(String(payload.status))
+    && typeof payload.progress === 'number'
+    && Number.isFinite(payload.progress)
+  ) {
+    return 'host.download.taskEvent';
+  }
+  if (
+    permissions.includes('host.clipboard.history')
+    && payload.type === 'clipboard.history.changed'
+    && Number.isSafeInteger(payload.revision)
+    && Number(payload.revision) >= 0
+  ) {
+    return 'host.clipboard.historyChanged';
+  }
+  return null;
 }
 
 function resolveSelectedFiles(value: unknown, selectedFiles: Map<string, string>): unknown {
@@ -420,6 +926,11 @@ function optionalString(value: unknown, field: string, maxLength: number): strin
   return value;
 }
 
+function requiredBoolean(value: unknown, field: string): boolean {
+  if (typeof value !== 'boolean') throw invalidParams(field);
+  return value;
+}
+
 function invalidParams(field: string) {
   return new RpcDispatchError('HOST_INVALID_PARAMS', `Invalid Host API parameter: ${field}`, -32602);
 }
@@ -432,5 +943,15 @@ function serviceError(reason: unknown) {
       return new RpcDispatchError(error.code, error.message);
     }
   }
-  return new RpcDispatchError('HTTP_SERVICE_REQUEST_FAILED', 'HTTP service request failed');
+  return new RpcDispatchError('NATIVE_SERVICE_REQUEST_FAILED', 'Native service request failed');
+}
+
+function templateServiceError(reason: unknown) {
+  if (typeof reason === 'object' && reason !== null) {
+    const error = reason as { code?: unknown };
+    if (typeof error.code === 'string' && /^[A-Z][A-Z0-9_]{0,127}$/.test(error.code)) {
+      return new RpcDispatchError(error.code, 'Template service request failed');
+    }
+  }
+  return new RpcDispatchError('NATIVE_SERVICE_REQUEST_FAILED', 'Template service request failed');
 }

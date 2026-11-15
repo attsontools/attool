@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash, generateKeyPairSync } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { readdirSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -35,9 +35,13 @@ const catalogKeyId = 'catalog-2026-01';
 const publisherKeyId = 'attson-codec-2026-01';
 const textPublisherKeyId = 'attson-text-2026-01';
 const httpPublisherKeyId = 'attson-http-2026-01';
+const aria2PublisherKeyId = 'attson-aria2-2026-01';
+const clipboardPublisherKeyId = 'attson-clipboard-2026-01';
 const codecApplication = await loadCatalogApplication('com.attson.codec');
 const textApplication = await loadCatalogApplication('com.attson.text');
 const httpApplication = await loadCatalogApplication('com.attson.http');
+const aria2Application = await loadCatalogApplication('com.attson.aria2');
+const clipboardApplication = await loadCatalogApplication('com.attson.clipboard');
 
 const root = {
   schemaVersion: 1,
@@ -51,7 +55,9 @@ const root = {
     keys: [
       trustKey(publisherKeyId),
       trustKey(textPublisherKeyId),
-      trustKey(httpPublisherKeyId)
+      trustKey(httpPublisherKeyId),
+      trustKey(aria2PublisherKeyId),
+      trustKey(clipboardPublisherKeyId)
     ]
   }]
 };
@@ -83,6 +89,18 @@ const previousCatalog = {
 };
 
 describe('Catalog release generation', () => {
+  it('pins the plugin SDK contract used by Catalog to an immutable commit', async () => {
+    const packageJson = JSON.parse(await readFile('package.json', 'utf8'));
+    const lockfile = await readFile('pnpm-lock.yaml', 'utf8');
+    const dependency = packageJson.devDependencies['@attson/plugin-sdk'];
+
+    assert.equal(
+      dependency,
+      'https://gh-proxy.com/https://github.com/attsontools/attool-plugin-sdk/archive/410158b5e850836d5db681b1a02b13e4d55d53d6.tar.gz'
+    );
+    assert.ok(lockfile.includes(dependency));
+  });
+
   it('loads JSON release policy by app ID and slug', async () => {
     const expected = {
       appId: 'com.attson.json',
@@ -181,6 +199,48 @@ describe('Catalog release generation', () => {
 
     assert.deepEqual(httpApplication, expected);
     assert.deepEqual(await loadCatalogApplicationBySlug('http'), expected);
+  });
+
+  it('loads Aria2 Host API 2.x release policy from the application registry', async () => {
+    const expected = {
+      appId: 'com.attson.aria2',
+      slug: 'aria2',
+      repository: 'attsontools/ataria2',
+      artifactPrefix: 'AT.Aria2',
+      name: 'Aria2 下载',
+      description: '多连接下载与任务历史',
+      publisherId: 'com.attson',
+      publisherKeySecret: 'ATARIA2_PUBLISHER_KEY_ID',
+      icon: 'download',
+      hostApi: { min: '2.0.0', max: '2.x' },
+      permissions: ['host.theme.read', 'host.download.tasks']
+    };
+
+    assert.deepEqual(await loadCatalogApplication('com.attson.aria2'), expected);
+    assert.deepEqual(await loadCatalogApplicationBySlug('aria2'), expected);
+  });
+
+  it('loads Clipboard Host API 2.x release policy from the application registry', async () => {
+    const expected = {
+      appId: 'com.attson.clipboard',
+      slug: 'clipboard',
+      repository: 'attsontools/atclipboard',
+      artifactPrefix: 'AT.Clipboard',
+      name: '剪贴板',
+      description: '后台剪贴板历史、快捷面板与内容恢复',
+      publisherId: 'com.attson',
+      publisherKeySecret: 'ATCLIPBOARD_PUBLISHER_KEY_ID',
+      icon: 'clipboard',
+      hostApi: { min: '2.0.0', max: '2.x' },
+      permissions: [
+        'host.theme.read',
+        'host.ui.auxiliary',
+        'host.clipboard.history'
+      ]
+    };
+
+    assert.deepEqual(clipboardApplication, expected);
+    assert.deepEqual(await loadCatalogApplicationBySlug('clipboard'), expected);
   });
 
   it('rejects ambiguous or out-of-scope application registry entries', async () => {
@@ -536,6 +596,188 @@ describe('Catalog release generation', () => {
     }
   });
 
+  it('requires the signed Clipboard service and auxiliary window layout', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'attool-clipboard-catalog-test-'));
+    const publisherKeys = generateKeyPairSync('ed25519');
+    const packageRoot = structuredClone(root);
+    packageRoot.publishers[0].keys[4].publicKey = rawPublicKey(publisherKeys.publicKey);
+    try {
+      const packagePath = await createPluginPackage(
+        directory,
+        publisherKeys.privateKey,
+        'linux',
+        'x86_64',
+        {
+          application: clipboardApplication,
+          publisherKeyId: clipboardPublisherKeyId
+        }
+      );
+      const inspected = await inspectPluginPackage({
+        packagePath,
+        application: clipboardApplication,
+        root: packageRoot,
+        publishedAt: generatedAt,
+        expectedVersion: version,
+        expectedPublisherKeyId: clipboardPublisherKeyId
+      });
+
+      assert.deepEqual(inspected.manifest.nativeService, {
+        entry: 'native/atclipboard-service',
+        version,
+        sha256: inspected.manifest.files['native/atclipboard-service'],
+        protocolVersion: 1,
+        lifecycle: 'background'
+      });
+      assert.deepEqual(inspected.manifest.ui.windows, {
+        history: { entry: 'ui/history.html', presentation: 'bottomPanel' },
+        preview: { entry: 'ui/preview.html', presentation: 'centeredDialog' }
+      });
+
+      const incompletePackage = await createPluginPackage(
+        directory,
+        publisherKeys.privateKey,
+        'linux',
+        'x86_64',
+        {
+          application: clipboardApplication,
+          publisherKeyId: clipboardPublisherKeyId,
+          omitFile: 'LICENSE'
+        }
+      );
+      await assert.rejects(
+        () => inspectPluginPackage({
+          packagePath: incompletePackage,
+          application: clipboardApplication,
+          root: packageRoot,
+          publishedAt: generatedAt,
+          expectedVersion: version,
+          expectedPublisherKeyId: clipboardPublisherKeyId
+        }),
+        /Clipboard package files/
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('requires the signed Aria2 service, runtime, and license layout', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'attool-aria2-catalog-test-'));
+    const publisherKeys = generateKeyPairSync('ed25519');
+    const packageRoot = structuredClone(root);
+    packageRoot.publishers[0].keys[3].publicKey = rawPublicKey(publisherKeys.publicKey);
+    try {
+      const packagePath = await createPluginPackage(
+        directory,
+        publisherKeys.privateKey,
+        'linux',
+        'x86_64',
+        {
+          application: aria2Application,
+          publisherKeyId: aria2PublisherKeyId
+        }
+      );
+      const inspected = await inspectPluginPackage({
+        packagePath,
+        application: aria2Application,
+        root: packageRoot,
+        publishedAt: generatedAt,
+        expectedVersion: version,
+        expectedPublisherKeyId: aria2PublisherKeyId
+      });
+
+      assert.equal(inspected.manifest.nativeService.entry, 'native/ataria2-service');
+      assert.deepEqual(Object.keys(inspected.manifest.files).sort(), [
+        'LICENSE',
+        'licenses/aria2-COPYING',
+        'native/aria2c',
+        'native/ataria2-service',
+        'ui/assets/app.js',
+        'ui/index.html'
+      ]);
+
+      const incompletePackage = await createPluginPackage(
+        directory,
+        publisherKeys.privateKey,
+        'linux',
+        'x86_64',
+        {
+          application: aria2Application,
+          publisherKeyId: aria2PublisherKeyId,
+          omitFile: 'licenses/aria2-COPYING'
+        }
+      );
+      await assert.rejects(
+        () => inspectPluginPackage({
+          packagePath: incompletePackage,
+          application: aria2Application,
+          root: packageRoot,
+          publishedAt: generatedAt,
+          expectedVersion: version,
+          expectedPublisherKeyId: aria2PublisherKeyId
+        }),
+        /Aria2 package files/
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('requires Windows Aria2 executables and the OpenSSL notice', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'attool-aria2-windows-catalog-test-'));
+    const publisherKeys = generateKeyPairSync('ed25519');
+    const packageRoot = structuredClone(root);
+    packageRoot.publishers[0].keys[3].publicKey = rawPublicKey(publisherKeys.publicKey);
+    try {
+      const packagePath = await createPluginPackage(
+        directory,
+        publisherKeys.privateKey,
+        'windows',
+        'x86_64',
+        {
+          application: aria2Application,
+          publisherKeyId: aria2PublisherKeyId
+        }
+      );
+      const inspected = await inspectPluginPackage({
+        packagePath,
+        application: aria2Application,
+        root: packageRoot,
+        publishedAt: generatedAt,
+        expectedVersion: version,
+        expectedPublisherKeyId: aria2PublisherKeyId
+      });
+
+      assert.equal(inspected.manifest.nativeService.entry, 'native/ataria2-service.exe');
+      assert.ok(inspected.manifest.files['native/aria2c.exe']);
+      assert.ok(inspected.manifest.files['licenses/aria2-LICENSE.OpenSSL']);
+
+      const incompletePackage = await createPluginPackage(
+        directory,
+        publisherKeys.privateKey,
+        'windows',
+        'x86_64',
+        {
+          application: aria2Application,
+          publisherKeyId: aria2PublisherKeyId,
+          omitFile: 'licenses/aria2-LICENSE.OpenSSL'
+        }
+      );
+      await assert.rejects(
+        () => inspectPluginPackage({
+          packagePath: incompletePackage,
+          application: aria2Application,
+          root: packageRoot,
+          publishedAt: generatedAt,
+          expectedVersion: version,
+          expectedPublisherKeyId: aria2PublisherKeyId
+        }),
+        /Aria2 package files/
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it('verifies the offline Root and previous Catalog before publishing', () => {
     const rootKeys = generateKeyPairSync('ed25519');
     const catalogKeys = generateKeyPairSync('ed25519');
@@ -736,6 +978,8 @@ describe('Catalog release generation', () => {
     assert.match(workflow, /^\s+release_tag:\s*$/m);
     assert.match(workflow, /\.github\/catalog\/apps\.json/);
     assert.match(workflow, /--app "\$APP_ID"/);
+    assert.match(workflow, /https:\/\/gh-proxy\.com\/\$DOWNLOAD_URL/);
+    assert.doesNotMatch(workflow, /gh release download/);
     assert.doesNotMatch(workflow, /^\s+codec_tag:\s*$/m);
   });
 
@@ -842,10 +1086,12 @@ async function createPluginPackage(
   arch = 'x86_64',
   {
     application = codecApplication,
-    publisherKeyId: manifestPublisherKeyId = publisherKeyId
+    publisherKeyId: manifestPublisherKeyId = publisherKeyId,
+    omitFile
   } = {}
 ) {
   const stage = path.join(directory, 'stage');
+  await rm(stage, { recursive: true, force: true });
   const ui = path.join(stage, 'ui');
   await mkdir(ui, { recursive: true });
   const content = Buffer.from(`<main>${application.name}</main>`);
@@ -855,15 +1101,52 @@ async function createPluginPackage(
   if (application.hostApi.max === '2.x') {
     const native = path.join(stage, 'native');
     const service = Buffer.from(`service-${os}-${arch}-${version}`);
+    const serviceName = application.appId === 'com.attson.aria2'
+      ? `ataria2-service${os === 'windows' ? '.exe' : ''}`
+      : application.appId === 'com.attson.clipboard'
+        ? `atclipboard-service${os === 'windows' ? '.exe' : ''}`
+        : 'athttp-service';
     await mkdir(native, { recursive: true });
-    await writeFile(path.join(native, 'athttp-service'), service);
-    files['native/athttp-service'] = createHash('sha256').update(service).digest('hex');
+    await writeFile(path.join(native, serviceName), service);
+    files[`native/${serviceName}`] = createHash('sha256').update(service).digest('hex');
     nativeService = {
-      entry: 'native/athttp-service',
+      entry: `native/${serviceName}`,
       version,
-      sha256: files['native/athttp-service'],
-      protocolVersion: 1
+      sha256: files[`native/${serviceName}`],
+      protocolVersion: 1,
+      ...(application.appId === 'com.attson.clipboard' ? { lifecycle: 'background' } : {})
     };
+  }
+  if (application.appId === 'com.attson.aria2') {
+    const payloads = {
+      LICENSE: Buffer.from('AT Aria2 license fixture'),
+      'licenses/aria2-COPYING': Buffer.from('aria2 GPL fixture'),
+      ...(os === 'windows'
+        ? { 'licenses/aria2-LICENSE.OpenSSL': Buffer.from('OpenSSL notice fixture') }
+        : {}),
+      [`native/aria2c${os === 'windows' ? '.exe' : ''}`]: Buffer.from(`aria2-${os}-${arch}`),
+      'ui/assets/app.js': Buffer.from('console.log("aria2 fixture")')
+    };
+    for (const [relative, bytes] of Object.entries(payloads)) {
+      if (relative === omitFile) continue;
+      await mkdir(path.dirname(path.join(stage, relative)), { recursive: true });
+      await writeFile(path.join(stage, relative), bytes);
+      files[relative] = createHash('sha256').update(bytes).digest('hex');
+    }
+  }
+  if (application.appId === 'com.attson.clipboard') {
+    const payloads = {
+      LICENSE: Buffer.from('AT Clipboard license fixture'),
+      'ui/history.html': Buffer.from('<main>Clipboard history</main>'),
+      'ui/preview.html': Buffer.from('<main>Clipboard preview</main>'),
+      'ui/assets/app.js': Buffer.from('console.log("clipboard fixture")')
+    };
+    for (const [relative, bytes] of Object.entries(payloads)) {
+      if (relative === omitFile) continue;
+      await mkdir(path.dirname(path.join(stage, relative)), { recursive: true });
+      await writeFile(path.join(stage, relative), bytes);
+      files[relative] = createHash('sha256').update(bytes).digest('hex');
+    }
   }
   const manifest = parseManifest({
     schemaVersion: 1,
@@ -873,7 +1156,15 @@ async function createPluginPackage(
     publisher: { id: application.publisherId, name: 'Attson', keyId: manifestPublisherKeyId },
     target: { os, arch },
     hostApi: application.hostApi,
-    ui: { entry: 'ui/index.html' },
+    ui: application.appId === 'com.attson.clipboard'
+      ? {
+          entry: 'ui/index.html',
+          windows: {
+            history: { entry: 'ui/history.html', presentation: 'bottomPanel' },
+            preview: { entry: 'ui/preview.html', presentation: 'centeredDialog' }
+          }
+        }
+      : { entry: 'ui/index.html' },
     permissions: application.permissions,
     ...(nativeService ? { nativeService } : {}),
     files
@@ -884,20 +1175,28 @@ async function createPluginPackage(
     directory,
     `${application.artifactPrefix}_${version}_${os}_${arch}.atpkg`
   );
+  await rm(packagePath, { force: true });
   zipPackage(stage, packagePath);
   return packagePath;
 }
 
 function zipPackage(stage, output) {
-  const entries = ['manifest.json', 'manifest.sig', 'ui/index.html'];
-  if (existsSync(path.join(stage, 'native', 'athttp-service'))) {
-    entries.push('native/athttp-service');
-  }
+  const entries = collectPackageEntries(stage);
   const zipped = spawnSync('zip', ['-X', '-D', '-q', output, ...entries], {
     cwd: stage,
     encoding: 'utf8'
   });
   if (zipped.status !== 0) throw new Error(zipped.stderr || 'zip failed');
+}
+
+function collectPackageEntries(directory, prefix = '') {
+  const entries = [];
+  for (const name of readdirSync(path.join(directory, prefix), { withFileTypes: true })) {
+    const relative = path.posix.join(prefix, name.name);
+    if (name.isDirectory()) entries.push(...collectPackageEntries(directory, relative));
+    else entries.push(relative);
+  }
+  return entries.sort();
 }
 
 function zipPackageWithDuplicate(stage, output) {

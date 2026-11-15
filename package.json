@@ -26,12 +26,11 @@
     "@tauri-apps/plugin-clipboard-manager": "^2.3.2",
     "@tauri-apps/plugin-dialog": "^2.7.0",
     "@tauri-apps/plugin-global-shortcut": "^2.3.1",
-    "monaco-editor": "^0.55.1",
     "naive-ui": "^2.44.1",
     "vue": "^3.5.33"
   },
   "devDependencies": {
-    "@attson/plugin-sdk": "github:attsontools/attool-plugin-sdk#v0.1.0-alpha.2",
+    "@attson/plugin-sdk": "https://gh-proxy.com/https://github.com/attsontools/attool-plugin-sdk/archive/410158b5e850836d5db681b1a02b13e4d55d53d6.tar.gz",
     "@tauri-apps/cli": "2.12.2",
     "@vitejs/plugin-vue": "^6.0.6",
     "esbuild": "^0.28.0",

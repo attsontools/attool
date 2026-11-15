@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "sequence": 8,
-  "issuedAt": "2026-11-13T06:53:09.000Z",
+  "sequence": 9,
+  "issuedAt": "2026-11-15T11:06:42.000Z",
   "expiresAt": "2031-11-11T03:17:47.000Z",
   "catalogKeys": [
     {
@@ -81,6 +81,14 @@
           "status": "active",
           "notBefore": "2026-11-13T06:53:09.000Z",
           "notAfter": "2027-11-13T06:53:09.000Z"
+        },
+        {
+          "keyId": "attson-clipboard-2026-01",
+          "algorithm": "ed25519",
+          "publicKey": "YYqzpG4u/svnyVt3fcALr2MFL2drgn9lisj5MM160Ao=",
+          "status": "active",
+          "notBefore": "2026-11-15T11:06:42.000Z",
+          "notAfter": "2027-11-15T11:06:42.000Z"
         }
       ]
     }

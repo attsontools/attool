@@ -1,6 +1,6 @@
 # AGENTS.md
 
-个人桌面工具箱（Tauri 2 + Vue 3 + Naive UI）。平台内置 Aria2 下载、主图模板、剪贴板、视频链接抽取、图片（含跨平台截图与录屏）、网络、HTTP 请求（Apifox-lite：多 tab / 历史 / 环境变量 / cURL / multipart，v0.8.9 起 tab 分 HTTP / SSE / WebSocket 三种，支持 AI 长连接调试；v0.9.0 起 OpenAPI 支持 URL 导入 + 每集合独立间隔的定时同步 + 智能 merge 保留用户改动）、AI 对话（多提供商多模型 AI 助手：OpenAI 兼容 / Anthropic Claude / 本地 Ollama，流式 Markdown + 会话侧栏 + 模型热切换）。编码转换、文本工具、生成器、时间工具与 JSON 工具通过官方 Catalog 作为独立应用按需安装。
+个人桌面工具箱（Tauri 2 + Vue 3 + Naive UI）。平台内置 Aria2 下载、主图模板、剪贴板、视频链接抽取、图片（含跨平台截图与录屏）、网络、AI 对话（多提供商多模型 AI 助手：OpenAI 兼容 / Anthropic Claude / 本地 Ollama，流式 Markdown + 会话侧栏 + 模型热切换）。HTTP 请求、编码转换、文本工具、生成器、时间工具与 JSON 工具通过官方 Catalog 作为独立应用按需安装；HTTP 使用 Host API 2.x + Native/Data Service 复用原有本地数据。
 
 ## 技术栈
 
@@ -12,7 +12,6 @@
 | 包管理 | pnpm（`packageManager: pnpm@10.29.3` 锁版本，用 `corepack enable` 自动匹配） |
 | 测试 | Vitest 4（无 jsdom，纯逻辑） |
 | 本地存储 | rusqlite（bundled SQLite） |
-| 编辑器 | Monaco Editor（HTTP OpenAPI 导入与 Schema 预览） |
 | 截图 | macOS core-graphics / Linux·Windows xcap 0.8 |
 | 更新 | 自研 updater（Ed25519 签名 SHA256SUMS + 平台专用 apply 脚本，覆盖 mac/win/**Linux**） |
 | 外部命令 | `aria2c`（下载）；PSD 解析器以 PyInstaller sidecar 随正式包分发 |
@@ -47,11 +46,12 @@ src/
 ├── theme/index.ts               # Naive UI darkOverrides + lightOverrides
 ├── composables/                 # useTheme / useSidebarState / useLastTool / useUpdater
 │                                #   / useClipboardHistory / useFileDrop / useAria2Handoff
-│                                #   / useHttpStore（HTTP 工具全局单例，带测试）
+│                                #   / usePluginStore（应用 registry / Catalog / 生命周期）
 ├── components/
 │   ├── shell/                   # 外壳：AppShell / Sidebar / Topbar / Dashboard / ToolIcon
 │   │                            #   / SettingsModal / UpdateBanner / ShortcutErrorNotifier
-│   ├── ui/                      # 通用原子：Panel / TaskRow / StatPill / Kbd / CodeEditor
+│   ├── ui/                      # 通用原子：Panel / TaskRow / StatPill / Kbd
+│   ├── plugins/                 # 应用管理、隔离 iframe、Host API 与 Catalog UI
 │   ├── clipboard/               # 剪贴板：ClipboardTool + ClipboardHistoryWindow（独立窗口）+ ItemCard
 │   ├── ecommerce/               # 主图模板：TemplateTool + 5 子组件（图层树/属性/画布/资源/批量）
 │   ├── image/                   # 图片：ImageTool（tabs：压缩/转换/EXIF/标注/OCR/截图）
@@ -59,13 +59,6 @@ src/
 │   ├── recording/               # 录屏：系统源选择/音频/暂停/预览 + 分块落盘
 │   ├── network/                 # 网络：URL 分解/Ping/端口/DNS
 │   ├── douyin/                  # 视频链接抽取（抖音，后端另支持 B站/小红书/YouTube）
-│   ├── http/                    # HTTP 请求：三栏（Sidebar + TabBar + kind-branch 内容区）
-│   │                            #   HTTP：RequestEditor + ResponseView（一次请求 → 响应）
-│   │                            #   SSE：SseTool + SseRequestEditor（长连接事件流）
-│   │                            #   WS：WsTool + WsRequestEditor（长连接 + 发送框 + 模板）
-│   │                            #   共用：StreamMessageList / EnvModal
-│   │                            #   + curl.ts / variables.ts / httpApi.ts / streamApi.ts
-│   │                            #   / streamMessageTone.ts / types.ts（带测试）
 │   └── ai/                      # AI 对话：AiChatTool（容器）+ AiSessionList + AiMessageList
 │                                #   / AiMessageBubble + AiComposer + AiModelPicker
 │                                #   / AiSettingsModal + AiSystemPromptDrawer
@@ -81,13 +74,8 @@ src-tauri/
 │                                #   / capture（截图）/ windows（xcap 窗口枚举）
 ├── src/ecommerce/               # 主图模板：commands / models / render / storage / psd_bridge
 ├── src/network/                 # 网络诊断：commands / ping / port / dns
-├── src/http/                    # HTTP 请求：mod / models / send（含 multipart 与 cancel）
-│                                #   / cancel / storage（tabs+history+envs+env_vars 4 张表，
-│                                #     http_tabs 有 kind 列区分 http/sse/ws）/ commands
-│   └── stream/                  # 长连接（v0.8.9+）：session（HashMap<sid, SessionHandle>）
-│                                #   / parser（自写 SSE 帧解析）/ buffer（2000 条·5 MB 上限）
-│                                #   / sse（reqwest bytes_stream）/ ws（tokio-tungstenite）
-│                                #   / commands（open/close/send/list_stream_messages）
+├── src/plugin/                  # .atpkg 验签 / Catalog / registry / 生命周期
+│                                #   / http_service（Host API 2.x 与 Native Service supervisor）
 ├── src/updater/                 # 自研 updater：mod / check / verify / download / keys / state
 │                                #   / commands / apply/{macos,windows,linux}
 │                                #   + scripts/{install-linux.sh, update-windows.bat}（embed）
@@ -103,7 +91,7 @@ src-tauri/
     └── sign-checksums.mjs       # release job 用 Ed25519 私钥签 SHA256SUMS
 
 docs/spec/                       # 当前态规范（overview / ui-design-system / architecture）
-docs/superpowers/                # superpowers 流程产物（每任务 1 份 spec + plan，已 gitignore）
+docs/tasks/                      # 本地任务过程稿（intent / roadmap / spec / plan，已 gitignore）
 ```
 
 ## UI 设计语言（一句话版）
@@ -204,7 +192,7 @@ AT.Tool_<v>_arm64.tar.gz
 - 字体没打包，依赖系统字体栈（`-apple-system / SF Pro Text / PingFang SC / Inter / Segoe UI`）
 - v0.8.4 及以前的用户**无法自动升到 v0.8.5**（老 tauri-plugin-updater 查 `latest.json`，已下线）—— 必须手动下载 v0.8.5 安装包装一次
 - v0.8.5 / v0.8.6 / v0.8.7 用户装机 updater 里 `body: null` 的 GitHub Releases JSON 解析失败，也**无法自动升到 v0.8.8+**（Rust 侧 body: String 不接受 null）—— 必须手动下载 v0.8.8 或更新版本装一次，之后 in-app 更新恢复
-- HTTP 工具的 SSE / WebSocket 消息**不落库**，只驻内存 buffer（2000 条 · 5 MB），关 tab 即清；如需回顾必须自己复制导出
+- HTTP 独立应用的 SSE / WebSocket 消息**不落库**，只驻 Native Service 内存 buffer（2000 条 · 5 MB），关 tab 即清；如需回顾必须自己复制导出
 
 ## 不要做
 
@@ -212,5 +200,6 @@ AT.Tool_<v>_arm64.tar.gz
 - 不要在 `<style scoped>` 里复制粘贴另一个组件的样式（应该走 token + 共享 class，或者放到 `src/styles/*.css`）
 - 不要把 `--bg-base` / `--text` 等 dark 假设硬写进选择器（应该让 `[data-theme=light]` 自动接管）
 - 不要在 `src/App.vue` 里塞业务逻辑 —— 当前已经是路由壳 + Aria2 工具，不要再扩。新增工具走独立组件
+- 不要把 HTTP 内置实现、宿主 HTTP SQLite owner 或旧 Tauri commands 加回来；HTTP 只通过 Catalog 应用、Host API 2.x 和 Native/Data Service 提供
 - 不要把"电商图片处理"功能加回来（已弃，主图模板覆盖该场景）
 - 不要重新引入 `tauri-plugin-updater` / `tauri-plugin-process` —— 已被自研 updater 替代

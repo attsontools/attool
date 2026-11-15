@@ -48,6 +48,12 @@ describe('useLastTool', () => {
     expect(lastToolId.value).toBe('plugin:com.attson.json');
   });
 
+  it('maps the removed HTTP tool to the external application', () => {
+    const { storage } = fakeStorage({ 'attool.lastTool': 'http' });
+    const { lastToolId } = useLastTool(storage);
+    expect(lastToolId.value).toBe('plugin:com.attson.http');
+  });
+
   it('remember persists tool id and updates state', () => {
     const { storage, data } = fakeStorage();
     const { lastToolId, remember } = useLastTool(storage);
