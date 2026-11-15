@@ -73,7 +73,7 @@ HTTP 数据仍位于 `${app_data_dir}/http/http.sqlite3`，但不属于宿主 ru
 
 ## 可插拔应用
 
-平台支持从本地包或官方 Catalog 安装签名 `.atpkg`。应用可以由独立仓库发布独立桌面安装包，也可以用同一版本和 `appId` 发布平台插件包；`atcodec`、`attext`、`atgenerator`、`attime`、`atjson` 与带原生 service 的 `athttp` 均已完成生产 Catalog 远程发现和生命周期闭环。
+平台支持从本地包或官方 Catalog 安装签名 `.atpkg`。应用可以由独立仓库发布独立桌面安装包，也可以用同一版本和 `appId` 发布平台插件包；`atcodec`、`attext`、`atgenerator`、`attime`、`atjson` 与带原生 service 的 `athttp`、`atclipboard` 均已完成生产 Catalog 远程发现和生命周期闭环。
 
 ### 包与安装状态
 
@@ -101,7 +101,7 @@ HTTP 数据仍位于 `${app_data_dir}/http/http.sqlite3`，但不属于宿主 ru
 
 `com.attson.template` 的 Native Service 固定复用 `${app_data_dir}/ecommerce`，以便后续原位接管现有模板 SQLite、素材和批量缓存；其他未知应用仍使用 `${app_data_dir}/native-services/<appId>`。Host API 与 Rust 网关共同限制 `template.templates.*`、PSD/素材导入及批量注册、渲染、保存方法，文件与目录路径只在 token 解析后进入 service，插件页面不接触真实路径。当前阶段只建立权限与目录契约，数据 owner 切换和旧内置写入保护由独立模板应用接管阶段完成。
 
-`com.attson.clipboard` 的独立版与插件版复用 `atclipboard-service`，固定原位接管 `${app_data_dir}/clipboard`，并通过 `host.clipboard.history` 的双层白名单访问。service 以生命周期锁和 `migrating / owned` marker 保证单一 owner；旧设置表为空时沿用历史默认值且不改写数据库，部分缺失或非法设置继续 fail closed。公共图片条目不得返回 asset、数据库或缓存路径，预览只接受 PNG/JPEG/WebP base64 data URL 且整串不超过 2 MiB；列表单页最多 100 条。后台采集、三类恢复、暂停、保留策略、清空未收藏和停启/重装已通过本地签名包与真实 500 条旧库验证；Wayland 插件模式使用宿主 `--plugin-window` 命令激活签名 history 窗口。生产 Catalog 生命周期完成前，宿主旧实现仍保留但在 `owned` 后永久退权，完整删除属于后续退场阶段。
+`com.attson.clipboard` 的独立版与插件版复用 `atclipboard-service`，固定原位接管 `${app_data_dir}/clipboard`，并通过 `host.clipboard.history` 的双层白名单访问。service 以生命周期锁和 `migrating / owned` marker 保证单一 owner；旧设置表为空时沿用历史默认值且不改写数据库，部分缺失或非法设置继续 fail closed。公共图片条目不得返回 asset、数据库或缓存路径，预览只接受 PNG/JPEG/WebP base64 data URL 且整串不超过 2 MiB；列表单页最多 100 条。后台采集、三类恢复、暂停、保留策略、清空未收藏、停启、卸载、重装、升级和首启失败回滚已通过两版生产 Catalog 与真实 500 条旧库验证；Wayland 插件模式使用宿主 `--plugin-window` 命令激活签名 history 窗口。宿主旧实现仍以兼容 guard 保留但在 `owned` 后永久退权，完整删除属于后续退场阶段。
 
 `com.attson.aria2` 已完成本地双制品与发布链验证：独立 Tauri 与签名 `.atpkg` 复用同一 Vue UI 和 `ataria2-service`，service 通过跨平台文件锁独占 `${app_data_dir}/aria2`、SQLite、固定 aria2 1.37.0 runtime 和取消句柄。首次接管先要求宿主写入 capability，再写 `migrating` marker，并以 SQLite exclusive barrier 等待 marker 前的旧写事务完成；一致快照通过 schema、完整性和行数校验后切换为永久 `owned`。旧库保留只读，宿主旧 owner 的所有读写在 marker 存在时拒绝，写路径取得 SQLite write transaction 后还会再次检查，停用或卸载插件也不恢复旧 owner。Linux x86_64 测试包已通过真实安装、下载和共享历史，五目标 workflow、生产签名校验和 Catalog 包布局校验也已在本地完成；生产 Publisher 授权、正式 Release 和安装/升级/回滚生命周期仍待远端验证。
 
@@ -116,14 +116,14 @@ HTTP 数据仍位于 `${app_data_dir}/http/http.sqlite3`，但不属于宿主 ru
 
 - `catalog/v1/root.json` 授权 Catalog Signing Key 与各独立应用的 Publisher Key；Root 由离线 Root Key 签名，AT Tool 正式构建只嵌入 Root 公钥。Catalog 与 AT Tool updater 使用相互独立的密钥体系，每个应用使用独立 Publisher Key。
 - 平台验证 Root、Catalog、Publisher manifest 签名、目标制品 SHA-256/大小和包内文件 hash。新元数据无效、过期或序列回退时不得覆盖上一份有效缓存；缓存过期后可继续运行已安装应用，但禁止新的远程安装和升级。
-- 官方 GitHub URL 先直接下载；仅在 `github.com` 或 `raw.githubusercontent.com` 的规范 HTTPS 请求发生传输失败时，使用 `gh-proxy.com` 重试。代理响应仍必须通过相同的 Root、Catalog、Publisher 签名、大小、SHA-256 与包内文件 hash 校验，代理不进入信任边界。
+- `github.com` 或 `raw.githubusercontent.com` 的规范 HTTPS URL 始终映射到 `gh-proxy.com` 下载；其他 URL 不改写。传输中断时最多执行三次严格 Range 续传，代理响应仍必须通过相同的 Root、Catalog、Publisher 签名、大小、SHA-256 与包内文件 hash 校验，代理不进入信任边界。
 - 远程安装与升级先下载到 staging 并登记 `pending`，通过 target、Host API、权限和隔离健康检查后再原子切换 `current`。切换前失败保持旧版本不变；首次运行确认失败恢复 `previous`，并记录稳定错误码与 correlation ID。
 - 应用管理合并 Catalog 与本地 registry，提供“应用目录 / 已安装 / 操作记录”。升级只接受严格更高 SemVer；新增权限必须由用户确认完整差集，权限不变或减少不重复授权。
 
 ### Catalog 发布链
 
 - 独立应用的一个 tag 由受保护 `prod` Environment 构建五个目标，每个目标同时产生独立安装包和 Publisher 签名 `.atpkg`。普通应用的正式 Release 必须恰好包含十个非空资产；Aria2 还必须附带固定 SHA-256 的 `aria2-1.37.0-source.tar.gz`，共十一项。
-- `.github/catalog/apps.json` 是官方应用来源注册表，固定声明 `appId`、仓库、资产前缀、展示信息、Host API、权限和 Publisher secret 名。`.github/workflows/catalog.yml` 只接受注册表中的 `attsontools/*` 公开 Release，下载五个 `.atpkg`，逐包核对不可变 Release URL、文件名、目标、版本、Publisher Key、签名、Host API、权限、文件集合与 hash；Aria2 包还必须包含目标对应的 `ataria2-service`、`aria2c`、COPYING 和 Windows OpenSSL notice，额外文件只允许位于已签名的 `ui/` 目录。
+- `.github/catalog/apps.json` 是官方应用来源注册表，固定声明 `appId`、仓库、资产前缀、展示信息、Host API、权限和 Publisher secret 名。`.github/workflows/catalog.yml` 只接受注册表中的 `attsontools/*` 公开 Release，通过 `gh-proxy.com` 下载五个 `.atpkg`，逐包核对不可变 Release URL、文件名、目标、版本、Publisher Key、签名、Host API、权限、文件集合与 hash；Aria2 包还必须包含目标对应的 `ataria2-service`、`aria2c`、COPYING 和 Windows OpenSSL notice，额外文件只允许位于已签名的 `ui/` 目录。
 - Catalog 发布器先离线验证已提交的 Root 和上一版 Catalog，再使用 Root 授权且处于有效窗口的 Catalog Signing Key 生成 7 天有效、严格递增的下一序列。首次发布从 `sequence: 1` 开始；已有应用只接受严格更高版本，首次接入的应用追加到 `apps` 且不得改写其他应用。
 - `.github/workflows/catalog-renew.yml` 每周一、周四续签 Catalog：递增序列并更新生成与过期时间，但必须逐字保留 `apps` 及其制品信息；续签只能使用 Root 当前授权且处于有效窗口的 Catalog Signing Key。
 - 发布和续签共享 `production-catalog` 并发组，且任一 `catalog/*` PR 未合并时都拒绝生成新候选，避免多个候选从同一序列分叉。

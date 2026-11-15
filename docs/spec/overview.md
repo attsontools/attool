@@ -48,7 +48,7 @@ attool 是一个个人使用的桌面工具集合，运行在 Tauri 2 上。前�
 
 | 工具（id） | 能力 | 后端 |
 |---|---|---|
-| 剪贴板（`clipboard`） | 历史记录、图片/文本预览、Paste 风格恢复、快捷键自定义、独立浮窗；`atclipboard` 双制品和原位接管已通过本地签名包与真实旧库验证，生产 Catalog 替代前仍保留受 owner guard 约束的内置实现 | `atclipboard-service`（单一 owner）+ 宿主 `clipboard/`（兼容 guard，待退场） |
+| 剪贴板（`clipboard`） | 历史记录、图片/文本预览、Paste 风格恢复、快捷键自定义、独立浮窗；`atclipboard` 双制品、五目标 Release、两版生产 Catalog、升级与首启失败回滚已通过真实旧库验证，宿主内置实现仅以 owner guard 兼容保留并等待退场 | `atclipboard-service`（单一 owner）+ 宿主 `clipboard/`（兼容 guard，待退场） |
 | 视频链接抽取（`douyin`） | 抖音 / B站 / 小红书 / YouTube 链接与文案解析；YouTube 使用内置 yt-dlp + EJS + QuickJS | `douyin/bilibili/xhs/youtube.rs` |
 | 图片（`image`） | 统一捕获工作台（截图 / 录屏，截图选区支持标注与快捷 OCR）、压缩、格式转换、EXIF、OCR；OCR 内置 Tesseract 与中英日语言模型 | `imaging/`（含 xcap 截图）+ `recording.rs` |
 | 网络（`network`） | URL 分解、Ping、端口、DNS | `network/` |
