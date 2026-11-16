@@ -37,11 +37,13 @@ const textPublisherKeyId = 'attson-text-2026-01';
 const httpPublisherKeyId = 'attson-http-2026-01';
 const aria2PublisherKeyId = 'attson-aria2-2026-01';
 const clipboardPublisherKeyId = 'attson-clipboard-2026-01';
+const templatePublisherKeyId = 'attson-template-2026-01';
 const codecApplication = await loadCatalogApplication('com.attson.codec');
 const textApplication = await loadCatalogApplication('com.attson.text');
 const httpApplication = await loadCatalogApplication('com.attson.http');
 const aria2Application = await loadCatalogApplication('com.attson.aria2');
 const clipboardApplication = await loadCatalogApplication('com.attson.clipboard');
+const templateApplication = await loadCatalogApplication('com.attson.template');
 
 const root = {
   schemaVersion: 1,
@@ -57,7 +59,8 @@ const root = {
       trustKey(textPublisherKeyId),
       trustKey(httpPublisherKeyId),
       trustKey(aria2PublisherKeyId),
-      trustKey(clipboardPublisherKeyId)
+      trustKey(clipboardPublisherKeyId),
+      trustKey(templatePublisherKeyId)
     ]
   }]
 };
@@ -241,6 +244,25 @@ describe('Catalog release generation', () => {
 
     assert.deepEqual(clipboardApplication, expected);
     assert.deepEqual(await loadCatalogApplicationBySlug('clipboard'), expected);
+  });
+
+  it('loads Template Host API 2.x release policy from the application registry', async () => {
+    const expected = {
+      appId: 'com.attson.template',
+      slug: 'template',
+      repository: 'attsontools/attemplate',
+      artifactPrefix: 'AT.Template',
+      name: '主图模板',
+      description: 'PSD 导入、画布编辑与批量主图生成',
+      publisherId: 'com.attson',
+      publisherKeySecret: 'ATTEMPLATE_PUBLISHER_KEY_ID',
+      icon: 'layout',
+      hostApi: { min: '2.0.0', max: '2.x' },
+      permissions: ['host.theme.read', 'host.template.project']
+    };
+
+    assert.deepEqual(await loadCatalogApplication('com.attson.template'), expected);
+    assert.deepEqual(await loadCatalogApplicationBySlug('template'), expected);
   });
 
   it('rejects ambiguous or out-of-scope application registry entries', async () => {
@@ -778,6 +800,139 @@ describe('Catalog release generation', () => {
     }
   });
 
+  it('requires the signed Template service and PSD bridge layout', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'attool-template-catalog-test-'));
+    const publisherKeys = generateKeyPairSync('ed25519');
+    const packageRoot = structuredClone(root);
+    packageRoot.publishers[0].keys[5].publicKey = rawPublicKey(publisherKeys.publicKey);
+    const inspect = (packagePath) => inspectPluginPackage({
+      packagePath,
+      application: templateApplication,
+      root: packageRoot,
+      publishedAt: generatedAt,
+      expectedVersion: version,
+      expectedPublisherKeyId: templatePublisherKeyId
+    });
+    try {
+      const packagePath = await createPluginPackage(
+        directory,
+        publisherKeys.privateKey,
+        'linux',
+        'x86_64',
+        { application: templateApplication, publisherKeyId: templatePublisherKeyId }
+      );
+      const inspected = await inspect(packagePath);
+      assert.equal(inspected.manifest.nativeService.entry, 'native/attemplate-service');
+      assert.deepEqual(Object.keys(inspected.manifest.files).sort(), [
+        'LICENSE',
+        'native/attemplate-service',
+        'native/psd-bridge',
+        'ui/assets/app.js',
+        'ui/index.html'
+      ]);
+
+      const missingRuntime = await createPluginPackage(
+        directory,
+        publisherKeys.privateKey,
+        'linux',
+        'x86_64',
+        {
+          application: templateApplication,
+          publisherKeyId: templatePublisherKeyId,
+          omitFile: 'native/psd-bridge'
+        }
+      );
+      await assert.rejects(() => inspect(missingRuntime), /Template package files/);
+
+      const extraNative = await createPluginPackage(
+        directory,
+        publisherKeys.privateKey,
+        'linux',
+        'x86_64',
+        {
+          application: templateApplication,
+          publisherKeyId: templatePublisherKeyId,
+          extraFile: 'native/yt_dlp'
+        }
+      );
+      await assert.rejects(() => inspect(extraNative), /Template package files/);
+
+      const wrongEntry = await createPluginPackage(
+        directory,
+        publisherKeys.privateKey,
+        'linux',
+        'x86_64',
+        {
+          application: templateApplication,
+          publisherKeyId: templatePublisherKeyId,
+          serviceEntryOverride: 'native/athttp-service'
+        }
+      );
+      await assert.rejects(() => inspect(wrongEntry), /Template native service entry/);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('prepares a Template Catalog release from five signed service and PSD packages', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'attool-template-release-test-'));
+    const rootKeys = generateKeyPairSync('ed25519');
+    const catalogKeys = generateKeyPairSync('ed25519');
+    const publisherKeys = generateKeyPairSync('ed25519');
+    const signedRoot = structuredClone(root);
+    signedRoot.catalogKeys[0].publicKey = rawPublicKey(catalogKeys.publicKey);
+    signedRoot.publishers[0].keys[5].publicKey = rawPublicKey(publisherKeys.publicKey);
+    try {
+      const assets = [];
+      for (const [os, arch] of [
+        ['linux', 'aarch64'],
+        ['linux', 'x86_64'],
+        ['macos', 'aarch64'],
+        ['macos', 'x86_64'],
+        ['windows', 'x86_64']
+      ]) {
+        const packagePath = await createPluginPackage(
+          directory,
+          publisherKeys.privateKey,
+          os,
+          arch,
+          { application: templateApplication, publisherKeyId: templatePublisherKeyId }
+        );
+        const fileName = path.basename(packagePath);
+        assets.push({
+          fileName,
+          size: (await readFile(packagePath)).byteLength,
+          url: `https://github.com/attsontools/attemplate/releases/download/${tagName}/${fileName}`
+        });
+      }
+
+      const prepared = await prepareCatalogRelease({
+        root: signedRoot,
+        rootSignature: signTrustMetadata(signedRoot, rootKeys.privateKey),
+        rootPublicKey: rawPublicKey(rootKeys.publicKey),
+        previousCatalog,
+        previousCatalogSignature: signTrustMetadata(previousCatalog, catalogKeys.privateKey),
+        application: templateApplication,
+        release: { tagName, publishedAt: generatedAt, notes: 'Template production drill', assets },
+        assetDirectory: directory,
+        catalogKeyId,
+        catalogPrivateKey: catalogKeys.privateKey,
+        publisherKeyId: templatePublisherKeyId,
+        generatedAt,
+        expiresAt
+      });
+
+      const application = prepared.catalog.apps.find((app) => app.appId === 'com.attson.template');
+      assert.equal(application.channels.stable.version, version);
+      assert.deepEqual(
+        application.channels.stable.artifacts.map(({ os, arch }) => `${os}/${arch}`),
+        ['linux/aarch64', 'linux/x86_64', 'macos/aarch64', 'macos/x86_64', 'windows/x86_64']
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it('verifies the offline Root and previous Catalog before publishing', () => {
     const rootKeys = generateKeyPairSync('ed25519');
     const catalogKeys = generateKeyPairSync('ed25519');
@@ -1087,7 +1242,9 @@ async function createPluginPackage(
   {
     application = codecApplication,
     publisherKeyId: manifestPublisherKeyId = publisherKeyId,
-    omitFile
+    omitFile,
+    extraFile,
+    serviceEntryOverride
   } = {}
 ) {
   const stage = path.join(directory, 'stage');
@@ -1105,14 +1262,21 @@ async function createPluginPackage(
       ? `ataria2-service${os === 'windows' ? '.exe' : ''}`
       : application.appId === 'com.attson.clipboard'
         ? `atclipboard-service${os === 'windows' ? '.exe' : ''}`
-        : 'athttp-service';
+        : application.appId === 'com.attson.template'
+          ? `attemplate-service${os === 'windows' ? '.exe' : ''}`
+          : 'athttp-service';
     await mkdir(native, { recursive: true });
     await writeFile(path.join(native, serviceName), service);
     files[`native/${serviceName}`] = createHash('sha256').update(service).digest('hex');
+    const serviceEntry = serviceEntryOverride || `native/${serviceName}`;
+    if (serviceEntryOverride && serviceEntryOverride !== `native/${serviceName}`) {
+      await writeFile(path.join(stage, serviceEntryOverride), service);
+      files[serviceEntryOverride] = createHash('sha256').update(service).digest('hex');
+    }
     nativeService = {
-      entry: `native/${serviceName}`,
+      entry: serviceEntry,
       version,
-      sha256: files[`native/${serviceName}`],
+      sha256: files[serviceEntry],
       protocolVersion: 1,
       ...(application.appId === 'com.attson.clipboard' ? { lifecycle: 'background' } : {})
     };
@@ -1147,6 +1311,25 @@ async function createPluginPackage(
       await writeFile(path.join(stage, relative), bytes);
       files[relative] = createHash('sha256').update(bytes).digest('hex');
     }
+  }
+  if (application.appId === 'com.attson.template') {
+    const payloads = {
+      LICENSE: Buffer.from('AT Template license fixture'),
+      [`native/psd-bridge${os === 'windows' ? '.exe' : ''}`]: Buffer.from(`psd-${os}-${arch}`),
+      'ui/assets/app.js': Buffer.from('console.log("template fixture")')
+    };
+    for (const [relative, bytes] of Object.entries(payloads)) {
+      if (relative === omitFile) continue;
+      await mkdir(path.dirname(path.join(stage, relative)), { recursive: true });
+      await writeFile(path.join(stage, relative), bytes);
+      files[relative] = createHash('sha256').update(bytes).digest('hex');
+    }
+  }
+  if (extraFile) {
+    const bytes = Buffer.from('unexpected fixture');
+    await mkdir(path.dirname(path.join(stage, extraFile)), { recursive: true });
+    await writeFile(path.join(stage, extraFile), bytes);
+    files[extraFile] = createHash('sha256').update(bytes).digest('hex');
   }
   const manifest = parseManifest({
     schemaVersion: 1,

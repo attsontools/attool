@@ -519,6 +519,31 @@ function requireApplicationPackageLayout(application, manifest) {
     }
     return;
   }
+  if (application.appId === 'com.attson.template') {
+    const windows = manifest.target.os === 'windows';
+    const serviceEntry = `native/attemplate-service${windows ? '.exe' : ''}`;
+    const runtimeEntry = `native/psd-bridge${windows ? '.exe' : ''}`;
+    requireEqual(manifest.nativeService?.entry, serviceEntry, 'Template native service entry');
+    requireEqual(manifest.nativeService?.version, manifest.version, 'Template native service version');
+    requireEqual(manifest.nativeService?.protocolVersion, 1, 'Template native service protocol');
+    const expectedFiles = [
+      'LICENSE',
+      serviceEntry,
+      runtimeEntry,
+      'ui/index.html'
+    ].sort();
+    const actualFiles = Object.keys(manifest.files).sort();
+    const missingFiles = expectedFiles.filter((relative) => !manifest.files[relative]);
+    const unexpectedFiles = actualFiles.filter(
+      (relative) => !expectedFiles.includes(relative) && !relative.startsWith('ui/')
+    );
+    if (missingFiles.length > 0 || unexpectedFiles.length > 0) {
+      throw new Error(
+        `Template package files mismatch: missing ${JSON.stringify(missingFiles)}, unexpected ${JSON.stringify(unexpectedFiles)}`
+      );
+    }
+    return;
+  }
   if (application.appId !== 'com.attson.aria2') return;
 
   const windows = manifest.target.os === 'windows';

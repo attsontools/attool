@@ -154,6 +154,25 @@
         "host.ui.auxiliary",
         "host.clipboard.history"
       ]
+    },
+    {
+      "appId": "com.attson.template",
+      "slug": "template",
+      "repository": "attsontools/attemplate",
+      "artifactPrefix": "AT.Template",
+      "name": "主图模板",
+      "description": "PSD 导入、画布编辑与批量主图生成",
+      "publisherId": "com.attson",
+      "publisherKeySecret": "ATTEMPLATE_PUBLISHER_KEY_ID",
+      "icon": "layout",
+      "hostApi": {
+        "min": "2.0.0",
+        "max": "2.x"
+      },
+      "permissions": [
+        "host.theme.read",
+        "host.template.project"
+      ]
     }
   ]
 }
