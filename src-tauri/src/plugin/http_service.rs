@@ -1125,6 +1125,16 @@ impl ServiceClient {
 }
 
 fn request_timeout(method: &str, params: &Value) -> Duration {
+    if matches!(
+        method,
+        "video.douyin.resolve"
+            | "video.douyin.extract"
+            | "video.xhs.extract"
+            | "video.bilibili.extract"
+            | "video.youtube.extract"
+    ) {
+        return Duration::from_secs(35);
+    }
     if method != "http.send" {
         return DEFAULT_REQUEST_TIMEOUT;
     }
@@ -1664,6 +1674,23 @@ mod tests {
             request_timeout("data.tabs.list", &json!({})),
             DEFAULT_REQUEST_TIMEOUT
         );
+    }
+
+    #[test]
+    fn video_request_timeout_leaves_room_for_the_platform_timeout_response() {
+        for method in [
+            "video.douyin.resolve",
+            "video.douyin.extract",
+            "video.xhs.extract",
+            "video.bilibili.extract",
+            "video.youtube.extract",
+        ] {
+            assert_eq!(
+                request_timeout(method, &json!({})),
+                Duration::from_secs(35),
+                "{method}"
+            );
+        }
     }
 
     #[tokio::test]

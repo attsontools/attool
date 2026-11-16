@@ -303,35 +303,44 @@ pub fn extract_package(
         return Err(error);
     }
     if let Some(service) = &package.native_service {
-        if let Err(error) = set_native_service_permissions(&destination.join(&service.entry)) {
+        if let Err(error) = set_native_payload_permissions(destination, package.files.keys()) {
             let _ = fs::remove_dir_all(destination);
             return Err(error);
         }
+        debug_assert!(package.files.contains_key(&service.entry));
     }
     Ok(package)
 }
 
-fn set_native_service_permissions(path: &Path) -> Result<(), PackageError> {
+fn set_native_payload_permissions<'a>(
+    destination: &Path,
+    files: impl Iterator<Item = &'a String>,
+) -> Result<(), PackageError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
-        let mut permissions = fs::metadata(path)
-            .map_err(|error| {
+        for relative in files.filter(|relative| relative.starts_with("native/")) {
+            let path = destination.join(relative);
+            let mut permissions = fs::metadata(&path)
+                .map_err(|error| {
+                    PackageError::new(
+                        "PLUGIN_STAGING_FAILED",
+                        format!("Cannot inspect native payload permissions: {error}"),
+                    )
+                })?
+                .permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&path, permissions).map_err(|error| {
                 PackageError::new(
                     "PLUGIN_STAGING_FAILED",
-                    format!("Cannot inspect native service permissions: {error}"),
+                    format!("Cannot mark native payload executable: {error}"),
                 )
-            })?
-            .permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(path, permissions).map_err(|error| {
-            PackageError::new(
-                "PLUGIN_STAGING_FAILED",
-                format!("Cannot mark native service executable: {error}"),
-            )
-        })?;
+            })?;
+        }
     }
+    #[cfg(not(unix))]
+    let _ = (destination, files);
     Ok(())
 }
 
@@ -684,7 +693,10 @@ mod tests {
 
     #[test]
     fn larger_file_limit_is_scoped_to_native_service_payloads() {
-        assert_eq!(package_file_limit("native/aria2c", true), MAX_NATIVE_FILE_BYTES);
+        assert_eq!(
+            package_file_limit("native/aria2c", true),
+            MAX_NATIVE_FILE_BYTES
+        );
         assert_eq!(package_file_limit("native/aria2c", false), MAX_FILE_BYTES);
         assert_eq!(package_file_limit("ui/large.bin", true), MAX_FILE_BYTES);
     }
@@ -788,12 +800,14 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&TEST_KEY_SEED);
         let index = b"<!doctype html><title>HTTP</title>";
         let service = b"native-service";
+        let runtime_helper = b"runtime-helper";
         let service_hash = sha256(service);
         let declared_hash = declared_hash.unwrap_or(&service_hash);
         let manifest = serde_json::json!({
             "appId": "com.attson.http",
             "files": {
                 "native/athttp-service": service_hash,
+                "native/runtime-helper": sha256(runtime_helper),
                 "ui/index.html": sha256(index)
             },
             "hostApi": {
@@ -825,6 +839,7 @@ mod tests {
             ("manifest.sig", signature.as_bytes()),
             ("ui/index.html", index.as_slice()),
             ("native/athttp-service", service.as_slice()),
+            ("native/runtime-helper", runtime_helper.as_slice()),
         ] {
             archive.start_file(name, options).unwrap();
             archive.write_all(bytes).unwrap();
@@ -1233,7 +1248,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn extraction_marks_the_native_service_executable() {
+    fn extraction_marks_native_service_payload_executables() {
         use std::os::unix::fs::PermissionsExt;
 
         let (directory, path, signing_key) = native_service_package(
@@ -1254,11 +1269,13 @@ mod tests {
         )
         .unwrap();
 
-        let mode = std::fs::metadata(destination.join("native/athttp-service"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_ne!(mode & 0o111, 0);
+        for relative in ["native/athttp-service", "native/runtime-helper"] {
+            let mode = std::fs::metadata(destination.join(relative))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_ne!(mode & 0o111, 0, "{relative} must be executable");
+        }
     }
 
     #[test]
