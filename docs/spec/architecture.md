@@ -105,7 +105,7 @@ HTTP 与剪贴板数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app
 
 `com.attson.aria2` 已完成本地双制品与发布链验证：独立 Tauri 与签名 `.atpkg` 复用同一 Vue UI 和 `ataria2-service`，service 通过跨平台文件锁独占 `${app_data_dir}/aria2`、SQLite、固定 aria2 1.37.0 runtime 和取消句柄。首次接管先要求宿主写入 capability，再写 `migrating` marker，并以 SQLite exclusive barrier 等待 marker 前的旧写事务完成；一致快照通过 schema、完整性和行数校验后切换为永久 `owned`。旧库保留只读，宿主旧 owner 的所有读写在 marker 存在时拒绝，写路径取得 SQLite write transaction 后还会再次检查，停用或卸载插件也不恢复旧 owner。Linux x86_64 测试包已通过真实安装、下载和共享历史，五目标 workflow、生产签名校验和 Catalog 包布局校验也已在本地完成；生产 Publisher 授权、正式 Release 和安装/升级/回滚生命周期仍待远端验证。
 
-`com.attson.video` 已完成 P1 本地双制品：独立 Tauri 与测试签名 `.atpkg` 复用同一 Vue 页面、`atvideo-service` 协议和固定的 yt-dlp 2026.10.21、yt-dlp-ejs 0.8.0、QuickJS-ng 0.17.0 runtime bytes。插件只声明 `host.theme.read`、`host.video.extract`、`host.clipboard.write`、`host.external.open`、`host.app.activate`，Host 与 service 共同限制五个视频方法、平台 host、精确参数和无凭证代理；30 秒平台/runtime 超时外由 standalone client 和 Host 各保留 35 秒响应预算。动态 Video 通过 `host.app.activate` 把有界 URL 批次交给动态 Aria2，Aria2 原子填入输入框但不自动创建任务。Linux x86_64 最终测试包已通过签名重装、全部 native hash/`0700` 权限、四平台解析、复制、外链、断线后 remount、停启、卸载重装和 Video 到 Aria2 流程；五目标发布与 Catalog 生命周期属于 P2，宿主内置视频实现和共享 runtime 在 P3 前继续保留。
+`com.attson.video` 的独立 Tauri 与签名 `.atpkg` 复用同一 Vue 页面、`atvideo-service` 协议和固定的 yt-dlp 2026.10.21、yt-dlp-ejs 0.8.0、QuickJS-ng 0.17.0 runtime bytes。插件只声明 `host.theme.read`、`host.video.extract`、`host.clipboard.write`、`host.external.open`、`host.app.activate`，Host 与 service 共同限制五个视频方法、平台 host、精确参数和无凭证代理；30 秒平台/runtime 超时外由 standalone client 和 Host 各保留 35 秒响应预算。动态 Video 通过 `host.app.activate` 把有界 URL 批次交给动态 Aria2，Aria2 原子填入输入框但不自动创建任务。Linux x86_64 最终测试包已通过签名重装、全部 native hash/`0700` 权限、四平台解析、复制、外链、断线后 remount、停启、卸载重装和 Video 到 Aria2 流程；五目标原生 runner workflow、固定 SDK 提交、生产/测试签名隔离、runtime smoke、精确十资产和 Catalog 包布局已完成本地验证。生产 Publisher 授权、两个正式 Release 与 Catalog 安装/升级/回滚生命周期仍待远端验证，宿主内置视频实现和共享 runtime 在 P3 前继续保留。
 
 ### 前端装配与应用外置
 
@@ -125,7 +125,7 @@ HTTP 与剪贴板数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app
 ### Catalog 发布链
 
 - 独立应用的一个 tag 由受保护 `prod` Environment 构建五个目标，每个目标同时产生独立安装包和 Publisher 签名 `.atpkg`。普通应用的正式 Release 必须恰好包含十个非空资产；Aria2 还必须附带固定 SHA-256 的 `aria2-1.37.0-source.tar.gz`，共十一项。
-- `.github/catalog/apps.json` 是官方应用来源注册表，固定声明 `appId`、仓库、资产前缀、展示信息、Host API、权限和 Publisher secret 名。`.github/workflows/catalog.yml` 只接受注册表中的 `attsontools/*` 公开 Release，通过 `gh-proxy.com` 下载五个 `.atpkg`，逐包核对不可变 Release URL、文件名、目标、版本、Publisher Key、签名、Host API、权限、文件集合与 hash；Aria2 包还必须包含目标对应的 `ataria2-service`、`aria2c`、COPYING 和 Windows OpenSSL notice，Template 包必须包含目标对应的 `attemplate-service`、`psd-bridge` 和 LICENSE，两者的额外文件都只允许位于已签名的 `ui/` 目录。
+- `.github/catalog/apps.json` 是官方应用来源注册表，固定声明 `appId`、仓库、资产前缀、展示信息、Host API、权限和 Publisher secret 名。`.github/workflows/catalog.yml` 只接受注册表中的 `attsontools/*` 公开 Release，通过 `gh-proxy.com` 下载五个 `.atpkg`，逐包核对不可变 Release URL、文件名、目标、版本、Publisher Key、签名、Host API、权限、文件集合与 hash；Aria2 包还必须包含目标对应的 `ataria2-service`、`aria2c`、COPYING 和 Windows OpenSSL notice，Template 包必须包含目标对应的 `attemplate-service`、`psd-bridge` 和 LICENSE，Video 包必须包含目标对应的 `atvideo-service`、`youtube-bridge`、QuickJS、runtime manifest、主许可证和三份第三方许可证，这些应用的额外文件都只允许位于已签名的 `ui/` 目录。
 - Catalog 发布器先离线验证已提交的 Root 和上一版 Catalog，再使用 Root 授权且处于有效窗口的 Catalog Signing Key 生成 7 天有效、严格递增的下一序列。首次发布从 `sequence: 1` 开始；已有应用只接受严格更高版本，首次接入的应用追加到 `apps` 且不得改写其他应用。
 - `.github/workflows/catalog-renew.yml` 每周一、周四续签 Catalog：递增序列并更新生成与过期时间，但必须逐字保留 `apps` 及其制品信息；续签只能使用 Root 当前授权且处于有效窗口的 Catalog Signing Key。
 - 发布和续签共享 `production-catalog` 并发组，且任一 `catalog/*` PR 未合并时都拒绝生成新候选，避免多个候选从同一序列分叉。

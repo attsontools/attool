@@ -544,6 +544,37 @@ function requireApplicationPackageLayout(application, manifest) {
     }
     return;
   }
+  if (application.appId === 'com.attson.video') {
+    const windows = manifest.target.os === 'windows';
+    const extension = windows ? '.exe' : '';
+    const serviceEntry = `native/atvideo-service${extension}`;
+    requireEqual(manifest.nativeService?.entry, serviceEntry, 'Video native service entry');
+    requireEqual(manifest.nativeService?.version, manifest.version, 'Video native service version');
+    requireEqual(manifest.nativeService?.protocolVersion, 1, 'Video native service protocol');
+    const expectedFiles = [
+      'LICENSE',
+      'THIRD_PARTY_NOTICES.md',
+      'licenses/QuickJS-ng-MIT.txt',
+      'licenses/yt-dlp-UNLICENSE.txt',
+      'licenses/yt-dlp-ejs-LICENSE.txt',
+      serviceEntry,
+      `native/youtube-bridge${extension}`,
+      `native/qjs${extension}`,
+      'runtime-manifest.json',
+      'ui/index.html'
+    ].sort();
+    const actualFiles = Object.keys(manifest.files).sort();
+    const missingFiles = expectedFiles.filter((relative) => !manifest.files[relative]);
+    const unexpectedFiles = actualFiles.filter(
+      (relative) => !expectedFiles.includes(relative) && !relative.startsWith('ui/')
+    );
+    if (missingFiles.length > 0 || unexpectedFiles.length > 0) {
+      throw new Error(
+        `Video package files mismatch: missing ${JSON.stringify(missingFiles)}, unexpected ${JSON.stringify(unexpectedFiles)}`
+      );
+    }
+    return;
+  }
   if (application.appId !== 'com.attson.aria2') return;
 
   const windows = manifest.target.os === 'windows';

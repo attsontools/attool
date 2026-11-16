@@ -173,6 +173,28 @@
         "host.theme.read",
         "host.template.project"
       ]
+    },
+    {
+      "appId": "com.attson.video",
+      "slug": "video",
+      "repository": "attsontools/atvideo",
+      "artifactPrefix": "AT.Video",
+      "name": "视频链接抽取",
+      "description": "抖音、小红书、B 站与 YouTube 链接抽取",
+      "publisherId": "com.attson",
+      "publisherKeySecret": "ATVIDEO_PUBLISHER_KEY_ID",
+      "icon": "video",
+      "hostApi": {
+        "min": "2.0.0",
+        "max": "2.x"
+      },
+      "permissions": [
+        "host.theme.read",
+        "host.video.extract",
+        "host.clipboard.write",
+        "host.external.open",
+        "host.app.activate"
+      ]
     }
   ]
 }
