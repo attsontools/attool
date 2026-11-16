@@ -1,4 +1,10 @@
 import type { InstalledPlugin } from './types';
+import {
+  AppActivationError,
+  type AcceptedAppActivation,
+  type AppActivationNotification,
+  type AppActivationRequest
+} from './appActivation';
 
 type ApiVersion = '1.0' | '2.0';
 const LEGACY_MAX_MESSAGE_BYTES = 1024 * 1024;
@@ -40,6 +46,13 @@ const CLIPBOARD_HISTORY_METHODS = new Set([
   'clipboard.settings.get',
   'clipboard.settings.update'
 ]);
+const VIDEO_EXTRACT_HOSTS: Record<string, ReadonlySet<string>> = {
+  'video.douyin.resolve': new Set(['v.douyin.com']),
+  'video.douyin.extract': new Set(['www.douyin.com', 'www.iesdouyin.com']),
+  'video.xhs.extract': new Set(['xhslink.com', 'www.xiaohongshu.com']),
+  'video.bilibili.extract': new Set(['www.bilibili.com', 'm.bilibili.com', 'b23.tv']),
+  'video.youtube.extract': new Set(['www.youtube.com', 'youtube.com', 'm.youtube.com', 'youtu.be'])
+};
 
 type RpcBase = {
   jsonrpc: '2.0';
@@ -108,6 +121,7 @@ export interface PluginHostSession {
   notifyTheme(theme: 'dark' | 'light'): void;
   notifyNativeServiceEvent(event: unknown): void;
   notifyActivated(payload: unknown): void;
+  notifyAppActivated(activation: AppActivationNotification): void;
   terminate(): void;
 }
 
@@ -125,7 +139,9 @@ type SessionOptions = {
   pickTemplateFiles?(input: HostTemplateFilePickRequest): Promise<HostSelectedPath[] | null>;
   pickTemplateDirectory?(): Promise<HostSelectedPath | null>;
   copyText?(text: string): Promise<void>;
+  openExternal?(url: string): Promise<void>;
   requestNativeService?(method: string, params: unknown): Promise<unknown>;
+  activateApp?(request: AppActivationRequest): AcceptedAppActivation | Promise<AcceptedAppActivation>;
   openAuxiliaryWindow?(input: HostUiOpenRequest): Promise<unknown>;
   closeAuxiliaryWindow?(): Promise<void>;
   onHandshake?(): void;
@@ -204,7 +220,10 @@ export function createPluginHostSession(options: SessionOptions): PluginHostSess
     }
   }
 
-  async function dispatch(request: RpcRequest): Promise<unknown> {
+  async function dispatch(
+    request: RpcRequest,
+    onAcceptedActivation?: (activation: AcceptedAppActivation) => void
+  ): Promise<unknown> {
     if (request.method === 'host.handshake') {
       handshaken = true;
       return {
@@ -287,6 +306,40 @@ export function createPluginHostSession(options: SessionOptions): PluginHostSess
         await options.copyText(text);
         return { copied: true };
       }
+      case 'host.clipboard.writeText': {
+        requirePermission('host.clipboard.write');
+        if (!options.copyText) {
+          throw new RpcDispatchError('HOST_CLIPBOARD_WRITE_UNAVAILABLE', 'Clipboard write is unavailable');
+        }
+        const params = asRecord(request.params);
+        const text = requiredString(params.text, 'text', 1024 * 1024);
+        if (new TextEncoder().encode(text).byteLength > 1024 * 1024) throw invalidParams('text');
+        await options.copyText(text);
+        return { copied: true };
+      }
+      case 'host.external.open': {
+        requirePermission('host.external.open');
+        if (!options.openExternal) {
+          throw new RpcDispatchError('HOST_EXTERNAL_OPEN_UNAVAILABLE', 'External URL opening is unavailable');
+        }
+        const params = asRecord(request.params);
+        const url = requiredString(params.url, 'url', 4096);
+        let parsed: URL;
+        try {
+          parsed = new URL(url);
+        } catch {
+          throw invalidParams('url');
+        }
+        if (
+          (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
+          || parsed.username.length > 0
+          || parsed.password.length > 0
+        ) {
+          throw invalidParams('url');
+        }
+        await options.openExternal(url);
+        return { opened: true };
+      }
       case 'host.download.pickDirectory': {
         requirePermission('host.download.tasks');
         if (!options.pickDirectory) {
@@ -315,6 +368,38 @@ export function createPluginHostSession(options: SessionOptions): PluginHostSess
         return dispatchHttpRequest(request, 'host.http.data', (method) => method.startsWith('data.'));
       case 'host.download.tasks':
         return dispatchDownloadRequest(request);
+      case 'host.app.activate': {
+        requirePermission('host.app.activate');
+        if (!options.activateApp) {
+          throw new RpcDispatchError('HOST_APP_ACTIVATION_UNAVAILABLE', 'Application activation is unavailable');
+        }
+        const params = asRecord(request.params);
+        const targetAppId = requiredString(params.appId, 'appId', 255);
+        const payload = Object.prototype.hasOwnProperty.call(params, 'payload')
+          ? params.payload
+          : {};
+        if (messageBytes(payload) > AUXILIARY_PAYLOAD_MAX_BYTES) {
+          throw new RpcDispatchError(
+            'HOST_APP_ACTIVATION_PAYLOAD_TOO_LARGE',
+            'Application activation payload is too large',
+            -32002
+          );
+        }
+        try {
+          const accepted = await options.activateApp({
+            sourceAppId: options.app.appId,
+            targetAppId,
+            payload
+          });
+          onAcceptedActivation?.(accepted);
+          return accepted.result;
+        } catch (reason) {
+          if (reason instanceof AppActivationError) {
+            throw new RpcDispatchError(reason.stableCode, reason.message, -32003);
+          }
+          throw reason;
+        }
+      }
       case 'host.ui.open': {
         requirePermission('host.ui.auxiliary');
         const params = asRecord(request.params);
@@ -405,6 +490,8 @@ export function createPluginHostSession(options: SessionOptions): PluginHostSess
       }
       case 'host.template.project':
         return dispatchTemplateRequest(request);
+      case 'host.video.extract':
+        return dispatchVideoRequest(request);
       default:
         throw new RpcDispatchError('HOST_METHOD_NOT_FOUND', 'Host API method was not found', -32601);
     }
@@ -518,6 +605,42 @@ export function createPluginHostSession(options: SessionOptions): PluginHostSess
     }
   }
 
+  async function dispatchVideoRequest(request: RpcRequest) {
+    requirePermission('host.video.extract');
+    if (!options.requestNativeService) {
+      throw new RpcDispatchError('NATIVE_SERVICE_NOT_CONNECTED', 'Native service is unavailable');
+    }
+    const params = asRecord(request.params);
+    const method = requiredString(params.method, 'method', 128);
+    const allowedHosts = VIDEO_EXTRACT_HOSTS[method];
+    if (!allowedHosts) {
+      throw new RpcDispatchError(
+        'HOST_VIDEO_METHOD_DENIED',
+        'Video service method is not allowed for host.video.extract',
+        -32003
+      );
+    }
+    if (!Object.prototype.hasOwnProperty.call(params, 'params')) throw invalidParams('params');
+    const serviceParams = asRecord(params.params);
+    const allowedParams = method === 'video.youtube.extract'
+      ? new Set(['url', 'proxy'])
+      : new Set(['url']);
+    if (Object.keys(serviceParams).some((key) => !allowedParams.has(key))) {
+      throw invalidParams('params');
+    }
+    validateHttpUrl(serviceParams.url, 'params.url', allowedHosts, 8192);
+    if (method === 'video.youtube.extract' && serviceParams.proxy != null) {
+      validateProxyUrl(serviceParams.proxy, 'params.proxy');
+    } else if (method !== 'video.youtube.extract' && Object.prototype.hasOwnProperty.call(serviceParams, 'proxy')) {
+      throw invalidParams('params.proxy');
+    }
+    try {
+      return await options.requestNativeService(method, serviceParams);
+    } catch (reason) {
+      throw serviceError(reason);
+    }
+  }
+
   function notifyNativeServiceEvent(event: unknown) {
     if (!handshaken || terminated || apiVersion !== '2.0') return;
     const method = nativeServiceEventMethod(event, options.app.permissions);
@@ -570,13 +693,21 @@ export function createPluginHostSession(options: SessionOptions): PluginHostSess
       }
       return;
     }
-    void dispatch(message)
+    let acceptedActivation: AcceptedAppActivation | undefined;
+    void dispatch(message, (activation) => {
+      acceptedActivation = activation;
+    })
       .then((result) => {
-        if (cancelled.delete(message.id) || terminated) return;
+        if (cancelled.delete(message.id) || terminated) {
+          acceptedActivation?.discard();
+          return;
+        }
         success(message.id, result);
+        acceptedActivation?.commit();
         if (message.method === 'host.handshake') options.onHandshake?.();
       })
       .catch((reason) => {
+        acceptedActivation?.discard();
         if (cancelled.delete(message.id) || terminated) return;
         failure(
           message.id,
@@ -611,6 +742,17 @@ export function createPluginHostSession(options: SessionOptions): PluginHostSess
         appId: options.app.appId,
         method: 'host.ui.activated',
         params: { windowId: options.windowId, payload }
+      });
+    },
+    notifyAppActivated(activation) {
+      if (!handshaken || terminated) return;
+      if (messageBytes(activation.payload) > AUXILIARY_PAYLOAD_MAX_BYTES) return;
+      post({
+        jsonrpc: '2.0',
+        apiVersion,
+        appId: options.app.appId,
+        method: 'host.app.activated',
+        params: activation
       });
     },
     terminate() {
@@ -930,6 +1072,47 @@ function optionalString(value: unknown, field: string, maxLength: number): strin
 function requiredBoolean(value: unknown, field: string): boolean {
   if (typeof value !== 'boolean') throw invalidParams(field);
   return value;
+}
+
+function validateHttpUrl(
+  value: unknown,
+  field: string,
+  allowedHosts: ReadonlySet<string>,
+  maxLength: number
+) {
+  const url = requiredString(value, field, maxLength);
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw invalidParams(field);
+  }
+  if (
+    (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
+    || parsed.username.length > 0
+    || parsed.password.length > 0
+    || !allowedHosts.has(parsed.hostname.toLowerCase())
+  ) {
+    throw invalidParams(field);
+  }
+}
+
+function validateProxyUrl(value: unknown, field: string) {
+  const proxy = requiredString(value, field, 2048);
+  if (new TextEncoder().encode(proxy).byteLength > 2048) throw invalidParams(field);
+  let parsed: URL;
+  try {
+    parsed = new URL(proxy);
+  } catch {
+    throw invalidParams(field);
+  }
+  if (
+    !['http:', 'https:', 'socks5:'].includes(parsed.protocol)
+    || parsed.username.length > 0
+    || parsed.password.length > 0
+  ) {
+    throw invalidParams(field);
+  }
 }
 
 function invalidParams(field: string) {

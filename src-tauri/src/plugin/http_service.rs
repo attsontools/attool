@@ -894,6 +894,11 @@ fn required_permission(method: &str) -> Result<&'static str, NativeServiceError>
         | "template.batch.sources.register"
         | "template.batch.run"
         | "template.batch.save" => Ok("host.template.project"),
+        "video.douyin.resolve"
+        | "video.douyin.extract"
+        | "video.xhs.extract"
+        | "video.bilibili.extract"
+        | "video.youtube.extract" => Ok("host.video.extract"),
         "clipboard.history.list"
         | "clipboard.history.get"
         | "clipboard.history.pin"
@@ -1602,6 +1607,21 @@ mod tests {
         }
         assert!(required_permission("clipboard.history.exportDatabase").is_err());
         assert!(required_permission("clipboard.settings.reset").is_err());
+    }
+
+    #[test]
+    fn maps_only_declared_video_service_methods_to_permissions() {
+        for method in [
+            "video.douyin.resolve",
+            "video.douyin.extract",
+            "video.xhs.extract",
+            "video.bilibili.extract",
+            "video.youtube.extract",
+        ] {
+            assert_eq!(required_permission(method).unwrap(), "host.video.extract");
+        }
+        assert!(required_permission("video.process.spawn").is_err());
+        assert!(required_permission("video.youtube.download").is_err());
     }
 
     #[test]

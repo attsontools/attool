@@ -87,7 +87,8 @@ HTTP 与剪贴板数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app
 - `attool-plugin://<appId>/<path>` 自定义协议只服务已启用且在签名清单中声明的文件，每次读取重新校验 SHA-256，并返回严格 CSP、CORS、`nosniff` 和 `no-store`。协议响应自身带无放行项的 CSP `sandbox`，因此被直接导航为文档时也不能执行脚本或发起导航，只作为 opaque iframe 的静态子资源来源。
 - Host 先通过 Tauri command 读取并校验 manifest entry HTML，再把 CSP 与指向签名资源目录的 `<base>` 放到所有不可信标记之前，作为 `sandbox="allow-scripts"` iframe 的 `srcdoc`。iframe 不带 `allow-same-origin`，文档 origin 保持 opaque；这同时隔离父 DOM、Vue 状态和 Tauri commands，不能再假设“自定义协议 origin + allow-same-origin”在所有 WebView 平台都能阻止子 frame 获得 Tauri 初始化脚本。
 - iframe 与平台通过 `MessageChannel` 上的 JSON-RPC 2.0 通信。纯前端插件继续使用 Host API 1.x；原生 service 插件使用 Host API 2.x，隔离安装探针同样读取 staged entry 为 opaque `srcdoc`，并按 operation 的 `nativeService` 选择相同 API 版本。握手返回 session ID、correlation ID、应用元数据、主题和已批准能力；请求校验 `appId`、API 版本、消息大小、超时和权限。HTTP 业务帧上限为 8 MiB，请求超时覆盖最长 300 秒网络请求并保留 5 秒传输余量。
-- 基础权限为 `host.theme.read`、`host.notification.show`、`host.file.save`；`host.ui.auxiliary` 只允许应用打开自己 manifest 已声明的辅助窗口，64 KiB 激活 payload 通过目标窗口的 `host.ui.activated` 通知交付。HTTP 插件另声明 `host.http.request`、`host.http.stream`、`host.http.data`，分别代理一次请求、长连接和 Data API；主图模板插件声明 `host.template.project`，仅能调用模板方法白名单；剪贴板应用声明 `host.clipboard.history`，只开放六个历史方法和两个设置方法。multipart 与模板文件/目录选择只向插件返回会话级不透明 token，复制、保存和文件选择都由 Host 执行；模板 token 绑定类型且只能消费一次，批处理返回和错误响应拒绝泄漏本地绝对路径。切换工具、停用或卸载会销毁 iframe、消息端口和尚未消费的 token。
+- 基础权限为 `host.theme.read`、`host.notification.show`、`host.file.save`；通用桌面能力另以 `host.clipboard.write`、`host.external.open` 和 `host.app.activate` 独立授权，不借用 HTTP 权限。`host.ui.auxiliary` 只允许应用打开自己 manifest 已声明的辅助窗口，64 KiB 激活 payload 通过目标窗口的 `host.ui.activated` 通知交付。HTTP 插件另声明 `host.http.request`、`host.http.stream`、`host.http.data`，分别代理一次请求、长连接和 Data API；主图模板插件声明 `host.template.project`，仅能调用模板方法白名单；剪贴板应用声明 `host.clipboard.history`，只开放六个历史方法和两个设置方法。multipart 与模板文件/目录选择只向插件返回会话级不透明 token，复制、保存和文件选择都由 Host 执行；模板 token 绑定类型且只能消费一次，批处理返回和错误响应拒绝泄漏本地绝对路径。切换工具、停用或卸载会销毁 iframe、消息端口和尚未消费的 token。
+- `host.app.activate` 只能激活已安装、启用且可加载的其他动态应用。Host 在 acceptance 响应前把最多 64 KiB 的 JSON payload 加入目标队列，响应后才导航，并在目标主页面握手确认后按 FIFO 通过 `host.app.activated` 交付真实 `sourceAppId`；每个目标最多保留 32 项。未响应的请求从队列撤销，已响应但目标加载或通知失败的内容保留到当前进程内下次可用 session，不因源 iframe 销毁而丢失。
 
 ### 原生 Service 与共享数据
 
@@ -272,7 +273,7 @@ export function useTheme(
 - 只为已安装、已启用、带合法 `nativeService` 的应用启动或连接 service；入口文件仍由安装 registry 的 hash 契约约束。
 - 按 app 解析受控数据目录：HTTP 保持 `${app_data_dir}/http`，剪贴板使用 `${app_data_dir}/clipboard`，Aria2 使用 `${app_data_dir}/aria2`，主图模板使用 `${app_data_dir}/ecommerce`，其他应用使用 `${app_data_dir}/native-services/<appId>`；runtime 管理 endpoint/lease、并发启动、owned child 生命周期、版本协商、请求超时和稳定错误码。
 - `plugin_connect_native_service` 建立连接，`plugin_native_service_request` 代理 Host API 2.x 请求；service 事件带 `appId` 统一转发给 `PluginFrame`。
-- transport 只开放显式领域方法：HTTP 继续映射三项 `host.http.*` 权限，下载七个方法映射到 `host.download.tasks`，模板十三个项目方法映射到 `host.template.project`；不提供任意 native service call。
+- transport 只开放显式领域方法：HTTP 继续映射三项 `host.http.*` 权限，下载七个方法映射到 `host.download.tasks`，模板十三个项目方法映射到 `host.template.project`，抖音解析/抽取、小红书、B 站和 YouTube 五个方法映射到 `host.video.extract`；不提供任意 native service call。视频调用还按方法限制平台 URL host、精确参数字段及无凭证代理，未来 service 新增参数不会自动扩张既有权限。
 - 不实现 HTTP、下载或其他应用业务，也不持有业务 SQLite schema；业务状态均由各自版本化 service 拥有。
 
 ### `src-tauri/src/updater/`
@@ -406,3 +407,7 @@ Root 私钥保持离线，日常 Catalog 只使用 Root 授权的独立 Signing 
 ### 2026-11-16 主图模板接管后永久退权旧 owner
 
 `attemplate-service` 在原目录完成 SQLite、项目 JSON 和素材引用校验后写入永久 `owned` marker，宿主旧模板 command 即使插件停用或卸载也不自动恢复。相比复制旧库或保留可逆双 owner，该方案要求独立版与插件版共同承担恢复能力，但避免模板、素材和批量缓存形成两个可写副本。
+
+### 2026-11-16 跨应用跳转由 Host activation 队列协调
+
+动态应用之间只通过 `host.app.activate` 请求 Host 导航并交付有界 payload，真实来源由当前 session 注入；视频解析继续使用独立领域权限和精确 service 方法白名单。相比复用仅面向同应用辅助窗口的 `host.ui.open`、调用目标 service 或在宿主保留视频专用 handoff，该方案增加两阶段队列状态，但避免源 iframe 提前卸载、跨应用越权和业务特判。

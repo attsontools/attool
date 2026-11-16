@@ -415,6 +415,10 @@ fn validate_manifest(
                 | "host.template.project"
                 | "host.ui.auxiliary"
                 | "host.clipboard.history"
+                | "host.app.activate"
+                | "host.clipboard.write"
+                | "host.external.open"
+                | "host.video.extract"
         )
     }) {
         return Err(PackageError::new(
@@ -492,6 +496,7 @@ fn validate_manifest(
             || permission == "host.download.tasks"
             || permission == "host.template.project"
             || permission == "host.clipboard.history"
+            || permission == "host.video.extract"
     });
     if (host_min.major == 2) != manifest.native_service.is_some()
         || (requests_native_service && manifest.native_service.is_none())
@@ -950,6 +955,58 @@ mod tests {
         let package = inspect_package(&path, &HostEnvironment::current("2.0.0"), &keys).unwrap();
 
         assert_eq!(package.permissions, ["host.template.project"]);
+    }
+
+    #[test]
+    fn accepts_general_app_permissions_without_a_native_service() {
+        let index = b"<!doctype html><title>Video</title>";
+        let permissions = "[\"host.app.activate\",\"host.clipboard.write\",\"host.external.open\"]";
+        let (_directory, path, signing_key) = package_with_index(
+            index,
+            index,
+            "com.attson.video",
+            "0.1.0-alpha.0",
+            permissions,
+        );
+        let keys = HashMap::from([("attool-p0-test".to_string(), signing_key.verifying_key())]);
+
+        let package = inspect_package(&path, &HostEnvironment::current("1.0.0"), &keys).unwrap();
+
+        assert_eq!(
+            package.permissions,
+            [
+                "host.app.activate",
+                "host.clipboard.write",
+                "host.external.open"
+            ]
+        );
+    }
+
+    #[test]
+    fn accepts_video_extract_only_with_a_host_api_two_native_service() {
+        let (_directory, path, signing_key) = native_service_package(
+            "0.1.0-alpha.0",
+            1,
+            None,
+            "2.0.0",
+            serde_json::json!(["host.video.extract"]),
+        );
+        let keys = HashMap::from([("attool-p0-test".to_string(), signing_key.verifying_key())]);
+        let package = inspect_package(&path, &HostEnvironment::current("2.0.0"), &keys).unwrap();
+        assert_eq!(package.permissions, ["host.video.extract"]);
+
+        let index = b"<!doctype html><title>Video</title>";
+        let (_directory, path, signing_key) = package_with_index(
+            index,
+            index,
+            "com.attson.video",
+            "0.1.0-alpha.0",
+            "[\"host.video.extract\"]",
+        );
+        let keys = HashMap::from([("attool-p0-test".to_string(), signing_key.verifying_key())]);
+        let error = inspect_package(&path, &HostEnvironment::current("1.0.0"), &keys)
+            .expect_err("video extraction requires a native service");
+        assert_eq!(error.code, "PLUGIN_NATIVE_SERVICE_REQUIRED");
     }
 
     #[test]

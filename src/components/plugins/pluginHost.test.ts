@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { AppActivationError } from './appActivation';
 import { createPluginHostSession, type HostMessagePort, type HostRpcMessage } from './pluginHost';
 import type { InstalledPlugin } from './types';
 
@@ -74,6 +75,25 @@ const template: InstalledPlugin = {
   }
 };
 
+const video: InstalledPlugin = {
+  ...codec,
+  appId: 'com.attson.video',
+  name: '视频链接抽取',
+  permissions: [
+    'host.app.activate',
+    'host.clipboard.write',
+    'host.external.open',
+    'host.video.extract'
+  ],
+  nativeService: {
+    entry: 'native/atvideo-service',
+    version: '0.1.0-alpha.0',
+    sha256: 'e'.repeat(64),
+    protocolVersion: 1,
+    lifecycle: 'onDemand'
+  }
+};
+
 const clipboard: InstalledPlugin = {
   ...codec,
   appId: 'com.attson.clipboard',
@@ -108,6 +128,274 @@ async function flush() {
 }
 
 describe('plugin host session', () => {
+  it('posts app activation acceptance before navigation and notifies a main target session', async () => {
+    const port = new FakePort();
+    const sequence: string[] = [];
+    const activateApp = vi.fn(async () => ({
+      result: { accepted: true as const, activationId: 'activation-1' },
+      commit: () => sequence.push('commit'),
+      discard: vi.fn()
+    }));
+    port.onPost = () => sequence.push('response');
+    const session = createPluginHostSession({
+      app: video,
+      port,
+      theme: () => 'dark',
+      notify: vi.fn(),
+      saveFile: vi.fn(),
+      activateApp,
+      requestNativeService: vi.fn()
+    });
+    const videoRequest = (id: string, method: string, params: unknown = {}): HostRpcMessage => ({
+      jsonrpc: '2.0', id, apiVersion: '2.0', appId: video.appId, method, params
+    });
+
+    port.receive(videoRequest('1', 'host.handshake'));
+    await flush();
+    sequence.length = 0;
+    port.receive(videoRequest('2', 'host.app.activate', {
+      appId: 'com.attson.aria2',
+      payload: { version: 1, kind: 'download.urls', urls: ['https://example.com/a.mp4'] }
+    }));
+    await flush();
+
+    expect(activateApp).toHaveBeenCalledWith({
+      sourceAppId: video.appId,
+      targetAppId: 'com.attson.aria2',
+      payload: { version: 1, kind: 'download.urls', urls: ['https://example.com/a.mp4'] }
+    });
+    expect(port.sent.at(-1)).toMatchObject({
+      id: '2', result: { accepted: true, activationId: 'activation-1' }
+    });
+    expect(sequence).toEqual(['response', 'commit']);
+
+    session.notifyAppActivated({
+      activationId: 'activation-target',
+      sourceAppId: video.appId,
+      payload: { version: 1, kind: 'download.urls', urls: ['https://example.com/b.mp4'] }
+    });
+    expect(port.sent.at(-1)).toMatchObject({
+      method: 'host.app.activated',
+      params: {
+        activationId: 'activation-target',
+        sourceAppId: video.appId,
+        payload: { version: 1, kind: 'download.urls', urls: ['https://example.com/b.mp4'] }
+      }
+    });
+  });
+
+  it('rejects unauthorized, oversized and unavailable app activations', async () => {
+    const invoke = async (app: InstalledPlugin, payload: unknown, activateApp = vi.fn()) => {
+      const port = new FakePort();
+      createPluginHostSession({
+        app,
+        port,
+        theme: () => 'dark',
+        notify: vi.fn(),
+        saveFile: vi.fn(),
+        activateApp,
+        requestNativeService: vi.fn()
+      });
+      const send = (id: string, method: string, params: unknown = {}): HostRpcMessage => ({
+        jsonrpc: '2.0',
+        id,
+        apiVersion: app.nativeService ? '2.0' : '1.0',
+        appId: app.appId,
+        method,
+        params
+      });
+      port.receive(send('handshake', 'host.handshake'));
+      await flush();
+      port.receive(send('activate', 'host.app.activate', {
+        appId: 'com.attson.aria2', payload
+      }));
+      await flush();
+      return { response: port.sent.at(-1), activateApp };
+    };
+
+    const unauthorized = await invoke(codec, {});
+    expect(unauthorized.response).toMatchObject({
+      error: { data: { code: 'HOST_PERMISSION_DENIED' } }
+    });
+    expect(unauthorized.activateApp).not.toHaveBeenCalled();
+
+    const oversized = await invoke(video, { data: 'x'.repeat(64 * 1024) });
+    expect(oversized.response).toMatchObject({
+      error: { data: { code: 'HOST_APP_ACTIVATION_PAYLOAD_TOO_LARGE' } }
+    });
+    expect(oversized.activateApp).not.toHaveBeenCalled();
+
+    const disabled = await invoke(video, {}, vi.fn(async () => {
+      throw new AppActivationError('HOST_APP_DISABLED', 'Target application is disabled');
+    }));
+    expect(disabled.response).toMatchObject({
+      error: { data: { code: 'HOST_APP_DISABLED' } }
+    });
+  });
+
+  it('discards an accepted activation when the source session closes before responding', async () => {
+    const port = new FakePort();
+    const discard = vi.fn();
+    const session = createPluginHostSession({
+      app: video,
+      port,
+      theme: () => 'dark',
+      notify: vi.fn(),
+      saveFile: vi.fn(),
+      activateApp: vi.fn(async () => ({
+        result: { accepted: true as const, activationId: 'activation-1' },
+        commit: vi.fn(),
+        discard
+      })),
+      requestNativeService: vi.fn()
+    });
+    const send = (id: string, method: string, params: unknown = {}): HostRpcMessage => ({
+      jsonrpc: '2.0', id, apiVersion: '2.0', appId: video.appId, method, params
+    });
+    port.receive(send('1', 'host.handshake'));
+    await flush();
+    port.receive(send('2', 'host.app.activate', { appId: 'com.attson.aria2' }));
+    session.terminate();
+    await flush();
+
+    expect(discard).toHaveBeenCalledOnce();
+  });
+
+  it('keeps activation commit actions isolated when an untrusted client reuses a request id', async () => {
+    const port = new FakePort();
+    const commits: string[] = [];
+    const activateApp = vi.fn()
+      .mockResolvedValueOnce({
+        result: { accepted: true as const, activationId: 'activation-1' },
+        commit: () => commits.push('first'),
+        discard: vi.fn()
+      })
+      .mockResolvedValueOnce({
+        result: { accepted: true as const, activationId: 'activation-2' },
+        commit: () => commits.push('second'),
+        discard: vi.fn()
+      });
+    createPluginHostSession({
+      app: video,
+      port,
+      theme: () => 'dark',
+      notify: vi.fn(),
+      saveFile: vi.fn(),
+      activateApp,
+      requestNativeService: vi.fn()
+    });
+    const send = (method: string, params: unknown = {}): HostRpcMessage => ({
+      jsonrpc: '2.0', id: 'same-id', apiVersion: '2.0', appId: video.appId, method, params
+    });
+    port.receive(send('host.handshake'));
+    await flush();
+
+    port.receive(send('host.app.activate', { appId: 'com.attson.aria2', payload: { index: 1 } }));
+    port.receive(send('host.app.activate', { appId: 'com.attson.aria2', payload: { index: 2 } }));
+    await flush();
+
+    expect(commits).toEqual(['first', 'second']);
+    expect(port.sent.filter((message) => 'id' in message && message.id === 'same-id')).toHaveLength(3);
+  });
+
+  it('writes text and opens only safe external HTTP URLs through independent permissions', async () => {
+    const port = new FakePort();
+    const copyText = vi.fn(async () => {});
+    const openExternal = vi.fn(async () => {});
+    createPluginHostSession({
+      app: video,
+      port,
+      theme: () => 'dark',
+      notify: vi.fn(),
+      saveFile: vi.fn(),
+      copyText,
+      openExternal,
+      requestNativeService: vi.fn()
+    });
+    const send = (id: string, method: string, params: unknown = {}): HostRpcMessage => ({
+      jsonrpc: '2.0', id, apiVersion: '2.0', appId: video.appId, method, params
+    });
+    port.receive(send('1', 'host.handshake'));
+    await flush();
+
+    port.receive(send('2', 'host.clipboard.writeText', { text: 'https://example.com/a.mp4' }));
+    await flush();
+    expect(copyText).toHaveBeenCalledWith('https://example.com/a.mp4');
+    expect(port.sent.at(-1)).toMatchObject({ id: '2', result: { copied: true } });
+
+    port.receive(send('3', 'host.external.open', { url: 'https://example.com/watch?v=1' }));
+    await flush();
+    expect(openExternal).toHaveBeenCalledWith('https://example.com/watch?v=1');
+    expect(port.sent.at(-1)).toMatchObject({ id: '3', result: { opened: true } });
+
+    for (const [id, method, params] of [
+      ['large', 'host.clipboard.writeText', { text: 'x'.repeat(1024 * 1024 + 1) }],
+      ['credentials', 'host.external.open', { url: 'https://user:secret@example.com/video' }],
+      ['scheme', 'host.external.open', { url: 'file:///etc/passwd' }]
+    ] as const) {
+      port.receive(send(id, method, params));
+      await flush();
+      expect(port.sent.at(-1)).toMatchObject({
+        id, error: { data: { code: 'HOST_INVALID_PARAMS' } }
+      });
+    }
+    expect(copyText).toHaveBeenCalledTimes(1);
+    expect(openExternal).toHaveBeenCalledTimes(1);
+  });
+
+  it('routes only five video extraction methods with platform-scoped URLs and safe proxies', async () => {
+    const port = new FakePort();
+    const requestNativeService = vi.fn(async (method: string) => ({ method }));
+    createPluginHostSession({
+      app: video,
+      port,
+      theme: () => 'dark',
+      notify: vi.fn(),
+      saveFile: vi.fn(),
+      requestNativeService
+    });
+    const send = (id: string, method: string, params: unknown = {}): HostRpcMessage => ({
+      jsonrpc: '2.0', id, apiVersion: '2.0', appId: video.appId, method, params
+    });
+    port.receive(send('1', 'host.handshake'));
+    await flush();
+
+    const allowed = [
+      ['video.douyin.resolve', { url: 'https://v.douyin.com/abc/' }],
+      ['video.douyin.extract', { url: 'https://www.douyin.com/video/123' }],
+      ['video.xhs.extract', { url: 'https://xhslink.com/a1b2' }],
+      ['video.bilibili.extract', { url: 'https://www.bilibili.com/video/BV1xx' }],
+      ['video.youtube.extract', {
+        url: 'https://youtu.be/example', proxy: 'socks5://127.0.0.1:1080'
+      }]
+    ] as const;
+    for (const [index, [method, params]] of allowed.entries()) {
+      port.receive(send(String(index + 2), 'host.video.extract', { method, params }));
+      await flush();
+    }
+    expect(requestNativeService.mock.calls).toEqual(allowed.map(([method, params]) => [method, params]));
+
+    for (const [id, method, params, code] of [
+      ['unknown', 'video.youtube.cookies', {}, 'HOST_VIDEO_METHOD_DENIED'],
+      ['wrong-host', 'video.youtube.extract', { url: 'https://www.douyin.com/video/123' }, 'HOST_INVALID_PARAMS'],
+      ['fake-host', 'video.youtube.extract', { url: 'https://www.youtube.com.evil/video' }, 'HOST_INVALID_PARAMS'],
+      ['proxy-creds', 'video.youtube.extract', {
+        url: 'https://youtu.be/example', proxy: 'http://user:secret@127.0.0.1:7890'
+      }, 'HOST_INVALID_PARAMS'],
+      ['extra-param', 'video.youtube.extract', {
+        url: 'https://youtu.be/example', cookies: 'SID=secret'
+      }, 'HOST_INVALID_PARAMS'],
+      ['proxy-bytes', 'video.youtube.extract', {
+        url: 'https://youtu.be/example', proxy: `http://127.0.0.1:7890/?q=${'中'.repeat(700)}`
+      }, 'HOST_INVALID_PARAMS']
+    ] as const) {
+      port.receive(send(id, 'host.video.extract', { method, params }));
+      await flush();
+      expect(port.sent.at(-1)).toMatchObject({ id, error: { data: { code } } });
+    }
+    expect(requestNativeService).toHaveBeenCalledTimes(5);
+  });
+
   it('opens only signed auxiliary windows and delivers activation to the target session', async () => {
     const port = new FakePort();
     const openAuxiliaryWindow = vi.fn(async () => ({ opened: true }));

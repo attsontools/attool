@@ -17,7 +17,7 @@ const CATALOG_BASE_URL: &str =
     "https://raw.githubusercontent.com/attsontools/attool/main/catalog/v1";
 const METADATA_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 const SIGNATURE_LIMIT_BYTES: usize = 1024;
-const KNOWN_PERMISSIONS: [&str; 10] = [
+const KNOWN_PERMISSIONS: [&str; 14] = [
     "host.theme.read",
     "host.file.save",
     "host.notification.show",
@@ -28,6 +28,10 @@ const KNOWN_PERMISSIONS: [&str; 10] = [
     "host.template.project",
     "host.ui.auxiliary",
     "host.clipboard.history",
+    "host.app.activate",
+    "host.clipboard.write",
+    "host.external.open",
+    "host.video.extract",
 ];
 
 #[derive(Debug, Clone)]
@@ -1144,7 +1148,8 @@ fn validate_release(release: &CatalogRelease, sha256_pattern: &Regex) -> Result<
         if (permission.starts_with("host.http.")
             || permission == "host.download.tasks"
             || permission == "host.template.project"
-            || permission == "host.clipboard.history")
+            || permission == "host.clipboard.history"
+            || permission == "host.video.extract")
             && host_api_major != Some(2)
         {
             return Err(CatalogError::new(
@@ -1478,6 +1483,81 @@ mod tests {
                 "host.clipboard.history"
             ]
         );
+    }
+
+    #[test]
+    fn accepts_general_app_permissions_on_host_api_one() {
+        let mut catalog: Value = serde_json::from_str(CATALOG_JSON).unwrap();
+        catalog["apps"][0]["channels"]["stable"]["permissions"] = serde_json::json!([
+            "host.app.activate",
+            "host.clipboard.write",
+            "host.external.open"
+        ]);
+        let signature = sign_value(&catalog);
+
+        let verified = CatalogVerifier::from_base64(ROOT_PUBLIC_KEY)
+            .unwrap()
+            .verify(
+                ROOT_JSON,
+                ROOT_SIGNATURE,
+                &catalog.to_string(),
+                &signature,
+                Utc.with_ymd_and_hms(2026, 11, 11, 0, 0, 0).unwrap(),
+                0,
+                0,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(
+            verified.catalog.apps[0].channels.stable.permissions,
+            [
+                "host.app.activate",
+                "host.clipboard.write",
+                "host.external.open"
+            ]
+        );
+    }
+
+    #[test]
+    fn accepts_video_extract_only_on_host_api_two() {
+        let mut catalog: Value = serde_json::from_str(CATALOG_JSON).unwrap();
+        catalog["apps"][0]["channels"]["stable"]["hostApi"] =
+            serde_json::json!({ "min": "2.0.0", "max": "2.x" });
+        catalog["apps"][0]["channels"]["stable"]["permissions"] =
+            serde_json::json!(["host.video.extract"]);
+        let signature = sign_value(&catalog);
+        CatalogVerifier::from_base64(ROOT_PUBLIC_KEY)
+            .unwrap()
+            .verify(
+                ROOT_JSON,
+                ROOT_SIGNATURE,
+                &catalog.to_string(),
+                &signature,
+                Utc.with_ymd_and_hms(2026, 11, 11, 0, 0, 0).unwrap(),
+                0,
+                0,
+                true,
+            )
+            .unwrap();
+
+        catalog["apps"][0]["channels"]["stable"]["hostApi"] =
+            serde_json::json!({ "min": "1.0.0", "max": "1.x" });
+        let signature = sign_value(&catalog);
+        let error = CatalogVerifier::from_base64(ROOT_PUBLIC_KEY)
+            .unwrap()
+            .verify(
+                ROOT_JSON,
+                ROOT_SIGNATURE,
+                &catalog.to_string(),
+                &signature,
+                Utc.with_ymd_and_hms(2026, 11, 11, 0, 0, 0).unwrap(),
+                0,
+                0,
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "CATALOG_PERMISSION_UNKNOWN");
     }
 
     #[test]
