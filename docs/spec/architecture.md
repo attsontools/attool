@@ -98,7 +98,7 @@ HTTP 与剪贴板数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app
 - 同一客户端连接允许请求并发分派，因此 `http.cancel` 可以中断仍在执行的 `http.send`；响应写入仍串行化，SSE/WS 保持 2000 条、5 MiB buffer 和 generation 语义。`stream.open` response 前到达的事件由客户端按 generation 暂存并在响应后交付，不能因 RPC/event 时序丢失首帧。
 - 宿主不包含 HTTP UI、Store、网络命令或数据库连接。停用/卸载插件不会恢复隐藏的内置实现；历史 `lastTool=http` 只映射到已启用的动态应用入口。
 
-`com.attson.template` 的 Native Service 固定复用 `${app_data_dir}/ecommerce`，以便后续原位接管现有模板 SQLite、素材和批量缓存；其他未知应用仍使用 `${app_data_dir}/native-services/<appId>`。Host API 与 Rust 网关共同限制 `template.templates.*`、PSD/素材导入及批量注册、渲染、保存方法，文件与目录路径只在 token 解析后进入 service，插件页面不接触真实路径。当前阶段只建立权限与目录契约，数据 owner 切换和旧内置写入保护由独立模板应用接管阶段完成。
+`com.attson.template` 的 standalone 与测试签名 `.atpkg` 复用同一 Vue 编辑器、`attemplate-service` 和独立 `psd-bridge`，固定原位接管 `${app_data_dir}/ecommerce` 中的模板 SQLite、素材和批量缓存；其他未知应用仍使用 `${app_data_dir}/native-services/<appId>`。首次接管要求宿主 capability，service 持有 owner lock，经完整性校验后把 `migrating` 原子切换为永久 `owned`；失败不改用户数据，成功后宿主旧模板 command 与第二个 service 均拒绝访问，停用或卸载测试包也不恢复旧 owner。Host API 与 Rust 网关共同限制 `template.templates.*`、PSD/素材导入及批量注册、渲染、保存方法，文件与目录路径只在 token 解析后进入 service；公共模板、素材、source 和 output DTO 只暴露受限预览与不透明 ID。Linux x86_64 真实测试包已通过签名安装、PSD 导入、编辑保存、两图批量渲染、选中导出、双客户端共享和路径泄漏检查；生产 Publisher、五目标 Release、Catalog 生命周期及宿主内置实现删除分别留在 P2、P3。
 
 `com.attson.clipboard` 的独立版与插件版复用 `atclipboard-service`，固定原位接管 `${app_data_dir}/clipboard`，并通过 `host.clipboard.history` 的双层白名单访问。service 以生命周期锁和 `migrating / owned` marker 保证单一 owner；旧设置表为空时沿用历史默认值且不改写数据库，部分缺失或非法设置继续 fail closed。公共图片条目不得返回 asset、数据库或缓存路径，预览只接受 PNG/JPEG/WebP base64 data URL 且整串不超过 2 MiB；列表单页最多 100 条。后台采集、三类恢复、暂停、保留策略、清空未收藏、停启、卸载、重装、升级和首启失败回滚已通过两版生产 Catalog 与真实 500 条旧库验证；Wayland 插件模式使用宿主 `--plugin-window` 命令激活签名 history 窗口。宿主旧 UI、SQLite owner、watcher、领域快捷键、commands 和固定窗口已删除；停用或卸载插件不触发宿主回退。
 
@@ -402,3 +402,7 @@ Root 私钥保持离线，日常 Catalog 只使用 Root 授权的独立 Signing 
 ### 2026-11-15 剪贴板仅保留独立应用入口
 
 生产 Catalog、升级回滚和真实旧库生命周期验证完成后，平台完整删除内置剪贴板 UI、SQLite owner、watcher、领域快捷键、commands 与固定窗口，只保留动态应用入口、service 桥接和签名辅助窗口。相比隐藏旧入口或保留兼容命令，完整退场避免宿主再次成为数据 owner，也确保停用或卸载插件不会触发不可见回退。
+
+### 2026-11-16 主图模板接管后永久退权旧 owner
+
+`attemplate-service` 在原目录完成 SQLite、项目 JSON 和素材引用校验后写入永久 `owned` marker，宿主旧模板 command 即使插件停用或卸载也不自动恢复。相比复制旧库或保留可逆双 owner，该方案要求独立版与插件版共同承担恢复能力，但避免模板、素材和批量缓存形成两个可写副本。
