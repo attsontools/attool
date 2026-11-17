@@ -1135,36 +1135,60 @@ async fn extract_youtube_video(
 
 #[tauri::command]
 async fn open_external_url(url: String) -> Result<(), String> {
-    // 只允许 http/https，避免任意命令注入（例如 file://、传参、shell 元字符）
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return Err("仅支持 http/https 协议".to_string());
-    }
-
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut c = std::process::Command::new("open");
-        c.arg(&url);
-        c
-    };
-
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut c = std::process::Command::new("cmd");
-        c.args(["/c", "start", "", &url]);
-        c
-    };
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let mut command = {
-        let mut c = std::process::Command::new("xdg-open");
-        c.arg(&url);
-        c
-    };
+    let (program, args) = external_url_command(std::env::consts::OS, &url)?;
+    let mut command = std::process::Command::new(program);
+    command.args(args);
 
     command
         .spawn()
         .map(|_| ())
         .map_err(|error| format!("打开链接失败：{error}"))
+}
+
+fn external_url_command(target_os: &str, raw_url: &str) -> Result<(String, Vec<String>), String> {
+    let url = url::Url::parse(raw_url).map_err(|_| "链接格式无效".to_string())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err("仅支持不含凭证的 http/https 链接".to_string());
+    }
+    let url = url.to_string();
+    match target_os {
+        "macos" => Ok(("open".to_string(), vec![url])),
+        "windows" => Ok((
+            "rundll32.exe".to_string(),
+            vec!["url.dll,FileProtocolHandler".to_string(), url],
+        )),
+        "linux" => Ok(("xdg-open".to_string(), vec![url])),
+        _ => Err("当前系统不支持打开外部链接".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod external_url_tests {
+    use super::external_url_command;
+
+    #[test]
+    fn windows_opener_does_not_pass_plugin_urls_through_cmd() {
+        let url = "https://example.com/watch?v=1&calc.exe";
+        let (program, args) = external_url_command("windows", url).unwrap();
+
+        assert_ne!(program.to_ascii_lowercase(), "cmd.exe");
+        assert_ne!(program.to_ascii_lowercase(), "cmd");
+        assert_eq!(args.last().map(String::as_str), Some(url));
+    }
+
+    #[test]
+    fn external_url_command_rejects_unsafe_urls() {
+        for url in [
+            "file:///etc/passwd",
+            "https://user:secret@example.com/video",
+            "not a url",
+        ] {
+            assert!(external_url_command("linux", url).is_err());
+        }
+    }
 }
 
 fn open_folder(folder: &str) -> Result<(), String> {

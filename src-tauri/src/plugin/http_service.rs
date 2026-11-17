@@ -894,6 +894,11 @@ fn required_permission(method: &str) -> Result<&'static str, NativeServiceError>
         | "template.batch.sources.register"
         | "template.batch.run"
         | "template.batch.save" => Ok("host.template.project"),
+        "video.douyin.resolve"
+        | "video.douyin.extract"
+        | "video.xhs.extract"
+        | "video.bilibili.extract"
+        | "video.youtube.extract" => Ok("host.video.extract"),
         "clipboard.history.list"
         | "clipboard.history.get"
         | "clipboard.history.pin"
@@ -1120,6 +1125,16 @@ impl ServiceClient {
 }
 
 fn request_timeout(method: &str, params: &Value) -> Duration {
+    if matches!(
+        method,
+        "video.douyin.resolve"
+            | "video.douyin.extract"
+            | "video.xhs.extract"
+            | "video.bilibili.extract"
+            | "video.youtube.extract"
+    ) {
+        return Duration::from_secs(35);
+    }
     if method != "http.send" {
         return DEFAULT_REQUEST_TIMEOUT;
     }
@@ -1605,6 +1620,21 @@ mod tests {
     }
 
     #[test]
+    fn maps_only_declared_video_service_methods_to_permissions() {
+        for method in [
+            "video.douyin.resolve",
+            "video.douyin.extract",
+            "video.xhs.extract",
+            "video.bilibili.extract",
+            "video.youtube.extract",
+        ] {
+            assert_eq!(required_permission(method).unwrap(), "host.video.extract");
+        }
+        assert!(required_permission("video.process.spawn").is_err());
+        assert!(required_permission("video.youtube.download").is_err());
+    }
+
+    #[test]
     fn maps_native_service_data_directories_without_moving_http_data() {
         let root = Path::new("/tmp/attool-data");
         assert_eq!(
@@ -1644,6 +1674,23 @@ mod tests {
             request_timeout("data.tabs.list", &json!({})),
             DEFAULT_REQUEST_TIMEOUT
         );
+    }
+
+    #[test]
+    fn video_request_timeout_leaves_room_for_the_platform_timeout_response() {
+        for method in [
+            "video.douyin.resolve",
+            "video.douyin.extract",
+            "video.xhs.extract",
+            "video.bilibili.extract",
+            "video.youtube.extract",
+        ] {
+            assert_eq!(
+                request_timeout(method, &json!({})),
+                Duration::from_secs(35),
+                "{method}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2480,6 +2527,169 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(listed["tasks"][0]["id"], id);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires ATTEMPLATE_TEST_PACKAGE and ATTEMPLATE_TEST_PSD"]
+    async fn packaged_template_plugin_imports_psd_and_shares_path_free_outputs() {
+        let package =
+            std::env::var("ATTEMPLATE_TEST_PACKAGE").expect("ATTEMPLATE_TEST_PACKAGE is required");
+        let psd = std::env::var("ATTEMPLATE_TEST_PSD").expect("ATTEMPLATE_TEST_PSD is required");
+        let directory = tempdir().unwrap();
+        let data_directory = directory.path().join("ecommerce");
+        std::fs::create_dir_all(&data_directory).unwrap();
+        std::fs::write(
+            data_directory.join("template-takeover-capability-v1"),
+            b"1\n",
+        )
+        .unwrap();
+        let store = PluginStore::open(directory.path().join("plugins")).unwrap();
+        let public_key = VerifyingKey::from_bytes(&[
+            0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64,
+            0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68,
+            0xf7, 0x07, 0x51, 0x1a,
+        ])
+        .unwrap();
+        let keys = HashMap::from([("attool-p0-test".to_string(), public_key)]);
+        let installed = store
+            .install(
+                Path::new(&package),
+                &HostEnvironment::current("2.0.0"),
+                &keys,
+            )
+            .unwrap();
+        assert_eq!(installed.app_id, "com.attson.template");
+        assert_eq!(
+            installed.permissions,
+            ["host.theme.read", "host.template.project"]
+        );
+
+        let runtime = NativeServiceRuntime::with_event_sink(
+            store,
+            directory.path().to_path_buf(),
+            Arc::new(NoopEventSink),
+        );
+        runtime.connect("com.attson.template").await.unwrap();
+        let mut service_cleanup = PackagedServiceCleanup::new(data_directory.clone());
+        let imported = runtime
+            .request(
+                "com.attson.template",
+                "template.psd.import",
+                json!({ "sourcePath": psd }),
+            )
+            .await
+            .unwrap();
+        let project = &imported["project"];
+        assert_eq!(project["canvasWidth"], 101);
+        assert_eq!(project["canvasHeight"], 55);
+        assert!(project.get("sourcePsdPath").is_none());
+        assert!(project.get("previewPath").is_none());
+        assert!(!imported.to_string().contains(&psd));
+
+        let mut edited = project.clone();
+        edited["name"] = json!("已编辑 PSD 模板");
+        let saved = runtime
+            .request(
+                "com.attson.template",
+                "template.templates.save",
+                json!({ "project": edited }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved["project"]["name"], "已编辑 PSD 模板");
+
+        let image_layer_id = project["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|layer| layer["type"] == "image")
+            .and_then(|layer| layer["id"].as_str())
+            .unwrap();
+        let green = directory.path().join("green.png");
+        let blue = directory.path().join("blue.png");
+        RgbaImage::from_pixel(1, 1, Rgba([0, 255, 0, 255]))
+            .save(&green)
+            .unwrap();
+        RgbaImage::from_pixel(1, 1, Rgba([0, 0, 255, 255]))
+            .save(&blue)
+            .unwrap();
+        let registered = runtime
+            .request(
+                "com.attson.template",
+                "template.batch.sources.register",
+                json!({ "sourcePaths": [green, blue] }),
+            )
+            .await
+            .unwrap();
+        let first_source = registered["sources"][0]["id"].as_str().unwrap();
+        let second_source = registered["sources"][1]["id"].as_str().unwrap();
+        let rendered = runtime
+            .request(
+                "com.attson.template",
+                "template.batch.run",
+                json!({
+                    "templateId": project["id"],
+                    "tasks": [{
+                        "layerId": image_layer_id,
+                        "variants": [
+                            { "kind": "image", "sourceId": first_source },
+                            { "kind": "image", "sourceId": second_source }
+                        ]
+                    }],
+                    "mode": "parallel"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rendered["outputs"].as_array().unwrap().len(), 2);
+        assert!(!rendered
+            .to_string()
+            .contains(directory.path().to_string_lossy().as_ref()));
+
+        let export_directory = directory.path().join("selected-exports");
+        std::fs::create_dir(&export_directory).unwrap();
+        let selected_output = rendered["outputs"][1]["id"].as_str().unwrap();
+        let exported = runtime
+            .request(
+                "com.attson.template",
+                "template.batch.save",
+                json!({
+                    "outputIds": [selected_output],
+                    "targetDirectory": export_directory
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exported, json!({ "saved": 1 }));
+        assert_eq!(
+            std::fs::read_dir(directory.path().join("selected-exports"))
+                .unwrap()
+                .count(),
+            1
+        );
+
+        let second_client = ServiceClient::connect(
+            &data_directory.join("service.endpoint.json"),
+            &data_directory,
+            "com.attson.template",
+            "standalone-test",
+        )
+        .await
+        .unwrap();
+        let listed = second_client
+            .request("template.templates.list", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(listed["templates"][0]["name"], "已编辑 PSD 模板");
+        let marker: Value = serde_json::from_slice(
+            &std::fs::read(data_directory.join("template-takeover.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(marker["state"], "owned");
+
+        runtime.disconnect("com.attson.template").await.unwrap();
+        service_cleanup.stop();
     }
 
     #[cfg(unix)]

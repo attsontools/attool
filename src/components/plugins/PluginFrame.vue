@@ -16,6 +16,11 @@ import {
   type PluginHostSession
 } from './pluginHost';
 import { createLatestActivationDispatcher } from './auxiliaryActivation';
+import type {
+  AcceptedAppActivation,
+  AppActivationNotification,
+  AppActivationRequest
+} from './appActivation';
 import { buildPluginFrameDocument, pluginAssetBaseUrl } from './pluginFrameDocument';
 import type { InstalledPlugin } from './types';
 
@@ -25,6 +30,11 @@ const props = defineProps<{
   entry?: string;
   windowId?: string;
   auxiliary?: boolean;
+  activateApp?: (request: AppActivationRequest) => AcceptedAppActivation | Promise<AcceptedAppActivation>;
+  registerAppActivationTarget?: (
+    appId: string,
+    deliver: (activation: AppActivationNotification) => void
+  ) => () => void;
 }>();
 
 const emit = defineEmits<{
@@ -46,6 +56,7 @@ let handshakeTimer: ReturnType<typeof setTimeout> | null = null;
 let handlingFailure = false;
 let nativeServiceEventUnlisten: UnlistenFn | null = null;
 let auxiliaryActivationUnlisten: UnlistenFn | null = null;
+let appActivationUnregister: (() => void) | null = null;
 let disposed = false;
 
 type AuxiliaryActivation = {
@@ -72,6 +83,8 @@ const activationDispatcher = createLatestActivationDispatcher<AuxiliaryActivatio
 });
 
 function clearSession() {
+  appActivationUnregister?.();
+  appActivationUnregister = null;
   session?.terminate();
   session = null;
   activationDispatcher.reset();
@@ -178,6 +191,10 @@ async function openAuxiliaryWindow(input: HostUiOpenRequest) {
   });
 }
 
+async function openExternal(url: string) {
+  await invoke('open_external_url', { url });
+}
+
 function handleLoad() {
   clearSession();
   handlingFailure = false;
@@ -203,6 +220,8 @@ function handleLoad() {
     pickTemplateFiles,
     pickTemplateDirectory,
     copyText: writeText,
+    openExternal,
+    activateApp: props.activateApp,
     openAuxiliaryWindow,
     closeAuxiliaryWindow: props.auxiliary
       ? () => getCurrentWindow().close()
@@ -247,6 +266,16 @@ async function confirmLaunch() {
       version: props.app.version
     });
     state.value = 'ready';
+    if (!props.auxiliary && props.registerAppActivationTarget) {
+      appActivationUnregister?.();
+      appActivationUnregister = props.registerAppActivationTarget(
+        props.app.appId,
+        (activation) => {
+          if (!session) throw new Error('Application Host session is unavailable');
+          session.notifyAppActivated(activation);
+        }
+      );
+    }
   } catch {
     clearSession();
     await handleLaunchFailure('无法确认当前应用版本');

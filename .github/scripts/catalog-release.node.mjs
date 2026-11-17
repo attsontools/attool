@@ -37,11 +37,15 @@ const textPublisherKeyId = 'attson-text-2026-01';
 const httpPublisherKeyId = 'attson-http-2026-01';
 const aria2PublisherKeyId = 'attson-aria2-2026-01';
 const clipboardPublisherKeyId = 'attson-clipboard-2026-01';
+const templatePublisherKeyId = 'attson-template-2026-01';
+const videoPublisherKeyId = 'attson-video-2026-01';
 const codecApplication = await loadCatalogApplication('com.attson.codec');
 const textApplication = await loadCatalogApplication('com.attson.text');
 const httpApplication = await loadCatalogApplication('com.attson.http');
 const aria2Application = await loadCatalogApplication('com.attson.aria2');
 const clipboardApplication = await loadCatalogApplication('com.attson.clipboard');
+const templateApplication = await loadCatalogApplication('com.attson.template');
+const videoApplication = await loadCatalogApplication('com.attson.video');
 
 const root = {
   schemaVersion: 1,
@@ -57,7 +61,9 @@ const root = {
       trustKey(textPublisherKeyId),
       trustKey(httpPublisherKeyId),
       trustKey(aria2PublisherKeyId),
-      trustKey(clipboardPublisherKeyId)
+      trustKey(clipboardPublisherKeyId),
+      trustKey(templatePublisherKeyId),
+      trustKey(videoPublisherKeyId)
     ]
   }]
 };
@@ -96,7 +102,7 @@ describe('Catalog release generation', () => {
 
     assert.equal(
       dependency,
-      'https://gh-proxy.com/https://github.com/attsontools/attool-plugin-sdk/archive/410158b5e850836d5db681b1a02b13e4d55d53d6.tar.gz'
+      'https://gh-proxy.com/https://github.com/attsontools/attool-plugin-sdk/archive/7300706aa5b492cd3ef6e8e5a88153cb81ac61e0.tar.gz'
     );
     assert.ok(lockfile.includes(dependency));
   });
@@ -241,6 +247,50 @@ describe('Catalog release generation', () => {
 
     assert.deepEqual(clipboardApplication, expected);
     assert.deepEqual(await loadCatalogApplicationBySlug('clipboard'), expected);
+  });
+
+  it('loads Template Host API 2.x release policy from the application registry', async () => {
+    const expected = {
+      appId: 'com.attson.template',
+      slug: 'template',
+      repository: 'attsontools/attemplate',
+      artifactPrefix: 'AT.Template',
+      name: '主图模板',
+      description: 'PSD 导入、画布编辑与批量主图生成',
+      publisherId: 'com.attson',
+      publisherKeySecret: 'ATTEMPLATE_PUBLISHER_KEY_ID',
+      icon: 'layout',
+      hostApi: { min: '2.0.0', max: '2.x' },
+      permissions: ['host.theme.read', 'host.template.project']
+    };
+
+    assert.deepEqual(await loadCatalogApplication('com.attson.template'), expected);
+    assert.deepEqual(await loadCatalogApplicationBySlug('template'), expected);
+  });
+
+  it('loads Video Host API 2.x release policy from the application registry', async () => {
+    const expected = {
+      appId: 'com.attson.video',
+      slug: 'video',
+      repository: 'attsontools/atvideo',
+      artifactPrefix: 'AT.Video',
+      name: '视频链接抽取',
+      description: '抖音、小红书、B 站与 YouTube 链接抽取',
+      publisherId: 'com.attson',
+      publisherKeySecret: 'ATVIDEO_PUBLISHER_KEY_ID',
+      icon: 'video',
+      hostApi: { min: '2.0.0', max: '2.x' },
+      permissions: [
+        'host.theme.read',
+        'host.video.extract',
+        'host.clipboard.write',
+        'host.external.open',
+        'host.app.activate'
+      ]
+    };
+
+    assert.deepEqual(await loadCatalogApplication('com.attson.video'), expected);
+    assert.deepEqual(await loadCatalogApplicationBySlug('video'), expected);
   });
 
   it('rejects ambiguous or out-of-scope application registry entries', async () => {
@@ -778,6 +828,290 @@ describe('Catalog release generation', () => {
     }
   });
 
+  it('requires the signed Template service and PSD bridge layout', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'attool-template-catalog-test-'));
+    const publisherKeys = generateKeyPairSync('ed25519');
+    const packageRoot = structuredClone(root);
+    packageRoot.publishers[0].keys[5].publicKey = rawPublicKey(publisherKeys.publicKey);
+    const inspect = (packagePath) => inspectPluginPackage({
+      packagePath,
+      application: templateApplication,
+      root: packageRoot,
+      publishedAt: generatedAt,
+      expectedVersion: version,
+      expectedPublisherKeyId: templatePublisherKeyId
+    });
+    try {
+      const packagePath = await createPluginPackage(
+        directory,
+        publisherKeys.privateKey,
+        'linux',
+        'x86_64',
+        { application: templateApplication, publisherKeyId: templatePublisherKeyId }
+      );
+      const inspected = await inspect(packagePath);
+      assert.equal(inspected.manifest.nativeService.entry, 'native/attemplate-service');
+      assert.deepEqual(Object.keys(inspected.manifest.files).sort(), [
+        'LICENSE',
+        'native/attemplate-service',
+        'native/psd-bridge',
+        'ui/assets/app.js',
+        'ui/index.html'
+      ]);
+
+      const missingRuntime = await createPluginPackage(
+        directory,
+        publisherKeys.privateKey,
+        'linux',
+        'x86_64',
+        {
+          application: templateApplication,
+          publisherKeyId: templatePublisherKeyId,
+          omitFile: 'native/psd-bridge'
+        }
+      );
+      await assert.rejects(() => inspect(missingRuntime), /Template package files/);
+
+      const extraNative = await createPluginPackage(
+        directory,
+        publisherKeys.privateKey,
+        'linux',
+        'x86_64',
+        {
+          application: templateApplication,
+          publisherKeyId: templatePublisherKeyId,
+          extraFile: 'native/yt_dlp'
+        }
+      );
+      await assert.rejects(() => inspect(extraNative), /Template package files/);
+
+      const wrongEntry = await createPluginPackage(
+        directory,
+        publisherKeys.privateKey,
+        'linux',
+        'x86_64',
+        {
+          application: templateApplication,
+          publisherKeyId: templatePublisherKeyId,
+          serviceEntryOverride: 'native/athttp-service'
+        }
+      );
+      await assert.rejects(() => inspect(wrongEntry), /Template native service entry/);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('requires the signed Video service and complete parsing runtime layout', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'attool-video-catalog-test-'));
+    const publisherKeys = generateKeyPairSync('ed25519');
+    const packageRoot = structuredClone(root);
+    packageRoot.publishers[0].keys[6].publicKey = rawPublicKey(publisherKeys.publicKey);
+    const inspect = (packagePath) => inspectPluginPackage({
+      packagePath,
+      application: videoApplication,
+      root: packageRoot,
+      publishedAt: generatedAt,
+      expectedVersion: version,
+      expectedPublisherKeyId: videoPublisherKeyId
+    });
+    try {
+      const packagePath = await createPluginPackage(
+        directory,
+        publisherKeys.privateKey,
+        'linux',
+        'x86_64',
+        { application: videoApplication, publisherKeyId: videoPublisherKeyId }
+      );
+      const inspected = await inspect(packagePath);
+      assert.equal(inspected.manifest.nativeService.entry, 'native/atvideo-service');
+      assert.deepEqual(Object.keys(inspected.manifest.files).sort(), [
+        'LICENSE',
+        'THIRD_PARTY_NOTICES.md',
+        'licenses/QuickJS-ng-MIT.txt',
+        'licenses/yt-dlp-UNLICENSE.txt',
+        'licenses/yt-dlp-ejs-LICENSE.txt',
+        'native/atvideo-service',
+        'native/qjs',
+        'native/youtube-bridge',
+        'runtime-manifest.json',
+        'ui/assets/app.js',
+        'ui/index.html'
+      ]);
+
+      const missingRuntime = await createPluginPackage(
+        directory,
+        publisherKeys.privateKey,
+        'linux',
+        'x86_64',
+        {
+          application: videoApplication,
+          publisherKeyId: videoPublisherKeyId,
+          omitFile: 'native/qjs'
+        }
+      );
+      await assert.rejects(() => inspect(missingRuntime), /Video package files/);
+
+      const extraNative = await createPluginPackage(
+        directory,
+        publisherKeys.privateKey,
+        'linux',
+        'x86_64',
+        {
+          application: videoApplication,
+          publisherKeyId: videoPublisherKeyId,
+          extraFile: 'native/ffmpeg'
+        }
+      );
+      await assert.rejects(() => inspect(extraNative), /Video package files/);
+
+      const wrongEntry = await createPluginPackage(
+        directory,
+        publisherKeys.privateKey,
+        'linux',
+        'x86_64',
+        {
+          application: videoApplication,
+          publisherKeyId: videoPublisherKeyId,
+          serviceEntryOverride: 'native/athttp-service'
+        }
+      );
+      await assert.rejects(() => inspect(wrongEntry), /Video native service entry/);
+
+      const windowsPackage = await createPluginPackage(
+        directory,
+        publisherKeys.privateKey,
+        'windows',
+        'x86_64',
+        { application: videoApplication, publisherKeyId: videoPublisherKeyId }
+      );
+      const windows = await inspect(windowsPackage);
+      assert.equal(windows.manifest.nativeService.entry, 'native/atvideo-service.exe');
+      assert.ok(windows.manifest.files['native/youtube-bridge.exe']);
+      assert.ok(windows.manifest.files['native/qjs.exe']);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('prepares a Video Catalog release from five signed service and runtime packages', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'attool-video-release-test-'));
+    const rootKeys = generateKeyPairSync('ed25519');
+    const catalogKeys = generateKeyPairSync('ed25519');
+    const publisherKeys = generateKeyPairSync('ed25519');
+    const signedRoot = structuredClone(root);
+    signedRoot.catalogKeys[0].publicKey = rawPublicKey(catalogKeys.publicKey);
+    signedRoot.publishers[0].keys[6].publicKey = rawPublicKey(publisherKeys.publicKey);
+    try {
+      const assets = [];
+      for (const [os, arch] of [
+        ['linux', 'aarch64'],
+        ['linux', 'x86_64'],
+        ['macos', 'aarch64'],
+        ['macos', 'x86_64'],
+        ['windows', 'x86_64']
+      ]) {
+        const packagePath = await createPluginPackage(
+          directory,
+          publisherKeys.privateKey,
+          os,
+          arch,
+          { application: videoApplication, publisherKeyId: videoPublisherKeyId }
+        );
+        const fileName = path.basename(packagePath);
+        assets.push({
+          fileName,
+          size: (await readFile(packagePath)).byteLength,
+          url: `https://github.com/attsontools/atvideo/releases/download/${tagName}/${fileName}`
+        });
+      }
+
+      const prepared = await prepareCatalogRelease({
+        root: signedRoot,
+        rootSignature: signTrustMetadata(signedRoot, rootKeys.privateKey),
+        rootPublicKey: rawPublicKey(rootKeys.publicKey),
+        previousCatalog,
+        previousCatalogSignature: signTrustMetadata(previousCatalog, catalogKeys.privateKey),
+        application: videoApplication,
+        release: { tagName, publishedAt: generatedAt, notes: 'Video production drill', assets },
+        assetDirectory: directory,
+        catalogKeyId,
+        catalogPrivateKey: catalogKeys.privateKey,
+        publisherKeyId: videoPublisherKeyId,
+        generatedAt,
+        expiresAt
+      });
+
+      const application = prepared.catalog.apps.find((app) => app.appId === 'com.attson.video');
+      assert.equal(application.channels.stable.version, version);
+      assert.deepEqual(
+        application.channels.stable.artifacts.map(({ os, arch }) => `${os}/${arch}`),
+        ['linux/aarch64', 'linux/x86_64', 'macos/aarch64', 'macos/x86_64', 'windows/x86_64']
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('prepares a Template Catalog release from five signed service and PSD packages', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'attool-template-release-test-'));
+    const rootKeys = generateKeyPairSync('ed25519');
+    const catalogKeys = generateKeyPairSync('ed25519');
+    const publisherKeys = generateKeyPairSync('ed25519');
+    const signedRoot = structuredClone(root);
+    signedRoot.catalogKeys[0].publicKey = rawPublicKey(catalogKeys.publicKey);
+    signedRoot.publishers[0].keys[5].publicKey = rawPublicKey(publisherKeys.publicKey);
+    try {
+      const assets = [];
+      for (const [os, arch] of [
+        ['linux', 'aarch64'],
+        ['linux', 'x86_64'],
+        ['macos', 'aarch64'],
+        ['macos', 'x86_64'],
+        ['windows', 'x86_64']
+      ]) {
+        const packagePath = await createPluginPackage(
+          directory,
+          publisherKeys.privateKey,
+          os,
+          arch,
+          { application: templateApplication, publisherKeyId: templatePublisherKeyId }
+        );
+        const fileName = path.basename(packagePath);
+        assets.push({
+          fileName,
+          size: (await readFile(packagePath)).byteLength,
+          url: `https://github.com/attsontools/attemplate/releases/download/${tagName}/${fileName}`
+        });
+      }
+
+      const prepared = await prepareCatalogRelease({
+        root: signedRoot,
+        rootSignature: signTrustMetadata(signedRoot, rootKeys.privateKey),
+        rootPublicKey: rawPublicKey(rootKeys.publicKey),
+        previousCatalog,
+        previousCatalogSignature: signTrustMetadata(previousCatalog, catalogKeys.privateKey),
+        application: templateApplication,
+        release: { tagName, publishedAt: generatedAt, notes: 'Template production drill', assets },
+        assetDirectory: directory,
+        catalogKeyId,
+        catalogPrivateKey: catalogKeys.privateKey,
+        publisherKeyId: templatePublisherKeyId,
+        generatedAt,
+        expiresAt
+      });
+
+      const application = prepared.catalog.apps.find((app) => app.appId === 'com.attson.template');
+      assert.equal(application.channels.stable.version, version);
+      assert.deepEqual(
+        application.channels.stable.artifacts.map(({ os, arch }) => `${os}/${arch}`),
+        ['linux/aarch64', 'linux/x86_64', 'macos/aarch64', 'macos/x86_64', 'windows/x86_64']
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it('verifies the offline Root and previous Catalog before publishing', () => {
     const rootKeys = generateKeyPairSync('ed25519');
     const catalogKeys = generateKeyPairSync('ed25519');
@@ -1087,7 +1421,9 @@ async function createPluginPackage(
   {
     application = codecApplication,
     publisherKeyId: manifestPublisherKeyId = publisherKeyId,
-    omitFile
+    omitFile,
+    extraFile,
+    serviceEntryOverride
   } = {}
 ) {
   const stage = path.join(directory, 'stage');
@@ -1105,14 +1441,23 @@ async function createPluginPackage(
       ? `ataria2-service${os === 'windows' ? '.exe' : ''}`
       : application.appId === 'com.attson.clipboard'
         ? `atclipboard-service${os === 'windows' ? '.exe' : ''}`
-        : 'athttp-service';
+        : application.appId === 'com.attson.template'
+          ? `attemplate-service${os === 'windows' ? '.exe' : ''}`
+          : application.appId === 'com.attson.video'
+            ? `atvideo-service${os === 'windows' ? '.exe' : ''}`
+            : 'athttp-service';
     await mkdir(native, { recursive: true });
     await writeFile(path.join(native, serviceName), service);
     files[`native/${serviceName}`] = createHash('sha256').update(service).digest('hex');
+    const serviceEntry = serviceEntryOverride || `native/${serviceName}`;
+    if (serviceEntryOverride && serviceEntryOverride !== `native/${serviceName}`) {
+      await writeFile(path.join(stage, serviceEntryOverride), service);
+      files[serviceEntryOverride] = createHash('sha256').update(service).digest('hex');
+    }
     nativeService = {
-      entry: `native/${serviceName}`,
+      entry: serviceEntry,
       version,
-      sha256: files[`native/${serviceName}`],
+      sha256: files[serviceEntry],
       protocolVersion: 1,
       ...(application.appId === 'com.attson.clipboard' ? { lifecycle: 'background' } : {})
     };
@@ -1147,6 +1492,45 @@ async function createPluginPackage(
       await writeFile(path.join(stage, relative), bytes);
       files[relative] = createHash('sha256').update(bytes).digest('hex');
     }
+  }
+  if (application.appId === 'com.attson.template') {
+    const payloads = {
+      LICENSE: Buffer.from('AT Template license fixture'),
+      [`native/psd-bridge${os === 'windows' ? '.exe' : ''}`]: Buffer.from(`psd-${os}-${arch}`),
+      'ui/assets/app.js': Buffer.from('console.log("template fixture")')
+    };
+    for (const [relative, bytes] of Object.entries(payloads)) {
+      if (relative === omitFile) continue;
+      await mkdir(path.dirname(path.join(stage, relative)), { recursive: true });
+      await writeFile(path.join(stage, relative), bytes);
+      files[relative] = createHash('sha256').update(bytes).digest('hex');
+    }
+  }
+  if (application.appId === 'com.attson.video') {
+    const extension = os === 'windows' ? '.exe' : '';
+    const payloads = {
+      LICENSE: Buffer.from('AT Video license fixture'),
+      'THIRD_PARTY_NOTICES.md': Buffer.from('Video third-party notices fixture'),
+      'licenses/QuickJS-ng-MIT.txt': Buffer.from('QuickJS license fixture'),
+      'licenses/yt-dlp-UNLICENSE.txt': Buffer.from('yt-dlp notice fixture'),
+      'licenses/yt-dlp-ejs-LICENSE.txt': Buffer.from('yt-dlp-ejs license fixture'),
+      [`native/youtube-bridge${extension}`]: Buffer.from(`youtube-bridge-${os}-${arch}`),
+      [`native/qjs${extension}`]: Buffer.from(`quickjs-${os}-${arch}`),
+      'runtime-manifest.json': Buffer.from('{"runtime":"video fixture"}'),
+      'ui/assets/app.js': Buffer.from('console.log("video fixture")')
+    };
+    for (const [relative, bytes] of Object.entries(payloads)) {
+      if (relative === omitFile) continue;
+      await mkdir(path.dirname(path.join(stage, relative)), { recursive: true });
+      await writeFile(path.join(stage, relative), bytes);
+      files[relative] = createHash('sha256').update(bytes).digest('hex');
+    }
+  }
+  if (extraFile) {
+    const bytes = Buffer.from('unexpected fixture');
+    await mkdir(path.dirname(path.join(stage, extraFile)), { recursive: true });
+    await writeFile(path.join(stage, extraFile), bytes);
+    files[extraFile] = createHash('sha256').update(bytes).digest('hex');
   }
   const manifest = parseManifest({
     schemaVersion: 1,

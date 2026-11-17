@@ -303,35 +303,44 @@ pub fn extract_package(
         return Err(error);
     }
     if let Some(service) = &package.native_service {
-        if let Err(error) = set_native_service_permissions(&destination.join(&service.entry)) {
+        if let Err(error) = set_native_payload_permissions(destination, package.files.keys()) {
             let _ = fs::remove_dir_all(destination);
             return Err(error);
         }
+        debug_assert!(package.files.contains_key(&service.entry));
     }
     Ok(package)
 }
 
-fn set_native_service_permissions(path: &Path) -> Result<(), PackageError> {
+fn set_native_payload_permissions<'a>(
+    destination: &Path,
+    files: impl Iterator<Item = &'a String>,
+) -> Result<(), PackageError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
-        let mut permissions = fs::metadata(path)
-            .map_err(|error| {
+        for relative in files.filter(|relative| relative.starts_with("native/")) {
+            let path = destination.join(relative);
+            let mut permissions = fs::metadata(&path)
+                .map_err(|error| {
+                    PackageError::new(
+                        "PLUGIN_STAGING_FAILED",
+                        format!("Cannot inspect native payload permissions: {error}"),
+                    )
+                })?
+                .permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&path, permissions).map_err(|error| {
                 PackageError::new(
                     "PLUGIN_STAGING_FAILED",
-                    format!("Cannot inspect native service permissions: {error}"),
+                    format!("Cannot mark native payload executable: {error}"),
                 )
-            })?
-            .permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(path, permissions).map_err(|error| {
-            PackageError::new(
-                "PLUGIN_STAGING_FAILED",
-                format!("Cannot mark native service executable: {error}"),
-            )
-        })?;
+            })?;
+        }
     }
+    #[cfg(not(unix))]
+    let _ = (destination, files);
     Ok(())
 }
 
@@ -415,6 +424,10 @@ fn validate_manifest(
                 | "host.template.project"
                 | "host.ui.auxiliary"
                 | "host.clipboard.history"
+                | "host.app.activate"
+                | "host.clipboard.write"
+                | "host.external.open"
+                | "host.video.extract"
         )
     }) {
         return Err(PackageError::new(
@@ -492,6 +505,7 @@ fn validate_manifest(
             || permission == "host.download.tasks"
             || permission == "host.template.project"
             || permission == "host.clipboard.history"
+            || permission == "host.video.extract"
     });
     if (host_min.major == 2) != manifest.native_service.is_some()
         || (requests_native_service && manifest.native_service.is_none())
@@ -679,7 +693,10 @@ mod tests {
 
     #[test]
     fn larger_file_limit_is_scoped_to_native_service_payloads() {
-        assert_eq!(package_file_limit("native/aria2c", true), MAX_NATIVE_FILE_BYTES);
+        assert_eq!(
+            package_file_limit("native/aria2c", true),
+            MAX_NATIVE_FILE_BYTES
+        );
         assert_eq!(package_file_limit("native/aria2c", false), MAX_FILE_BYTES);
         assert_eq!(package_file_limit("ui/large.bin", true), MAX_FILE_BYTES);
     }
@@ -783,12 +800,14 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&TEST_KEY_SEED);
         let index = b"<!doctype html><title>HTTP</title>";
         let service = b"native-service";
+        let runtime_helper = b"runtime-helper";
         let service_hash = sha256(service);
         let declared_hash = declared_hash.unwrap_or(&service_hash);
         let manifest = serde_json::json!({
             "appId": "com.attson.http",
             "files": {
                 "native/athttp-service": service_hash,
+                "native/runtime-helper": sha256(runtime_helper),
                 "ui/index.html": sha256(index)
             },
             "hostApi": {
@@ -820,6 +839,7 @@ mod tests {
             ("manifest.sig", signature.as_bytes()),
             ("ui/index.html", index.as_slice()),
             ("native/athttp-service", service.as_slice()),
+            ("native/runtime-helper", runtime_helper.as_slice()),
         ] {
             archive.start_file(name, options).unwrap();
             archive.write_all(bytes).unwrap();
@@ -950,6 +970,58 @@ mod tests {
         let package = inspect_package(&path, &HostEnvironment::current("2.0.0"), &keys).unwrap();
 
         assert_eq!(package.permissions, ["host.template.project"]);
+    }
+
+    #[test]
+    fn accepts_general_app_permissions_without_a_native_service() {
+        let index = b"<!doctype html><title>Video</title>";
+        let permissions = "[\"host.app.activate\",\"host.clipboard.write\",\"host.external.open\"]";
+        let (_directory, path, signing_key) = package_with_index(
+            index,
+            index,
+            "com.attson.video",
+            "0.1.0-alpha.0",
+            permissions,
+        );
+        let keys = HashMap::from([("attool-p0-test".to_string(), signing_key.verifying_key())]);
+
+        let package = inspect_package(&path, &HostEnvironment::current("1.0.0"), &keys).unwrap();
+
+        assert_eq!(
+            package.permissions,
+            [
+                "host.app.activate",
+                "host.clipboard.write",
+                "host.external.open"
+            ]
+        );
+    }
+
+    #[test]
+    fn accepts_video_extract_only_with_a_host_api_two_native_service() {
+        let (_directory, path, signing_key) = native_service_package(
+            "0.1.0-alpha.0",
+            1,
+            None,
+            "2.0.0",
+            serde_json::json!(["host.video.extract"]),
+        );
+        let keys = HashMap::from([("attool-p0-test".to_string(), signing_key.verifying_key())]);
+        let package = inspect_package(&path, &HostEnvironment::current("2.0.0"), &keys).unwrap();
+        assert_eq!(package.permissions, ["host.video.extract"]);
+
+        let index = b"<!doctype html><title>Video</title>";
+        let (_directory, path, signing_key) = package_with_index(
+            index,
+            index,
+            "com.attson.video",
+            "0.1.0-alpha.0",
+            "[\"host.video.extract\"]",
+        );
+        let keys = HashMap::from([("attool-p0-test".to_string(), signing_key.verifying_key())]);
+        let error = inspect_package(&path, &HostEnvironment::current("1.0.0"), &keys)
+            .expect_err("video extraction requires a native service");
+        assert_eq!(error.code, "PLUGIN_NATIVE_SERVICE_REQUIRED");
     }
 
     #[test]
@@ -1176,7 +1248,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn extraction_marks_the_native_service_executable() {
+    fn extraction_marks_native_service_payload_executables() {
         use std::os::unix::fs::PermissionsExt;
 
         let (directory, path, signing_key) = native_service_package(
@@ -1197,11 +1269,13 @@ mod tests {
         )
         .unwrap();
 
-        let mode = std::fs::metadata(destination.join("native/athttp-service"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_ne!(mode & 0o111, 0);
+        for relative in ["native/athttp-service", "native/runtime-helper"] {
+            let mode = std::fs::metadata(destination.join(relative))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_ne!(mode & 0o111, 0, "{relative} must be executable");
+        }
     }
 
     #[test]

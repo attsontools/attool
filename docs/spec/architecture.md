@@ -77,7 +77,7 @@ HTTP 与剪贴板数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app
 ### 包与安装状态
 
 - `.atpkg` 是目标 OS/CPU 专用 ZIP，包含 `manifest.json`、`manifest.sig`、许可证、`ui/` 静态资源，以及可选的目标平台 `nativeService`；包内不允许目录条目、重复文件、未声明文件或不安全相对路径。
-- manifest schema v1 固定声明 `appId`、SemVer `version`、publisher、target、Host API 范围、UI 入口、权限和每个文件的 SHA-256；`ui.windows` 可额外声明最多四个签名辅助入口及受控 presentation。原生 service 还必须声明与包版本一致的入口、协议版本、文件 hash 和可选的 `onDemand | background` 生命周期，并绑定 Host API 2.x；Unix 安装后入口权限收紧为 `0700`。平台使用与 updater 分离的 Publisher Key 验签，并拒绝未知字段、错误 target、未知权限和不兼容 Host API。
+- manifest schema v1 固定声明 `appId`、SemVer `version`、publisher、target、Host API 范围、UI 入口、权限和每个文件的 SHA-256；`ui.windows` 可额外声明最多四个签名辅助入口及受控 presentation。原生 service 还必须声明与包版本一致的入口、协议版本、文件 hash 和可选的 `onDemand | background` 生命周期，并绑定 Host API 2.x；Unix 安装后所有受签名清单约束的 `native/` payload 权限统一收紧为 `0700`，确保 service 及其 runtime helper 可执行且不向其他用户开放。平台使用与 updater 分离的 Publisher Key 验签，并拒绝未知字段、错误 target、未知权限和不兼容 Host API。
 - 单个普通包文件上限为 100 MiB；声明了 `nativeService` 的包仅对 `native/` 下受 manifest hash 约束的 runtime/service 放宽到 128 MiB，其他路径不随之放宽。
 - `src-tauri/src/plugin/install.rs` 把包解压到随机 staging，完成入口健康检查后 rename 到 `app_data_dir/plugins/apps/<appId>/<version>/`，再用 SQLite 事务写入 registry 和成功历史。健康检查 operation 同时持久化待安装包的 `nativeService` 元数据，前端重载后仍能为原生 service 插件建立 Host API 2.x 探针；registry 写入失败会删除已激活目录。
 - registry 为每个 `appId` 保存不可变版本目录以及 `current / previous / pending` 关系。停用只更新 registry 并隐藏导航；重新启用前校验入口文件 hash；卸载先把程序包和可选数据移入 staging，registry 提交失败时恢复原目录。
@@ -87,7 +87,8 @@ HTTP 与剪贴板数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app
 - `attool-plugin://<appId>/<path>` 自定义协议只服务已启用且在签名清单中声明的文件，每次读取重新校验 SHA-256，并返回严格 CSP、CORS、`nosniff` 和 `no-store`。协议响应自身带无放行项的 CSP `sandbox`，因此被直接导航为文档时也不能执行脚本或发起导航，只作为 opaque iframe 的静态子资源来源。
 - Host 先通过 Tauri command 读取并校验 manifest entry HTML，再把 CSP 与指向签名资源目录的 `<base>` 放到所有不可信标记之前，作为 `sandbox="allow-scripts"` iframe 的 `srcdoc`。iframe 不带 `allow-same-origin`，文档 origin 保持 opaque；这同时隔离父 DOM、Vue 状态和 Tauri commands，不能再假设“自定义协议 origin + allow-same-origin”在所有 WebView 平台都能阻止子 frame 获得 Tauri 初始化脚本。
 - iframe 与平台通过 `MessageChannel` 上的 JSON-RPC 2.0 通信。纯前端插件继续使用 Host API 1.x；原生 service 插件使用 Host API 2.x，隔离安装探针同样读取 staged entry 为 opaque `srcdoc`，并按 operation 的 `nativeService` 选择相同 API 版本。握手返回 session ID、correlation ID、应用元数据、主题和已批准能力；请求校验 `appId`、API 版本、消息大小、超时和权限。HTTP 业务帧上限为 8 MiB，请求超时覆盖最长 300 秒网络请求并保留 5 秒传输余量。
-- 基础权限为 `host.theme.read`、`host.notification.show`、`host.file.save`；`host.ui.auxiliary` 只允许应用打开自己 manifest 已声明的辅助窗口，64 KiB 激活 payload 通过目标窗口的 `host.ui.activated` 通知交付。HTTP 插件另声明 `host.http.request`、`host.http.stream`、`host.http.data`，分别代理一次请求、长连接和 Data API；主图模板插件声明 `host.template.project`，仅能调用模板方法白名单；剪贴板应用声明 `host.clipboard.history`，只开放六个历史方法和两个设置方法。multipart 与模板文件/目录选择只向插件返回会话级不透明 token，复制、保存和文件选择都由 Host 执行；模板 token 绑定类型且只能消费一次，批处理返回和错误响应拒绝泄漏本地绝对路径。切换工具、停用或卸载会销毁 iframe、消息端口和尚未消费的 token。
+- 基础权限为 `host.theme.read`、`host.notification.show`、`host.file.save`；通用桌面能力另以 `host.clipboard.write`、`host.external.open` 和 `host.app.activate` 独立授权，不借用 HTTP 权限。`host.ui.auxiliary` 只允许应用打开自己 manifest 已声明的辅助窗口，64 KiB 激活 payload 通过目标窗口的 `host.ui.activated` 通知交付。HTTP 插件另声明 `host.http.request`、`host.http.stream`、`host.http.data`，分别代理一次请求、长连接和 Data API；主图模板插件声明 `host.template.project`，仅能调用模板方法白名单；剪贴板应用声明 `host.clipboard.history`，只开放六个历史方法和两个设置方法。multipart 与模板文件/目录选择只向插件返回会话级不透明 token，复制、保存和文件选择都由 Host 执行；模板 token 绑定类型且只能消费一次，批处理返回和错误响应拒绝泄漏本地绝对路径。切换工具、停用或卸载会销毁 iframe、消息端口和尚未消费的 token。
+- `host.app.activate` 只能激活已安装、启用且可加载的其他动态应用。Host 在 acceptance 响应前把最多 64 KiB 的 JSON payload 加入目标队列，响应后才导航，并在目标主页面握手确认后按 FIFO 通过 `host.app.activated` 交付真实 `sourceAppId`；每个目标最多保留 32 项。未响应的请求从队列撤销，已响应但目标加载或通知失败的内容保留到当前进程内下次可用 session，不因源 iframe 销毁而丢失。
 
 ### 原生 Service 与共享数据
 
@@ -98,11 +99,13 @@ HTTP 与剪贴板数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app
 - 同一客户端连接允许请求并发分派，因此 `http.cancel` 可以中断仍在执行的 `http.send`；响应写入仍串行化，SSE/WS 保持 2000 条、5 MiB buffer 和 generation 语义。`stream.open` response 前到达的事件由客户端按 generation 暂存并在响应后交付，不能因 RPC/event 时序丢失首帧。
 - 宿主不包含 HTTP UI、Store、网络命令或数据库连接。停用/卸载插件不会恢复隐藏的内置实现；历史 `lastTool=http` 只映射到已启用的动态应用入口。
 
-`com.attson.template` 的 Native Service 固定复用 `${app_data_dir}/ecommerce`，以便后续原位接管现有模板 SQLite、素材和批量缓存；其他未知应用仍使用 `${app_data_dir}/native-services/<appId>`。Host API 与 Rust 网关共同限制 `template.templates.*`、PSD/素材导入及批量注册、渲染、保存方法，文件与目录路径只在 token 解析后进入 service，插件页面不接触真实路径。当前阶段只建立权限与目录契约，数据 owner 切换和旧内置写入保护由独立模板应用接管阶段完成。
+`com.attson.template` 的 standalone 与签名 `.atpkg` 复用同一 Vue 编辑器、`attemplate-service` 和独立 `psd-bridge`，固定原位接管 `${app_data_dir}/ecommerce` 中的模板 SQLite、素材和批量缓存；其他未知应用仍使用 `${app_data_dir}/native-services/<appId>`。首次接管要求宿主 capability，service 持有 owner lock，经完整性校验后把 `migrating` 原子切换为永久 `owned`；失败不改用户数据，成功后宿主旧模板 command 与第二个 service 均拒绝访问，停用或卸载测试包也不恢复旧 owner。Host API 与 Rust 网关共同限制 `template.templates.*`、PSD/素材导入及批量注册、渲染、保存方法，文件与目录路径只在 token 解析后进入 service；公共模板、素材、source 和 output DTO 只暴露受限预览与不透明 ID。Linux x86_64 真实测试包已通过签名安装、PSD 导入、编辑保存、两图批量渲染、选中导出、双客户端共享和路径泄漏检查；五目标 workflow、固定 SDK、生产/测试签名隔离、精确十资产和 Catalog 包布局也已在本地验证。生产 Publisher 授权、两个正式 Release、Catalog 安装/升级/回滚生命周期及宿主内置实现删除仍分别留在 P2、P3。
 
 `com.attson.clipboard` 的独立版与插件版复用 `atclipboard-service`，固定原位接管 `${app_data_dir}/clipboard`，并通过 `host.clipboard.history` 的双层白名单访问。service 以生命周期锁和 `migrating / owned` marker 保证单一 owner；旧设置表为空时沿用历史默认值且不改写数据库，部分缺失或非法设置继续 fail closed。公共图片条目不得返回 asset、数据库或缓存路径，预览只接受 PNG/JPEG/WebP base64 data URL 且整串不超过 2 MiB；列表单页最多 100 条。后台采集、三类恢复、暂停、保留策略、清空未收藏、停启、卸载、重装、升级和首启失败回滚已通过两版生产 Catalog 与真实 500 条旧库验证；Wayland 插件模式使用宿主 `--plugin-window` 命令激活签名 history 窗口。宿主旧 UI、SQLite owner、watcher、领域快捷键、commands 和固定窗口已删除；停用或卸载插件不触发宿主回退。
 
 `com.attson.aria2` 已完成本地双制品与发布链验证：独立 Tauri 与签名 `.atpkg` 复用同一 Vue UI 和 `ataria2-service`，service 通过跨平台文件锁独占 `${app_data_dir}/aria2`、SQLite、固定 aria2 1.37.0 runtime 和取消句柄。首次接管先要求宿主写入 capability，再写 `migrating` marker，并以 SQLite exclusive barrier 等待 marker 前的旧写事务完成；一致快照通过 schema、完整性和行数校验后切换为永久 `owned`。旧库保留只读，宿主旧 owner 的所有读写在 marker 存在时拒绝，写路径取得 SQLite write transaction 后还会再次检查，停用或卸载插件也不恢复旧 owner。Linux x86_64 测试包已通过真实安装、下载和共享历史，五目标 workflow、生产签名校验和 Catalog 包布局校验也已在本地完成；生产 Publisher 授权、正式 Release 和安装/升级/回滚生命周期仍待远端验证。
+
+`com.attson.video` 的独立 Tauri 与签名 `.atpkg` 复用同一 Vue 页面、`atvideo-service` 协议和固定的 yt-dlp 2026.10.21、yt-dlp-ejs 0.8.0、QuickJS-ng 0.17.0 runtime bytes。插件只声明 `host.theme.read`、`host.video.extract`、`host.clipboard.write`、`host.external.open`、`host.app.activate`，Host 与 service 共同限制五个视频方法、平台 host、精确参数和无凭证代理；30 秒平台/runtime 超时外由 standalone client 和 Host 各保留 35 秒响应预算。动态 Video 通过 `host.app.activate` 把有界 URL 批次交给动态 Aria2，Aria2 原子填入输入框但不自动创建任务。Linux x86_64 最终测试包已通过签名重装、全部 native hash/`0700` 权限、四平台解析、复制、外链、断线后 remount、停启、卸载重装和 Video 到 Aria2 流程；五目标原生 runner workflow、固定 SDK 提交、生产/测试签名隔离、runtime smoke、精确十资产和 Catalog 包布局已完成本地验证。生产 Publisher 授权、两个正式 Release 与 Catalog 安装/升级/回滚生命周期仍待远端验证，宿主内置视频实现和共享 runtime 在 P3 前继续保留。
 
 ### 前端装配与应用外置
 
@@ -122,7 +125,7 @@ HTTP 与剪贴板数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app
 ### Catalog 发布链
 
 - 独立应用的一个 tag 由受保护 `prod` Environment 构建五个目标，每个目标同时产生独立安装包和 Publisher 签名 `.atpkg`。普通应用的正式 Release 必须恰好包含十个非空资产；Aria2 还必须附带固定 SHA-256 的 `aria2-1.37.0-source.tar.gz`，共十一项。
-- `.github/catalog/apps.json` 是官方应用来源注册表，固定声明 `appId`、仓库、资产前缀、展示信息、Host API、权限和 Publisher secret 名。`.github/workflows/catalog.yml` 只接受注册表中的 `attsontools/*` 公开 Release，通过 `gh-proxy.com` 下载五个 `.atpkg`，逐包核对不可变 Release URL、文件名、目标、版本、Publisher Key、签名、Host API、权限、文件集合与 hash；Aria2 包还必须包含目标对应的 `ataria2-service`、`aria2c`、COPYING 和 Windows OpenSSL notice，额外文件只允许位于已签名的 `ui/` 目录。
+- `.github/catalog/apps.json` 是官方应用来源注册表，固定声明 `appId`、仓库、资产前缀、展示信息、Host API、权限和 Publisher secret 名。`.github/workflows/catalog.yml` 只接受注册表中的 `attsontools/*` 公开 Release，通过 `gh-proxy.com` 下载五个 `.atpkg`，逐包核对不可变 Release URL、文件名、目标、版本、Publisher Key、签名、Host API、权限、文件集合与 hash；Aria2 包还必须包含目标对应的 `ataria2-service`、`aria2c`、COPYING 和 Windows OpenSSL notice，Template 包必须包含目标对应的 `attemplate-service`、`psd-bridge` 和 LICENSE，Video 包必须包含目标对应的 `atvideo-service`、`youtube-bridge`、QuickJS、runtime manifest、主许可证和三份第三方许可证，这些应用的额外文件都只允许位于已签名的 `ui/` 目录。
 - Catalog 发布器先离线验证已提交的 Root 和上一版 Catalog，再使用 Root 授权且处于有效窗口的 Catalog Signing Key 生成 7 天有效、严格递增的下一序列。首次发布从 `sequence: 1` 开始；已有应用只接受严格更高版本，首次接入的应用追加到 `apps` 且不得改写其他应用。
 - `.github/workflows/catalog-renew.yml` 每周一、周四续签 Catalog：递增序列并更新生成与过期时间，但必须逐字保留 `apps` 及其制品信息；续签只能使用 Root 当前授权且处于有效窗口的 Catalog Signing Key。
 - 发布和续签共享 `production-catalog` 并发组，且任一 `catalog/*` PR 未合并时都拒绝生成新候选，避免多个候选从同一序列分叉。
@@ -272,7 +275,7 @@ export function useTheme(
 - 只为已安装、已启用、带合法 `nativeService` 的应用启动或连接 service；入口文件仍由安装 registry 的 hash 契约约束。
 - 按 app 解析受控数据目录：HTTP 保持 `${app_data_dir}/http`，剪贴板使用 `${app_data_dir}/clipboard`，Aria2 使用 `${app_data_dir}/aria2`，主图模板使用 `${app_data_dir}/ecommerce`，其他应用使用 `${app_data_dir}/native-services/<appId>`；runtime 管理 endpoint/lease、并发启动、owned child 生命周期、版本协商、请求超时和稳定错误码。
 - `plugin_connect_native_service` 建立连接，`plugin_native_service_request` 代理 Host API 2.x 请求；service 事件带 `appId` 统一转发给 `PluginFrame`。
-- transport 只开放显式领域方法：HTTP 继续映射三项 `host.http.*` 权限，下载七个方法映射到 `host.download.tasks`，模板十三个项目方法映射到 `host.template.project`；不提供任意 native service call。
+- transport 只开放显式领域方法：HTTP 继续映射三项 `host.http.*` 权限，下载七个方法映射到 `host.download.tasks`，模板十三个项目方法映射到 `host.template.project`，抖音解析/抽取、小红书、B 站和 YouTube 五个方法映射到 `host.video.extract`；不提供任意 native service call。视频调用还按方法限制平台 URL host、精确参数字段及无凭证代理，并使用 35 秒 Host 请求预算给 service 内部 30 秒平台/runtime 超时留出稳定错误响应余量；未来 service 新增参数不会自动扩张既有权限。
 - 不实现 HTTP、下载或其他应用业务，也不持有业务 SQLite schema；业务状态均由各自版本化 service 拥有。
 
 ### `src-tauri/src/updater/`
@@ -402,3 +405,15 @@ Root 私钥保持离线，日常 Catalog 只使用 Root 授权的独立 Signing 
 ### 2026-11-15 剪贴板仅保留独立应用入口
 
 生产 Catalog、升级回滚和真实旧库生命周期验证完成后，平台完整删除内置剪贴板 UI、SQLite owner、watcher、领域快捷键、commands 与固定窗口，只保留动态应用入口、service 桥接和签名辅助窗口。相比隐藏旧入口或保留兼容命令，完整退场避免宿主再次成为数据 owner，也确保停用或卸载插件不会触发不可见回退。
+
+### 2026-11-16 主图模板接管后永久退权旧 owner
+
+`attemplate-service` 在原目录完成 SQLite、项目 JSON 和素材引用校验后写入永久 `owned` marker，宿主旧模板 command 即使插件停用或卸载也不自动恢复。相比复制旧库或保留可逆双 owner，该方案要求独立版与插件版共同承担恢复能力，但避免模板、素材和批量缓存形成两个可写副本。
+
+### 2026-11-16 跨应用跳转由 Host activation 队列协调
+
+动态应用之间只通过 `host.app.activate` 请求 Host 导航并交付有界 payload，真实来源由当前 session 注入；视频解析继续使用独立领域权限和精确 service 方法白名单。相比复用仅面向同应用辅助窗口的 `host.ui.open`、调用目标 service 或在宿主保留视频专用 handoff，该方案增加两阶段队列状态，但避免源 iframe 提前卸载、跨应用越权和业务特判。
+
+### 2026-11-16 视频应用自持完整解析运行时
+
+`atvideo` 的独立版和插件版共同持有四平台解析 service、专用 YouTube bridge 与固定 QuickJS runtime，不复用宿主或主图模板的 PSD sidecar。相比继续调用宿主命令或立即重写纯 Rust YouTube 提取器，该方案增加独立制品体积和 runtime 发布成本，但保证双制品行为一致，并允许宿主视频实现最终完整退场。

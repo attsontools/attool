@@ -37,6 +37,7 @@ import { useUpdater } from './composables/useUpdater';
 import { useUpdaterPrefs } from './composables/useUpdaterPrefs';
 import type { DownloadEventPayload, DownloadTask, StartDownloadRequest } from './types/download';
 import type { Tool } from './types/tool';
+import { createAppActivationCoordinator } from './components/plugins/appActivation';
 import {
   publishRecordingResult,
   requestCaptureMode,
@@ -90,6 +91,19 @@ const { collapsed: sidebarCollapsed, toggle: toggleSidebar } = useSidebarState()
 const { lastToolId, remember: rememberLastTool } = useLastTool();
 const { theme, toggle: toggleTheme } = useTheme();
 const pluginStore = usePluginStore();
+const appActivation = createAppActivationCoordinator({
+  resolveTarget(appId) {
+    const app = pluginStore.apps.value.find((candidate) => candidate.appId === appId);
+    if (!app) return { installed: false, enabled: false, available: false };
+    const serviceStatus = pluginStore.nativeServiceStatuses.value.get(appId);
+    return {
+      installed: true,
+      enabled: app.enabled,
+      available: app.enabled && Boolean(app.entry) && serviceStatus?.state !== 'unavailable'
+    };
+  },
+  navigate: (toolId) => selectTool(toolId)
+});
 const tools = computed<Tool[]>(() =>
   [...builtinTools, ...pluginStore.navigationTools.value]
 );
@@ -622,6 +636,8 @@ async function clearCompleted() {
             :key="`${selectedPlugin.appId}:${selectedPlugin.version}`"
             :app="selectedPlugin"
             :theme="theme"
+            :activate-app="appActivation.accept"
+            :register-app-activation-target="appActivation.registerTarget"
             @version-state="pluginStore.replaceInstalled"
           />
         </template>
