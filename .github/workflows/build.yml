@@ -159,7 +159,6 @@ jobs:
         shell: bash
         run: |
           python -m pip install -r src-tauri/python/requirements-build.txt
-          PYTHON=python node .github/scripts/install-yt-dlp.mjs
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile

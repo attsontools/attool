@@ -2,21 +2,23 @@
 
 个人桌面工具集合，基于 Tauri 2 + Vue 3 + Naive UI。Mono Dark / Light 双主题，全平台 in-app 自动更新（含 Linux `.deb`）。
 
-## 当前内置工具
+## 主要工具
 
 | 工具 | 说明 |
 |---|---|
 | **Aria2 下载** | shell out 到本机 `aria2c`，多连接 / 分片 / 批量 URL / 实时进度 |
 | **主图模板** | PSD 导入（`psd-tools` 桥接）+ 字段占位 `{{key}}` + 笛卡尔展开批量导出 PNG |
-| **剪贴板** | 剪贴板历史记录，图片 / 文本预览，Paste 风格快速恢复，快捷键可自定义 |
-| **视频链接抽取** | 抖音 / B站 / 小红书 / YouTube 视频链接与文案解析 |
+| **剪贴板** | Catalog 独立应用；剪贴板历史记录，图片 / 文本预览，Paste 风格快速恢复，快捷键可自定义 |
+| **视频链接抽取** | Catalog 独立应用；抖音 / B站 / 小红书 / YouTube 视频链接与文案解析 |
 | **图片** | 截图与录屏统一捕获工作台、压缩、格式转换、EXIF 读取/去除、标注、OCR |
 | **网络** | URL 分解、Ping、端口检查、DNS 查询 |
 | **AI 对话** | 多提供商多模型 AI 助手：OpenAI 兼容 / Anthropic Claude / 本地 Ollama，流式 Markdown + 会话侧栏 + 模型热切换 |
 
-HTTP 请求、编码转换、文本工具、生成器、时间工具与 JSON 工具已拆分为独立应用，可在平台的“应用管理”中按需安装；独立安装包与平台插件包分别由对应应用仓库发布。
+HTTP 请求、剪贴板、视频链接抽取、编码转换、文本工具、生成器、时间工具与 JSON 工具已拆分为独立应用，可在平台的“应用管理”中按需安装；独立安装包与平台插件包分别由对应应用仓库发布。
 
 HTTP 请求应用提供 HTTP / SSE / WebSocket、多 tab、历史、环境变量、集合、OpenAPI、cURL 和 multipart 调试。平台通过 Host API 2.x 连接应用自带的 Native/Data Service，沿用原 `${app_data_dir}/http/http.sqlite3` 数据；停用或卸载应用不会恢复隐藏的内置 HTTP。
+
+视频链接抽取由 `com.attson.video` 自带 UI、`atvideo-service` 和 YouTube runtime；宿主只保留受权限控制的视频 service 网关与跨应用 activation。动态 Video 可把解析出的 URL 交给动态 Aria2，停用或卸载后不会恢复旧的宿主实现。
 
 截图支持全平台：macOS 用系统 `screencapture`，Linux / Windows 用 xcap。录屏通过系统屏幕来源选择器捕获画面，可组合系统音频与麦克风，停止后预览并保存。默认全局快捷键为 `CommandOrControl+Shift+R`，首次按下开始选择录制来源，录制中再次按下停止。
 

@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest';
 const manifestPath = 'src-tauri/runtime-manifest.json';
 
 describe('bundled runtime manifest', () => {
-  it('pins every application-owned engine and OCR language source', () => {
+  it('pins every host-owned engine and OCR language source', () => {
     expect(existsSync(manifestPath)).toBe(true);
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
 
@@ -14,12 +14,8 @@ describe('bundled runtime manifest', () => {
     expect(manifest.tessdata.languages).toEqual(['eng', 'chi_sim', 'chi_tra', 'jpn']);
     expect(manifest.aria2.version).toBe('1.37.0');
     expect(manifest.aria2.commit).toMatch(/^[0-9a-f]{40}$/);
-    expect(manifest.ytDlp.version).toMatch(/^\d{4}\.\d{2}\.\d{2}$/);
-    expect(manifest.ytDlp.ejs.sha256).toMatch(/^[0-9a-f]{64}$/);
-    expect(manifest.ytDlp.wheelSha256).toMatch(/^[0-9a-f]{64}$/);
-    expect(manifest.ytDlp.ejs.wheelSha256).toMatch(/^[0-9a-f]{64}$/);
-    expect(Object.keys(manifest.quickJs.assets)).toHaveLength(5);
-    for (const asset of Object.values(manifest.quickJs.assets)) expect(asset.sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(manifest).not.toHaveProperty('ytDlp');
+    expect(manifest).not.toHaveProperty('quickJs');
   });
 
   it('runs runtime preparation before every release build', () => {
@@ -93,14 +89,26 @@ describe('bundled runtime manifest', () => {
     expect(workflow).toContain('${{ runner.temp }}/attool-native');
   });
 
-  it('verifies the pinned yt-dlp source before installing the shared runtime', () => {
+  it('keeps the application-owned video runtime out of the host build', () => {
     const workflow = readFileSync('.github/workflows/build.yml', 'utf8');
-    const installer = readFileSync('.github/scripts/install-yt-dlp.mjs', 'utf8');
+    const notices = readFileSync('src-tauri/THIRD_PARTY_NOTICES.md', 'utf8');
+    const prepareRuntime = readFileSync('.github/scripts/prepare-runtime.mjs', 'utf8');
+    const smokeRuntime = readFileSync('.github/scripts/smoke-runtime.mjs', 'utf8');
+    const rustBuild = readFileSync('src-tauri/build.rs', 'utf8');
+    const runtimeModule = readFileSync('src-tauri/src/bundled_tools.rs', 'utf8');
 
-    expect(workflow).toContain('install-yt-dlp.mjs');
-    expect(installer).toContain('manifest.ytDlp.sha256');
-    expect(installer).toContain('manifest.ytDlp.ejs.sha256');
-    expect(installer).toContain("createHash('sha256')");
+    expect(existsSync('.github/scripts/install-yt-dlp.mjs')).toBe(false);
+    expect(workflow).not.toContain('install-yt-dlp.mjs');
+    expect(prepareRuntime).not.toContain('quickjs');
+    expect(prepareRuntime).not.toContain('QuickJS');
+    expect(smokeRuntime).not.toContain('quickjs');
+    expect(smokeRuntime).not.toContain('QuickJS');
+    expect(rustBuild).not.toContain('QUICKJS');
+    expect(runtimeModule).not.toContain('quickjs()');
+    expect(notices).not.toContain('yt-dlp');
+    expect(notices).not.toContain('QuickJS');
+    expect(existsSync('src-tauri/licenses/yt-dlp-UNLICENSE.txt')).toBe(false);
+    expect(existsSync('src-tauri/licenses/QuickJS-ng-MIT.txt')).toBe(false);
   });
 
   it('allows smoke checks that only require a successful exit status', () => {

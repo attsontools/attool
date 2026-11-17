@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 const packageJson = JSON.parse(readFileSync('package.json', 'utf8'));
 const releaseConfig = JSON.parse(readFileSync('src-tauri/tauri.release.conf.json', 'utf8'));
 const buildScript = readFileSync('.github/scripts/build-psd-sidecar.mjs', 'utf8');
+const pythonBridge = readFileSync('src-tauri/python/psd_template_bridge.py', 'utf8');
 const rustBuildScript = readFileSync('src-tauri/build.rs', 'utf8');
 const bridgeSource = readFileSync('src-tauri/src/ecommerce/psd_bridge.rs', 'utf8');
 const workflow = readFileSync('.github/workflows/build.yml', 'utf8');
@@ -22,6 +23,17 @@ describe('PSD parser sidecar packaging', () => {
     expect(bridgeSource).toContain('include_bytes!(env!("ATTOOL_PSD_BRIDGE_PATH"))');
     expect(workflow).toContain('python/requirements-build.txt');
     expect(workflow).toContain('pnpm tauri:build --target ${{ matrix.target }}');
+  });
+
+  it('keeps video extraction dependencies out of the PSD parser', () => {
+    expect(buildScript).toContain("'scipy._external.array_api_compat.numpy'");
+    expect(buildScript).not.toContain("'yt_dlp'");
+    expect(buildScript).not.toContain("'yt_dlp_ejs'");
+    expect(buildScript).not.toContain('--runtime-version');
+    expect(pythonBridge).not.toContain('extract_youtube');
+    expect(pythonBridge).not.toContain('yt_dlp');
+    expect(pythonBridge).not.toContain('operation.add_argument("--youtube")');
+    expect(workflow).not.toContain('install-yt-dlp.mjs');
   });
 
   it('keeps transition archives compatible while making the sidecar optional', () => {

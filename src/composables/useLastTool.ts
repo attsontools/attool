@@ -4,7 +4,8 @@ import type { KVStorage } from './useSidebarState';
 const STORAGE_KEY = 'attool.lastTool';
 
 const LEGACY_ID_MAP: Record<string, string> = {
-  douyin: 'video-link',
+  douyin: 'plugin:com.attson.video',
+  'video-link': 'plugin:com.attson.video',
   recording: 'image',
   codec: 'plugin:com.attson.codec',
   json: 'plugin:com.attson.json',

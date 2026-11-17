@@ -16,10 +16,10 @@ attool 是一个个人使用的桌面工具集合，运行在 Tauri 2 上。前�
 - 官方 Catalog 由 AT Tool 主仓维护并签名，平台可按当前 OS/架构远程安装和主动升级多个官方应用；新版本先进入 `pending`，健康检查与原子切换通过后成为 `current`，失败时保留或恢复上一可用版本。
 - HTTP 已完全外置为 `com.attson.http`：`athttp` 独立版和官方 Catalog 插件复用同一 UI、请求核心与 `${app_data_dir}/http/http.sqlite3`，由单一 Native/Data Service 提供请求、长连接和数据 API。平台只保留 Host API 2.x 桥接和 service supervisor，不再包含内置 HTTP UI、Store、Tauri commands 或 SQLite owner。
 - 剪贴板已完全外置为 `com.attson.clipboard`：`atclipboard` 独立版和官方 Catalog 插件复用同一 UI 与 `${app_data_dir}/clipboard`，由单一 background Native Service 持有历史、监听和快捷键。平台只保留 Host API 2.x、service supervisor、签名辅助窗口及通用系统剪贴板写入，不再包含内置剪贴板 UI、commands、SQLite owner 或固定历史/预览窗口。
-- 视频链接抽取的 `com.attson.video` 独立版与签名插件复用同一 UI、`atvideo-service` 和独立 YouTube runtime，并可通过 Host activation 把链接交给动态 Aria2；生产 Publisher、两个五目标 alpha Release、精确十资产、Catalog 安装升级与首次启动失败回滚均已验证。宿主内置视频入口及共享 runtime 在 P3 前继续保留。
+- 视频链接抽取已完全外置为 `com.attson.video`：独立版与签名插件复用同一 UI、`atvideo-service` 和独立 YouTube runtime，并可通过 Host activation 把链接交给动态 Aria2。宿主只保留 Host API 2.x 的最小视频权限网关、Catalog 包校验和跨应用 activation，不再包含内置视频入口、四平台解析 commands、进程内 Aria2 handoff 或 yt-dlp / QuickJS runtime。
 - 插件平台支持页面关闭后继续连接的 `background` Native Service，以及由 manifest 声明、宿主隔离承载的底部面板和居中对话框辅助窗口。后台连接失败不会阻止平台启动，应用入口和管理页会显示稳定错误码与关联 ID。
 
-下面详列两个“重后端”内置工具与 HTTP、剪贴板独立应用，其余见汇总表。
+下面详列两个“重后端”内置工具与 HTTP、剪贴板、视频独立应用，其余见汇总表。
 
 ### Aria2 下载（`id: aria2`）
 
@@ -53,11 +53,17 @@ attool 是一个个人使用的桌面工具集合，运行在 Tauri 2 上。前�
 - 插件 iframe 通过 `host.clipboard.history` 的六个历史方法和两个设置方法访问 service；公共 DTO、分页、文本截断与图片预览均有界，不暴露内部图片、数据库或缓存路径。
 - 宿主启动不打开、迁移、清理或删除剪贴板数据库，不注册领域快捷键，也不保留固定窗口或旧 Tauri commands。截图、钉图等通用系统图片剪贴板写入仍由宿主提供。
 
+### 视频链接抽取（独立应用 `com.attson.video`）
+
+- 通过官方 Catalog 安装；启用后动态工具 ID 为 `plugin:com.attson.video`，停用或卸载后入口消失，平台不提供内置回退或自动安装。
+- 独立版与插件版复用同一 UI、`atvideo-service`、YouTube bridge，以及应用包内固定的 yt-dlp、yt-dlp-ejs 与 QuickJS runtime；宿主安装包不携带这些视频 runtime。
+- 插件通过 `host.video.extract` 的五个方法白名单完成四平台解析，并使用独立授权的复制、外链与 `host.app.activate` 能力。Host 只校验方法、平台 host、精确参数、无凭证代理和 timeout，不执行视频解析。
+- 动态 Video 可把有界 URL 批次交给动态 Aria2；历史 `douyin` / `video-link` 最近工具值会迁移到动态 ID，目标未安装或停用时回到首页。
+
 ### 其余工具
 
 | 工具（id） | 能力 | 后端 |
 |---|---|---|
-| 视频链接抽取（`douyin`） | 抖音 / B站 / 小红书 / YouTube 链接与文案解析；YouTube 使用内置 yt-dlp + EJS + QuickJS | `douyin/bilibili/xhs/youtube.rs` |
 | 图片（`image`） | 统一捕获工作台（截图 / 录屏，截图选区支持标注与快捷 OCR）、压缩、格式转换、EXIF、OCR；OCR 内置 Tesseract 与中英日语言模型 | `imaging/`（含 xcap 截图）+ `recording.rs` |
 | 网络（`network`） | URL 分解、Ping、端口、DNS | `network/` |
 
@@ -92,8 +98,7 @@ attool 是一个个人使用的桌面工具集合，运行在 Tauri 2 上。前�
 
 - Tesseract 5.5.3，以及 `eng` / `chi_sim` / `chi_tra` / `jpn` 语言模型
 - Aria2 1.37.0
-- `psd-bridge` sidecar 自带的 Python、`psd-tools`、yt-dlp 2026.10.21 与 yt-dlp-ejs 0.8.0
-- QuickJS-ng 0.17.0，用于 yt-dlp 的 YouTube JavaScript challenge
+- `psd-bridge` sidecar 自带的 Python 与 `psd-tools`，只用于主图模板 PSD 导入
 - Linux Wayland 录屏所需的 GStreamer 插件与 libvpx；GStreamer 1.0 ABI 由 Deb 依赖保证
 
 这些文件释放到用户缓存中的版本化目录；缺失或损坏时从主程序内嵌内容自动重建。正式版不从系统 `PATH` 回退查找上述程序，也不在首次使用时联网下载组件。
