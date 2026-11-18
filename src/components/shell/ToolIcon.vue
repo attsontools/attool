@@ -85,6 +85,21 @@ defineProps<{ name: ToolIconId; size?: number }>();
       <polygon points="22 2 15 22 11 13 2 9 22 2" />
     </template>
 
+    <!-- hash / codec -->
+    <template v-else-if="name === 'hash'">
+      <line x1="10" y1="3" x2="8" y2="21" />
+      <line x1="16" y1="3" x2="14" y2="21" />
+      <line x1="4" y1="9" x2="20" y2="9" />
+      <line x1="3" y1="15" x2="19" y2="15" />
+    </template>
+
+    <!-- type / text tools -->
+    <template v-else-if="name === 'type'">
+      <polyline points="4 7 4 4 20 4 20 7" />
+      <line x1="9" y1="20" x2="15" y2="20" />
+      <line x1="12" y1="4" x2="12" y2="20" />
+    </template>
+
     <!-- chat -->
     <template v-else-if="name === 'chat'">
       <path d="M4 5.5C4 4.67 4.67 4 5.5 4h13c.83 0 1.5.67 1.5 1.5v9c0 .83-.67 1.5-1.5 1.5H9.5L5.5 20v-4H5.5A1.5 1.5 0 0 1 4 14.5v-9Z" />

@@ -13,6 +13,7 @@ use uuid::Uuid;
 use super::{
     auxiliary_window::{AuxiliaryWindowError, AuxiliaryWindowRuntime},
     catalog::{CatalogError, CatalogInstallPlan, CatalogRuntime, CatalogSnapshot},
+    frame_server::{FrameAssetReader, FrameSessionDescriptor, FrameSessionRuntime},
     http_service::{NativeServiceError, NativeServiceRuntime},
     install::{
         InstallError, InstalledPlugin, PluginAsset, PluginHistoryRecord, PluginStore,
@@ -38,6 +39,7 @@ pub struct PluginRuntime {
     client: reqwest::Client,
     operations: Arc<Mutex<HashMap<String, OperationSnapshot>>>,
     pending: Arc<Mutex<HashMap<String, PendingCatalogInstall>>>,
+    frame_sessions: FrameSessionRuntime,
 }
 
 struct PendingCatalogInstall {
@@ -83,6 +85,7 @@ impl PluginRuntime {
                 .map_err(|error| format!("cannot create plugin download client: {error}"))?,
             operations: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            frame_sessions: FrameSessionRuntime::default(),
         })
     }
 
@@ -220,6 +223,78 @@ impl PluginRuntime {
             })?
             .read_prepared_entry(&operation.prepared, entry)?;
         entry_html(asset)
+    }
+
+    fn create_frame_session(
+        &self,
+        app_id: String,
+        entry: Option<String>,
+    ) -> Result<FrameSessionDescriptor, PluginCommandError> {
+        let entry = {
+            let store = self.store.lock().map_err(|_| {
+                PluginCommandError::new("PLUGIN_STORE_LOCK_FAILED", "Plugin store lock failed")
+            })?;
+            let plugin = store
+                .list()?
+                .into_iter()
+                .find(|plugin| plugin.app_id == app_id)
+                .ok_or_else(|| {
+                    PluginCommandError::new("PLUGIN_NOT_FOUND", "Installed plugin was not found")
+                })?;
+            let entry = entry.unwrap_or(plugin.entry.clone());
+            if entry != plugin.entry && !plugin.windows.values().any(|window| window.entry == entry)
+            {
+                return Err(PluginCommandError::new(
+                    "PLUGIN_ENTRY_NOT_DECLARED",
+                    "Plugin UI entry is not declared as a signed window",
+                ));
+            }
+            entry
+        };
+        let runtime = self.clone();
+        let reader: FrameAssetReader =
+            Arc::new(move |relative| runtime.read_asset(&app_id, relative));
+        self.frame_sessions.start(&entry, reader)
+    }
+
+    fn create_probe_frame_session(
+        &self,
+        operation_id: String,
+        entry: Option<String>,
+    ) -> Result<FrameSessionDescriptor, PluginCommandError> {
+        let entry = {
+            let pending = self.pending.lock().map_err(|_| {
+                PluginCommandError::new(
+                    "PLUGIN_OPERATION_LOCK_FAILED",
+                    "Plugin operation lock failed",
+                )
+            })?;
+            let operation = pending.get(&operation_id).ok_or_else(|| {
+                PluginCommandError::new(
+                    "PLUGIN_OPERATION_NOT_FOUND",
+                    "Plugin operation was not found",
+                )
+            })?;
+            let package = &operation.prepared.package;
+            let entry = entry.unwrap_or(package.entry.clone());
+            if entry != package.entry
+                && !package.windows.values().any(|window| window.entry == entry)
+            {
+                return Err(PluginCommandError::new(
+                    "PLUGIN_ENTRY_NOT_DECLARED",
+                    "Plugin UI entry is not declared as a signed window",
+                ));
+            }
+            entry
+        };
+        let runtime = self.clone();
+        let reader: FrameAssetReader =
+            Arc::new(move |relative| runtime.read_probe_asset(&operation_id, relative));
+        self.frame_sessions.start(&entry, reader)
+    }
+
+    fn revoke_frame_session(&self, session_id: &str) {
+        self.frame_sessions.revoke(session_id);
     }
 
     async fn start_catalog_install(
@@ -848,7 +923,7 @@ pub struct PluginCommandError {
 }
 
 impl PluginCommandError {
-    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+    pub(super) fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
             message: message.into(),
@@ -1074,6 +1149,43 @@ pub async fn plugin_read_probe_entry_html(
     })
     .await
     .map_err(join_error)?
+}
+
+#[tauri::command]
+pub async fn plugin_create_frame_session(
+    app_id: String,
+    entry: Option<String>,
+    runtime: State<'_, PluginRuntime>,
+) -> Result<FrameSessionDescriptor, PluginCommandError> {
+    let runtime = runtime.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || runtime.create_frame_session(app_id, entry))
+        .await
+        .map_err(join_error)?
+}
+
+#[tauri::command]
+pub async fn plugin_create_probe_frame_session(
+    operation_id: String,
+    entry: Option<String>,
+    runtime: State<'_, PluginRuntime>,
+) -> Result<FrameSessionDescriptor, PluginCommandError> {
+    let runtime = runtime.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        runtime.create_probe_frame_session(operation_id, entry)
+    })
+    .await
+    .map_err(join_error)?
+}
+
+#[tauri::command]
+pub async fn plugin_revoke_frame_session(
+    session_id: String,
+    runtime: State<'_, PluginRuntime>,
+) -> Result<(), PluginCommandError> {
+    let runtime = runtime.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || runtime.revoke_frame_session(&session_id))
+        .await
+        .map_err(join_error)
 }
 
 #[tauri::command]
@@ -1315,9 +1427,21 @@ pub async fn plugin_rollback_plugin_launch(
 
 #[cfg(test)]
 mod tests {
-    use ed25519_dalek::SigningKey;
+    use std::{
+        fs::File,
+        io::{Read, Write},
+        net::TcpStream,
+    };
 
-    use super::{operation_error_message, PluginRuntime, P0_TEST_PUBLIC_KEY};
+    use base64::Engine;
+    use ed25519_dalek::{Signer, SigningKey};
+    use sha2::{Digest, Sha256};
+    use zip::{write::SimpleFileOptions, ZipWriter};
+
+    use super::{
+        operation_error_message, CatalogOperationMode, PendingCatalogInstall, PluginRuntime,
+        P0_TEST_PUBLIC_KEY,
+    };
     use crate::plugin::install::PluginStore;
     use crate::plugin::remote_install::{OperationSnapshot, OperationStage};
 
@@ -1346,6 +1470,71 @@ mod tests {
         }
     }
 
+    fn signed_test_package(directory: &std::path::Path) -> std::path::PathBuf {
+        const SEED: [u8; 32] = [
+            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec,
+            0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03,
+            0x1c, 0xae, 0x7f, 0x60,
+        ];
+        let path = directory.join("frame-test.atpkg");
+        let signing_key = SigningKey::from_bytes(&SEED);
+        let license = b"P0 test license";
+        let entry = b"<!doctype html><title>Frame test</title>";
+        let script = b"globalThis.frameTest = true;";
+        let sha256 = |bytes: &[u8]| hex::encode(Sha256::digest(bytes));
+        let manifest = format!(
+            concat!(
+                "{{\"appId\":\"com.attson.frame-test\",",
+                "\"files\":{{\"LICENSE\":\"{}\",\"ui/app.js\":\"{}\",\"ui/index.html\":\"{}\"}},",
+                "\"hostApi\":{{\"max\":\"1.x\",\"min\":\"1.0.0\"}},",
+                "\"name\":\"Frame test\",",
+                "\"permissions\":[\"host.theme.read\"],",
+                "\"publisher\":{{\"id\":\"com.attson\",\"keyId\":\"attool-p0-test\",\"name\":\"Attson\"}},",
+                "\"schemaVersion\":1,",
+                "\"target\":{{\"arch\":\"{}\",\"os\":\"{}\"}},",
+                "\"ui\":{{\"entry\":\"ui/index.html\"}},",
+                "\"version\":\"0.1.0-alpha.0\"}}"
+            ),
+            sha256(license),
+            sha256(script),
+            sha256(entry),
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+        );
+        let signature = base64::engine::general_purpose::STANDARD
+            .encode(signing_key.sign(manifest.as_bytes()).to_bytes());
+        let mut archive = ZipWriter::new(File::create(&path).unwrap());
+        for (name, bytes) in [
+            ("manifest.json", manifest.as_bytes()),
+            ("manifest.sig", signature.as_bytes()),
+            ("LICENSE", license.as_slice()),
+            ("ui/index.html", entry.as_slice()),
+            ("ui/app.js", script.as_slice()),
+        ] {
+            archive
+                .start_file(name, SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(bytes).unwrap();
+        }
+        archive.finish().unwrap();
+        path
+    }
+
+    fn get(url: &str) -> String {
+        let parsed = url::Url::parse(url).unwrap();
+        let address = format!("{}:{}", parsed.host_str().unwrap(), parsed.port().unwrap());
+        let mut stream = TcpStream::connect(&address).unwrap();
+        write!(
+            stream,
+            "GET {} HTTP/1.1\r\nHost: {address}\r\n\r\n",
+            parsed.path()
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
+
     #[test]
     fn p0_runtime_trusts_the_sdk_test_key() {
         let directory = tempfile::tempdir().unwrap();
@@ -1363,6 +1552,51 @@ mod tests {
             P0_TEST_PUBLIC_KEY
         );
         assert!(runtime.trusted_keys.contains_key("attool-p0-test"));
+    }
+
+    #[test]
+    fn installed_and_probe_frames_share_verified_session_delivery() {
+        let installed_directory = tempfile::tempdir().unwrap();
+        let installed_package = signed_test_package(installed_directory.path());
+        let installed_runtime = PluginRuntime::p0(
+            PluginStore::open(installed_directory.path().join("plugins")).unwrap(),
+        )
+        .unwrap();
+        installed_runtime.install(installed_package).unwrap();
+        let installed = installed_runtime
+            .create_frame_session("com.attson.frame-test".to_string(), None)
+            .unwrap();
+        assert!(get(&installed.url).contains("<title>Frame test</title>"));
+        installed_runtime.revoke_frame_session(&installed.session_id);
+
+        let probe_directory = tempfile::tempdir().unwrap();
+        let probe_package = signed_test_package(probe_directory.path());
+        let probe_runtime =
+            PluginRuntime::p0(PluginStore::open(probe_directory.path().join("plugins")).unwrap())
+                .unwrap();
+        let prepared = probe_runtime
+            .store
+            .lock()
+            .unwrap()
+            .prepare_install(
+                &probe_package,
+                &probe_runtime.environment,
+                &probe_runtime.trusted_keys,
+                "probe-operation",
+            )
+            .unwrap();
+        probe_runtime.pending.lock().unwrap().insert(
+            "probe-operation".to_string(),
+            PendingCatalogInstall {
+                prepared,
+                mode: CatalogOperationMode::Install,
+            },
+        );
+        let probe = probe_runtime
+            .create_probe_frame_session("probe-operation".to_string(), None)
+            .unwrap();
+        assert!(get(&probe.url).contains("<title>Frame test</title>"));
+        probe_runtime.revoke_frame_session(&probe.session_id);
     }
 
     #[test]

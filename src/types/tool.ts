@@ -13,6 +13,8 @@ export type ToolIconId =
   | 'dice'
   | 'clock'
   | 'send'
+  | 'hash'
+  | 'type'
   | 'chat'
   | 'apps';
 

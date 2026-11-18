@@ -189,6 +189,67 @@ describe('usePluginStore', () => {
     });
   });
 
+  it('uses the catalog business icon for installed app navigation', async () => {
+    const store = usePluginStore(fakeApi());
+
+    await store.load();
+
+    expect(store.navigationTools.value[0].icon).toBe('hash');
+  });
+
+  it('updates fallback navigation icons after the catalog is refreshed', async () => {
+    const api = fakeApi();
+    vi.mocked(api.listCatalog).mockResolvedValue(null);
+    const store = usePluginStore(api);
+
+    await store.load();
+    expect(store.navigationTools.value[0].icon).toBe('apps');
+
+    await store.refreshCatalog();
+    expect(store.navigationTools.value[0].icon).toBe('hash');
+  });
+
+  it('maps only supported catalog icons and falls back for unknown apps', async () => {
+    const api = fakeApi();
+    const icons = [
+      ['codec', 'hash'],
+      ['type', 'type'],
+      ['dice', 'dice'],
+      ['clock', 'clock'],
+      ['code', 'code'],
+      ['http', 'send'],
+      ['clipboard', 'clipboard'],
+      ['video', 'video']
+    ] as const;
+    vi.mocked(api.listInstalled).mockResolvedValue([
+      ...icons.map(([icon], index) => ({
+        ...codec,
+        appId: `com.attson.${icon}`,
+        name: icon,
+        installedAt: `2026-11-10T00:00:0${index}Z`
+      })),
+      { ...codec, appId: 'com.example.unknown', name: 'Unknown' }
+    ]);
+    vi.mocked(api.listCatalog).mockResolvedValue({
+      ...catalog,
+      apps: icons.map(([icon], index) => ({
+        ...catalog.apps[0],
+        appId: `com.attson.${icon}`,
+        name: icon,
+        icon,
+        publishedAt: `2026-11-10T07:00:0${index}Z`
+      }))
+    });
+    const store = usePluginStore(api);
+
+    await store.load();
+
+    expect(store.navigationTools.value.map((tool) => tool.icon)).toEqual([
+      ...icons.map(([, expected]) => expected),
+      'apps'
+    ]);
+  });
+
   it('loads installed apps when operation event subscription is unavailable', async () => {
     const api = fakeApi();
     vi.mocked(api.listenOperations).mockRejectedValue(new Error('event bridge unavailable'));

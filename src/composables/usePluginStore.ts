@@ -12,7 +12,21 @@ import type {
   PluginHistoryRecord,
   PluginOperationSnapshot
 } from '../components/plugins/types';
-import type { Tool } from '../types/tool';
+import type { Tool, ToolIconId } from '../types/tool';
+
+function catalogToolIcon(icon: string | undefined): ToolIconId {
+  const icons: Record<string, ToolIconId> = {
+    codec: 'hash',
+    type: 'type',
+    dice: 'dice',
+    clock: 'clock',
+    code: 'code',
+    http: 'send',
+    clipboard: 'clipboard',
+    video: 'video'
+  };
+  return icon ? icons[icon] ?? 'apps' : 'apps';
+}
 
 function commandError(error: unknown): PluginCommandError {
   if (typeof error === 'object' && error !== null) {
@@ -61,6 +75,7 @@ export function usePluginStore(api: PluginApi = createPluginApi()) {
       .filter((app) => app.enabled)
       .map((app) => {
         const serviceStatus = nativeServiceStatuses.value.get(app.appId);
+        const catalogIcon = catalog.value?.apps.find((item) => item.appId === app.appId)?.icon;
         return {
           id: `plugin:${app.appId}`,
           name: app.name,
@@ -68,7 +83,7 @@ export function usePluginStore(api: PluginApi = createPluginApi()) {
             ? `后台服务不可用 · ${serviceStatus.errorCode ?? 'NATIVE_SERVICE_UNAVAILABLE'}`
             : `${app.publisherName} 提供的独立应用`,
           status: 'ready',
-          icon: 'apps',
+          icon: catalogToolIcon(catalogIcon),
           group: 'utility',
           source: 'plugin',
           pluginAppId: app.appId

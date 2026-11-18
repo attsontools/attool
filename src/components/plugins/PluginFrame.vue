@@ -21,7 +21,11 @@ import type {
   AppActivationNotification,
   AppActivationRequest
 } from './appActivation';
-import { buildPluginFrameDocument, pluginAssetBaseUrl } from './pluginFrameDocument';
+import {
+  pluginFrameFailureMessage,
+  validatePluginFrameFailure,
+  type PluginFrameSession
+} from './pluginFrameSession';
 import type { InstalledPlugin } from './types';
 
 const props = defineProps<{
@@ -49,9 +53,10 @@ const state = ref<FrameState>('loading');
 const errorMessage = ref('');
 const reloadRevision = ref(0);
 const serviceReady = ref(false);
-const frameHtml = ref('');
+const frameUrl = ref('');
 const frameEntry = computed(() => props.entry ?? props.app.entry);
 let session: PluginHostSession | null = null;
+let frameResourceSession: (PluginFrameSession & { revision: number }) | null = null;
 let handshakeTimer: ReturnType<typeof setTimeout> | null = null;
 let handlingFailure = false;
 let nativeServiceEventUnlisten: UnlistenFn | null = null;
@@ -90,6 +95,26 @@ function clearSession() {
   activationDispatcher.reset();
   if (handshakeTimer) clearTimeout(handshakeTimer);
   handshakeTimer = null;
+}
+
+async function revokeResourceSession() {
+  const active = frameResourceSession;
+  frameResourceSession = null;
+  frameUrl.value = '';
+  if (!active) return;
+  try {
+    await invoke('plugin_revoke_frame_session', { sessionId: active.sessionId });
+  } catch {
+    // Session revocation is idempotent and best-effort during teardown.
+  }
+}
+
+async function revokeCreatedSession(created: PluginFrameSession) {
+  try {
+    await invoke('plugin_revoke_frame_session', { sessionId: created.sessionId });
+  } catch {
+    // The backend may already have dropped a failed session.
+  }
 }
 
 async function savePluginFile(input: HostFileSaveRequest) {
@@ -133,6 +158,7 @@ function pathName(path: string) {
 }
 
 async function prepareFrame() {
+  const revision = reloadRevision.value;
   serviceReady.value = false;
   state.value = props.app.nativeService ? 'connecting' : 'loading';
   errorMessage.value = '';
@@ -167,18 +193,20 @@ async function prepareFrame() {
     if (props.app.nativeService) {
       await invoke('plugin_connect_native_service', { appId: props.app.appId });
     }
-    const html = await invoke<string>('plugin_read_entry_html', {
+    const created = await invoke<PluginFrameSession>('plugin_create_frame_session', {
       appId: props.app.appId,
       entry: frameEntry.value
     });
-    if (disposed) return;
-    frameHtml.value = `${buildPluginFrameDocument(
-      html,
-      pluginAssetBaseUrl('attool-plugin', props.app.appId, frameEntry.value)
-    )}\n<!-- reload:${reloadRevision.value} -->`;
+    if (disposed || revision !== reloadRevision.value) {
+      await revokeCreatedSession(created);
+      return;
+    }
+    frameResourceSession = { ...created, revision };
+    frameUrl.value = created.url;
     state.value = 'loading';
     serviceReady.value = true;
   } catch (reason) {
+    if (disposed || revision !== reloadRevision.value) return;
     await handleLaunchFailure(serviceErrorMessage(reason));
   }
 }
@@ -199,7 +227,8 @@ function handleLoad() {
   clearSession();
   handlingFailure = false;
   const contentWindow = frame.value?.contentWindow;
-  if (!contentWindow) {
+  const resourceSession = frameResourceSession;
+  if (!contentWindow || !resourceSession) {
     void handleLaunchFailure('无法建立应用窗口连接');
     return;
   }
@@ -250,7 +279,7 @@ function handleLoad() {
       apiVersion: props.app.nativeService ? '2.0' : '1.0',
       appId: props.app.appId
     },
-    '*',
+    new URL(resourceSession.url).origin,
     [channel.port2]
   );
   handshakeTimer = setTimeout(() => {
@@ -260,11 +289,13 @@ function handleLoad() {
 }
 
 async function confirmLaunch() {
+  const resourceSession = frameResourceSession;
   try {
     await invoke<boolean>('plugin_confirm_plugin_launch', {
       appId: props.app.appId,
       version: props.app.version
     });
+    if (disposed || handlingFailure || frameResourceSession !== resourceSession) return;
     state.value = 'ready';
     if (!props.auxiliary && props.registerAppActivationTarget) {
       appActivationUnregister?.();
@@ -277,6 +308,7 @@ async function confirmLaunch() {
       );
     }
   } catch {
+    if (disposed || handlingFailure || frameResourceSession !== resourceSession) return;
     clearSession();
     await handleLaunchFailure('无法确认当前应用版本');
   }
@@ -285,6 +317,8 @@ async function confirmLaunch() {
 async function handleLaunchFailure(reason: string) {
   if (handlingFailure) return;
   handlingFailure = true;
+  clearSession();
+  await revokeResourceSession();
   if (props.auxiliary) {
     fail(reason);
     return;
@@ -311,15 +345,30 @@ function fail(reason: string) {
   errorMessage.value = reason;
 }
 
-function reload() {
+async function reload() {
   clearSession();
+  await revokeResourceSession();
+  if (disposed) return;
   state.value = 'loading';
   errorMessage.value = '';
   handlingFailure = false;
   serviceReady.value = false;
-  frameHtml.value = '';
   reloadRevision.value += 1;
-  void prepareFrame();
+  await prepareFrame();
+}
+
+function handleFrameMessage(event: MessageEvent) {
+  const active = frameResourceSession;
+  const contentWindow = frame.value?.contentWindow;
+  if (!active || !contentWindow) return;
+  const category = validatePluginFrameFailure(event, {
+    source: contentWindow,
+    launchToken: active.launchToken,
+    revision: active.revision,
+    currentRevision: reloadRevision.value,
+    launchPending: state.value !== 'ready'
+  });
+  if (category) void handleLaunchFailure(pluginFrameFailureMessage(category));
 }
 
 function serviceErrorMessage(reason: unknown) {
@@ -344,11 +393,16 @@ watch(
   (theme) => session?.notifyTheme(theme)
 );
 
-onMounted(() => void prepareFrame());
+onMounted(() => {
+  window.addEventListener('message', handleFrameMessage);
+  void prepareFrame();
+});
 
 onBeforeUnmount(() => {
   disposed = true;
+  window.removeEventListener('message', handleFrameMessage);
   clearSession();
+  void revokeResourceSession();
   nativeServiceEventUnlisten?.();
   nativeServiceEventUnlisten = null;
   auxiliaryActivationUnlisten?.();
@@ -360,11 +414,11 @@ onBeforeUnmount(() => {
 <template>
   <section class="plugin-frame" :class="{ auxiliary }">
     <iframe
-      v-if="serviceReady"
+      v-if="serviceReady && frameUrl"
       ref="frame"
-      :srcdoc="frameHtml"
+      :src="frameUrl"
       :title="windowId ? `${app.name} ${windowId}` : app.name"
-      sandbox="allow-scripts"
+      sandbox="allow-scripts allow-same-origin"
       referrerpolicy="no-referrer"
       @load="handleLoad"
       @error="handleLaunchFailure('应用资源加载失败')"
