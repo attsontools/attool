@@ -11,7 +11,7 @@ attool 是一个个人使用的桌面工具集合，运行在 Tauri 2 上。前�
 ### 应用管理与独立应用
 
 - “应用管理”（`id: app-management`）位于侧栏“平台”分组，展示内置工具和已安装插件，支持本地 `.atpkg` 预览、权限确认、安装、停用、启用、卸载、筛选和安装历史。
-- 平台只接受签名有效、文件 hash 完整、target 匹配且 Host API 兼容的包。Host 校验插件 entry 后把它装入 opaque `srcdoc` sandbox，签名静态资源由 `attool-plugin://<appId>` 提供；公共桌面能力只能通过版本化 Host API 调用。
+- 平台只接受签名有效、文件 hash 完整、target 匹配且 Host API 兼容的包。Host 为每个插件窗口创建独立的随机 loopback origin，经带令牌的短期资源 session 提供已验签 entry 与静态资源；iframe 只能通过版本化 Host API 调用公共桌面能力，关闭、失败或重载时撤销资源 session。
 - Codec、Text、Generator、Time 与 JSON 均为从平台完全外置的双制品应用：`atcodec`、`attext`、`atgenerator`、`attime`、`atjson` 仓库分别生成独立 Tauri 安装包和对应插件包。平台不再包含五者的内置实现，安装的插件是唯一入口。
 - 官方 Catalog 由 AT Tool 主仓维护并签名，平台可按当前 OS/架构远程安装和主动升级多个官方应用；新版本先进入 `pending`，健康检查与原子切换通过后成为 `current`，失败时保留或恢复上一可用版本。
 - HTTP 已完全外置为 `com.attson.http`：`athttp` 独立版和官方 Catalog 插件复用同一 UI、请求核心与 `${app_data_dir}/http/http.sqlite3`，由单一 Native/Data Service 提供请求、长连接和数据 API。平台只保留 Host API 2.x 桥接和 service supervisor，不再包含内置 HTTP UI、Store、Tauri commands 或 SQLite owner。

@@ -1,6 +1,7 @@
 pub mod auxiliary_window;
 pub mod catalog;
 pub mod commands;
+pub mod frame_server;
 mod github_proxy;
 pub mod http_service;
 pub mod install;

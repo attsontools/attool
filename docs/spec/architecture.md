@@ -84,9 +84,9 @@ HTTP 与剪贴板数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app
 
 ### 隔离运行时与 Host API
 
-- `attool-plugin://<appId>/<path>` 自定义协议只服务已启用且在签名清单中声明的文件，每次读取重新校验 SHA-256，并返回严格 CSP、CORS、`nosniff` 和 `no-store`。协议响应自身带无放行项的 CSP `sandbox`，因此被直接导航为文档时也不能执行脚本或发起导航，只作为 opaque iframe 的静态子资源来源。
-- Host 先通过 Tauri command 读取并校验 manifest entry HTML，再把 CSP 与指向签名资源目录的 `<base>` 放到所有不可信标记之前，作为 `sandbox="allow-scripts"` iframe 的 `srcdoc`。iframe 不带 `allow-same-origin`，文档 origin 保持 opaque；这同时隔离父 DOM、Vue 状态和 Tauri commands，不能再假设“自定义协议 origin + allow-same-origin”在所有 WebView 平台都能阻止子 frame 获得 Tauri 初始化脚本。
-- iframe 与平台通过 `MessageChannel` 上的 JSON-RPC 2.0 通信。纯前端插件继续使用 Host API 1.x；原生 service 插件使用 Host API 2.x，隔离安装探针同样读取 staged entry 为 opaque `srcdoc`，并按 operation 的 `nativeService` 选择相同 API 版本。握手返回 session ID、correlation ID、应用元数据、主题和已批准能力；请求校验 `appId`、API 版本、消息大小、超时和权限。HTTP 业务帧上限为 8 MiB，请求超时覆盖最长 300 秒网络请求并保留 5 秒传输余量。
+- Host 为每个插件窗口和安装探针绑定一个随机 `127.0.0.1` 端口，创建带 session ID 与 launch token 的独立资源 origin。loopback server 只接受匹配 Host、origin、令牌或 HttpOnly session cookie 的 `GET` / `HEAD`，只读取签名清单声明且 SHA-256 匹配的文件，并返回严格 CSP、`nosniff`、`no-store`、same-origin CORP 与 no-referrer；关闭、失败或重载时撤销 session 并停止监听。
+- Host 校验 manifest entry 为 UTF-8 HTML 后，在所有不可信标记之前注入 CSP、带尾斜杠的签名资源 `<base>` 和仅报告启动阶段资源/模块错误的 nonce bootstrap。iframe 使用 `sandbox="allow-scripts allow-same-origin"`，但其随机 loopback origin 与父 WebView、其他插件窗口及 Tauri origin 分离；插件不能访问父 DOM、Vue 状态或 Tauri commands。历史 `attool-plugin:` 自定义协议保留为不可执行的签名资源兼容入口，不再承载活动插件文档。
+- iframe 与平台通过 `MessageChannel` 上的 JSON-RPC 2.0 通信，连接消息固定发送到当前资源 session 的精确 origin，并同时校验 frame source、launch token 和加载 revision。纯前端插件继续使用 Host API 1.x；原生 service 插件使用 Host API 2.x，隔离安装探针使用相同 loopback session，并按 operation 的 `nativeService` 选择相同 API 版本。握手返回 session ID、correlation ID、应用元数据、主题和已批准能力；请求校验 `appId`、API 版本、消息大小、超时和权限。HTTP 业务帧上限为 8 MiB，请求超时覆盖最长 300 秒网络请求并保留 5 秒传输余量。
 - 基础权限为 `host.theme.read`、`host.notification.show`、`host.file.save`；通用桌面能力另以 `host.clipboard.write`、`host.external.open` 和 `host.app.activate` 独立授权，不借用 HTTP 权限。`host.ui.auxiliary` 只允许应用打开自己 manifest 已声明的辅助窗口，64 KiB 激活 payload 通过目标窗口的 `host.ui.activated` 通知交付。HTTP 插件另声明 `host.http.request`、`host.http.stream`、`host.http.data`，分别代理一次请求、长连接和 Data API；主图模板插件声明 `host.template.project`，仅能调用模板方法白名单；剪贴板应用声明 `host.clipboard.history`，只开放六个历史方法和两个设置方法。multipart 与模板文件/目录选择只向插件返回会话级不透明 token，复制、保存和文件选择都由 Host 执行；模板 token 绑定类型且只能消费一次，批处理返回和错误响应拒绝泄漏本地绝对路径。切换工具、停用或卸载会销毁 iframe、消息端口和尚未消费的 token。
 - `host.app.activate` 只能激活已安装、启用且可加载的其他动态应用。Host 在 acceptance 响应前把最多 64 KiB 的 JSON payload 加入目标队列，响应后才导航，并在目标主页面握手确认后按 FIFO 通过 `host.app.activated` 交付真实 `sourceAppId`；每个目标最多保留 32 项。未响应的请求从队列撤销，已响应但目标加载或通知失败的内容保留到当前进程内下次可用 session，不因源 iframe 销毁而丢失。
 
@@ -393,6 +393,10 @@ Root 私钥保持离线，日常 Catalog 只使用 Root 授权的独立 Signing 
 ### 2026-11-14 插件文档使用 opaque srcdoc 隔离
 
 插件 entry 由 Host 校验后装入不带 `allow-same-origin` 的 `srcdoc`，签名静态资源继续从自定义协议加载，直接导航协议文档则由 CSP `sandbox` 钝化。相比保留每应用 custom origin 或拆成独立 WebView，该方案需要 CORS 与文档前缀装配，但能跨平台阻断子 frame 获得本地 Tauri 调用身份，同时保留现有 MessageChannel Host API。
+
+### 2026-11-18 插件文档改用独立 loopback origin
+
+取代 2026-11-14「插件文档使用 opaque srcdoc 隔离」。每个活动窗口改用随机 loopback 端口与令牌资源 session，在保持父 WebView、插件窗口和 Tauri origin 隔离的同时恢复 WebKitGTK 对模块及相对静态资源的可靠加载；代价是 Host 需要管理本地 listener、精确 CSP、消息来源和 session 撤销生命周期。
 
 ### 2026-11-15 后台 Service 与宿主承载辅助窗口
 
