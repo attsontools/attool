@@ -30,6 +30,12 @@ describe('useLastTool', () => {
     expect(lastToolId.value).toBe('image');
   });
 
+  it.each(['douyin', 'video-link'])('maps the removed %s tool to the external video application', (id) => {
+    const { storage } = fakeStorage({ 'attool.lastTool': id });
+    const { lastToolId } = useLastTool(storage);
+    expect(lastToolId.value).toBe('plugin:com.attson.video');
+  });
+
   it('maps the removed codec tool to the external application', () => {
     const { storage } = fakeStorage({ 'attool.lastTool': 'codec' });
     const { lastToolId } = useLastTool(storage);

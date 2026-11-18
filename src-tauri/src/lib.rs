@@ -1,10 +1,8 @@
-mod bilibili;
 mod bundled_tools;
 mod clipboard;
 #[cfg(target_os = "linux")]
 mod capture_command;
 mod updater;
-mod douyin;
 mod embedded_runtime;
 #[cfg(target_os = "linux")]
 mod gpu_linux;
@@ -15,8 +13,6 @@ pub mod network;
 mod recording;
 mod recording_preview;
 mod plugin;
-mod xhs;
-mod youtube;
 
 use ecommerce::{EcommerceStore, LegacyTemplateOwner};
 use regex::Regex;
@@ -1005,134 +1001,6 @@ fn find_download_dir(db_path: &Path, id: &str) -> Result<String, String> {
         .map_err(|error| format!("未找到任务保存目录：{error}"))
 }
 
-const DOUYIN_MOBILE_UA: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) \
-    AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1";
-
-#[tauri::command]
-async fn extract_douyin_video(url: String) -> Result<douyin::DouyinVideoInfo, String> {
-    let video_id = douyin::extract_video_id(&url)
-        .ok_or_else(|| "URL 中未找到 video id".to_string())?;
-
-    let share_url = format!("https://www.iesdouyin.com/share/video/{video_id}/");
-    let client = reqwest::Client::builder()
-        .user_agent(DOUYIN_MOBILE_UA)
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .map_err(|error| format!("构造 HTTP 客户端失败：{error}"))?;
-
-    let response = client
-        .get(&share_url)
-        .header("Accept-Language", "zh-CN,zh;q=0.9")
-        .send()
-        .await
-        .map_err(|error| format!("网络错误：{error}"))?;
-
-    if !response.status().is_success() {
-        return Err(format!("网络错误：HTTP {}", response.status()));
-    }
-
-    let body = response
-        .text()
-        .await
-        .map_err(|error| format!("读取响应失败：{error}"))?;
-
-    let raw_json = douyin::extract_payload_json(&body)?;
-    let root = douyin::parse_render_data(&raw_json)?;
-    let raw_mp4 =
-        douyin::find_mp4_url(&root).ok_or_else(|| "未在页面数据中找到视频 URL".to_string())?;
-    let title = douyin::find_title(&root, &video_id);
-    let (mp4_url, resolved_no_wm) = douyin::derive_watermark_removed_url(&raw_mp4);
-    Ok(douyin::DouyinVideoInfo {
-        mp4_url,
-        title,
-        has_watermark: !resolved_no_wm,
-    })
-}
-
-#[tauri::command]
-async fn resolve_douyin_url(url: String) -> Result<String, String> {
-    if !(url.starts_with("https://v.douyin.com/") || url.starts_with("http://v.douyin.com/")) {
-        return Err("仅支持 v.douyin.com 短链".to_string());
-    }
-
-    let client = reqwest::Client::builder()
-        .user_agent(DOUYIN_MOBILE_UA)
-        .connect_timeout(std::time::Duration::from_secs(8))
-        .timeout(std::time::Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .map_err(|error| format!("构造 HTTP 客户端失败：{error}"))?;
-
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|error| format!("请求失败：{error}"))?;
-
-    let final_url = response.url().to_string();
-    Ok(canonicalize_douyin_url(&final_url))
-}
-
-fn canonicalize_douyin_url(url: &str) -> String {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| regex::Regex::new(r"/video/(\d+)").unwrap());
-    if let Some(cap) = re.captures(url) {
-        return format!("https://www.douyin.com/video/{}", &cap[1]);
-    }
-    url.to_string()
-}
-
-#[cfg(test)]
-mod douyin_tests {
-    use super::canonicalize_douyin_url;
-
-    #[test]
-    fn extracts_id_from_iesdouyin_share_url() {
-        assert_eq!(
-            canonicalize_douyin_url(
-                "https://www.iesdouyin.com/share/video/7650383172730932515/?region=CN&mid=xxx"
-            ),
-            "https://www.douyin.com/video/7650383172730932515"
-        );
-    }
-
-    #[test]
-    fn extracts_id_from_douyin_video_url() {
-        assert_eq!(
-            canonicalize_douyin_url("https://www.douyin.com/video/7650383172730932515"),
-            "https://www.douyin.com/video/7650383172730932515"
-        );
-    }
-
-    #[test]
-    fn returns_original_when_no_video_id_found() {
-        assert_eq!(
-            canonicalize_douyin_url("https://www.douyin.com/note/xxx"),
-            "https://www.douyin.com/note/xxx"
-        );
-    }
-}
-
-#[tauri::command]
-async fn extract_xhs_note(url: String) -> Result<xhs::XhsNoteInfo, String> {
-    xhs::extract_note(&url).await
-}
-
-#[tauri::command]
-async fn extract_bilibili_video(url: String) -> Result<bilibili::BiliVideoInfo, String> {
-    bilibili::extract_video(&url).await
-}
-
-#[tauri::command]
-async fn extract_youtube_video(
-    url: String,
-    proxy: Option<String>,
-) -> Result<youtube::YoutubeVideoInfo, String> {
-    youtube::extract_video(&url, proxy.as_deref()).await
-}
-
 #[tauri::command]
 async fn open_external_url(url: String) -> Result<(), String> {
     let (program, args) = external_url_command(std::env::consts::OS, &url)?;
@@ -1511,11 +1379,6 @@ pub fn run() {
             delete_download_task,
             open_download_folder,
             open_external_url,
-            resolve_douyin_url,
-            extract_douyin_video,
-            extract_xhs_note,
-            extract_bilibili_video,
-            extract_youtube_video,
             recording::begin_recording_file,
             recording::append_recording_chunk,
             recording::finish_recording_file,

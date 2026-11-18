@@ -28,7 +28,6 @@ import TaskRow from './components/ui/TaskRow.vue';
 import { useSidebarState } from './composables/useSidebarState';
 import { useLastTool } from './composables/useLastTool';
 import { useTheme } from './composables/useTheme';
-import { useAria2Handoff } from './composables/useAria2Handoff';
 import { usePluginStore } from './composables/usePluginStore';
 import { builtinTools } from './builtinTools';
 import UpdateBanner from './components/shell/UpdateBanner.vue';
@@ -45,7 +44,6 @@ import {
   type RecordingResult
 } from './components/image/imageBus';
 
-const DouyinTool = defineAsyncComponent(() => import('./components/douyin/DouyinTool.vue'));
 const ImageTool = defineAsyncComponent(() => import('./components/image/ImageTool.vue'));
 const NetworkTool = defineAsyncComponent(() => import('./components/network/NetworkTool.vue'));
 const AiChatTool = defineAsyncComponent(() => import('./components/ai/AiChatTool.vue'));
@@ -123,7 +121,6 @@ function onPaletteOpen(v: boolean) {
 function onPaletteQuery(v: string) {
   paletteQuery.value = v;
 }
-const aria2Handoff = useAria2Handoff();
 const { state: updaterState, check: updaterCheck, install: updaterInstall, relaunch: updaterRelaunch, dismiss: updaterDismiss } = useUpdater();
 const { autoCheck: updaterAutoCheck, setAutoCheck: updaterSetAutoCheck, skipVersion: updaterSkipVersion, shouldSkip: updaterShouldSkip } = useUpdaterPrefs();
 const settingsOpen = ref(false);
@@ -255,11 +252,6 @@ function selectTool(id: string) {
   if (!tool || tool.status !== 'ready') return;
   selectedToolId.value = id;
   rememberLastTool(id);
-  if (id === 'aria2') aria2Handoff.drainInto(url);
-}
-
-function handleDouyinNavigate(target: string) {
-  selectTool(target);
 }
 
 function goHome() {
@@ -605,10 +597,6 @@ async function clearCompleted() {
 
         <template v-else-if="selectedTool.id === 'template'">
           <TemplateTool />
-        </template>
-
-        <template v-else-if="selectedTool.id === 'video-link'">
-          <DouyinTool @request-navigate="handleDouyinNavigate" />
         </template>
 
         <template v-else-if="selectedTool.id === 'image'">

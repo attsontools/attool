@@ -10,8 +10,8 @@
 │  │                   Dashboard / SettingsModal /           │
 │  │                   UpdateBanner / ...                    │
 │  ├─ ui/*             Panel / TaskRow / StatPill / Kbd     │
-│  ├─ <5 工具>/*       image / network / douyin /            │
-│  │                   ecommerce / ai                       │
+│  ├─ <4 工具>/*       image / network / ecommerce /         │
+│  │                   ai                                    │
 │  │                   （懒加载）                             │
 │  ├─ composables/*    useTheme / useSidebarState /         │
 │  │                   useUpdater / usePluginStore...        │
@@ -34,16 +34,15 @@
 │  ├─ network/         ping / port / dns                    │
 │  ├─ updater/         自研更新：check / verify / download / │
 │  │                   apply/{mac,win,linux} + embed scripts │
-│  ├─ plugin/          .atpkg 验签 / 安装 registry /         │
-│  │                   自定义协议 / Host API / service 代理   │
-│  └─ *.rs             douyin·bili·xhs·yt                   │
+│  └─ plugin/          .atpkg 验签 / 安装 registry /         │
+│                      自定义协议 / Host API / service 代理   │
 │                                                          │
 │           ↕ Command::new / xcap / reqwest                │
 │                                                          │
 │  内置运行时 / 系统能力                                     │
 │  ├─ aria2c / tesseract    内嵌并释放到版本化缓存           │
-│  ├─ psd-bridge sidecar    Python + psd-tools + yt-dlp    │
-│  ├─ QuickJS / GStreamer plugins  YouTube / Linux 录屏    │
+│  ├─ psd-bridge sidecar    Python + psd-tools             │
+│  ├─ GStreamer plugins     Linux 录屏                     │
 │  ├─ xcap / core-graphics  屏幕截图                        │
 │  ├─ gtk-layer-shell  Wayland capture overlay 定位         │
 │  ├─ pkexec           Linux 升级提权（updater）             │
@@ -72,7 +71,7 @@ HTTP 与剪贴板数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app
 
 ## 可插拔应用
 
-平台支持从本地包或官方 Catalog 安装签名 `.atpkg`。应用可以由独立仓库发布独立桌面安装包，也可以用同一版本和 `appId` 发布平台插件包；`atcodec`、`attext`、`atgenerator`、`attime`、`atjson` 与带原生 service 的 `athttp`、`atclipboard` 均已完成生产 Catalog 远程发现和生命周期闭环。
+平台支持从本地包或官方 Catalog 安装签名 `.atpkg`。应用可以由独立仓库发布独立桌面安装包，也可以用同一版本和 `appId` 发布平台插件包；`atcodec`、`attext`、`atgenerator`、`attime`、`atjson` 与带原生 service 的 `athttp`、`atclipboard`、`atvideo` 均已完成生产 Catalog 远程发现和生命周期闭环。
 
 ### 包与安装状态
 
@@ -105,12 +104,12 @@ HTTP 与剪贴板数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app
 
 `com.attson.aria2` 已完成本地双制品与发布链验证：独立 Tauri 与签名 `.atpkg` 复用同一 Vue UI 和 `ataria2-service`，service 通过跨平台文件锁独占 `${app_data_dir}/aria2`、SQLite、固定 aria2 1.37.0 runtime 和取消句柄。首次接管先要求宿主写入 capability，再写 `migrating` marker，并以 SQLite exclusive barrier 等待 marker 前的旧写事务完成；一致快照通过 schema、完整性和行数校验后切换为永久 `owned`。旧库保留只读，宿主旧 owner 的所有读写在 marker 存在时拒绝，写路径取得 SQLite write transaction 后还会再次检查，停用或卸载插件也不恢复旧 owner。Linux x86_64 测试包已通过真实安装、下载和共享历史，五目标 workflow、生产签名校验和 Catalog 包布局校验也已在本地完成；生产 Publisher 授权、正式 Release 和安装/升级/回滚生命周期仍待远端验证。
 
-`com.attson.video` 的独立 Tauri 与签名 `.atpkg` 复用同一 Vue 页面、`atvideo-service` 协议和固定的 yt-dlp 2026.10.21、yt-dlp-ejs 0.8.0、QuickJS-ng 0.17.0 runtime bytes。插件只声明 `host.theme.read`、`host.video.extract`、`host.clipboard.write`、`host.external.open`、`host.app.activate`，Host 与 service 共同限制五个视频方法、平台 host、精确参数和无凭证代理；30 秒平台/runtime 超时外由 standalone client 和 Host 各保留 35 秒响应预算。动态 Video 通过 `host.app.activate` 把有界 URL 批次交给动态 Aria2，Aria2 原子填入输入框但不自动创建任务。Linux x86_64 最终测试包已通过签名重装、全部 native hash/`0700` 权限、四平台解析、复制、外链、断线后 remount、停启、卸载重装和 Video 到 Aria2 流程；五目标原生 runner workflow、固定 SDK 提交、生产/测试签名隔离、runtime smoke、精确十资产和 Catalog 包布局已完成本地验证。生产 Publisher 授权、两个正式 Release 与 Catalog 安装/升级/回滚生命周期仍待远端验证，宿主内置视频实现和共享 runtime 在 P3 前继续保留。
+`com.attson.video` 的独立 Tauri 与签名 `.atpkg` 复用同一 Vue 页面、`atvideo-service` 协议和固定的 yt-dlp 2026.10.21、yt-dlp-ejs 0.8.0、QuickJS-ng 0.17.0 runtime bytes。插件只声明 `host.theme.read`、`host.video.extract`、`host.clipboard.write`、`host.external.open`、`host.app.activate`，Host 与 service 共同限制五个视频方法、平台 host、精确参数和无凭证代理；30 秒平台/runtime 超时外由 standalone client 和 Host 各保留 35 秒响应预算。动态 Video 通过 `host.app.activate` 把有界 URL 批次交给动态 Aria2，Aria2 原子填入输入框但不自动创建任务。生产 Publisher、两个五目标 alpha Release、固定 runtime smoke、精确十资产和 Catalog 包布局均已验签；隔离环境已完成安装、升级、首次启动失败回滚、停启、卸载、重装，以及 B 站解析、复制、外链和 Video 到动态 Aria2 回归。宿主内置视频 UI、四平台 Rust 解析、Tauri commands、进程内 handoff 和视频 runtime 已删除；只保留受权限控制的 service 网关、Catalog policy 与跨应用 activation。
 
 ### 前端装配与应用外置
 
 - `usePluginStore` 从 Tauri registry 加载插件并生成动态 `Tool`；“应用管理”固定在侧栏平台分组，负责本地包预览、权限确认、安装、启停、卸载、筛选和历史查看。
-- 平台不再内置 `codec`、`text`、`generator`、`time`、`json`、`http` 与 `clipboard`；对应插件是这些工具在平台中的唯一入口。停用或卸载插件后，平台不提供回退版内置工具。
+- 平台不再内置 `codec`、`text`、`generator`、`time`、`json`、`http`、`clipboard` 与 `video-link`；对应插件是这些工具在平台中的唯一入口。停用或卸载插件后，平台不提供回退版内置工具。
 - `@attson/plugin-sdk` 定义 manifest、签名 canonical JSON、浏览器 Host bridge 和稳定错误；`atcodec`、`attext`、`atgenerator`、`attime` 与 `atjson` 通过 Vite host alias 在 Standalone Adapter 与 Plugin Adapter 间切换，各自共享独立版和插件版的 Vue UI 与核心逻辑。
 - `athttp` 与 `atclipboard` 同样通过 Vite adapter 复用 UI：独立版直接连接本地 service，插件版经 Host API 2.x 转发到相同 service。两者的生产 `0.1.0-alpha.2` 均已通过五目标 Release、Catalog 安装/升级/回滚和真实 Tauri 验收。
 
@@ -227,7 +226,7 @@ export function useTheme(
 - `ApplicationManager.vue` 展示内置工具、Catalog 应用、已安装应用和操作记录，并驱动远程安装、升级、停启与卸载。
 - `PluginFrame.vue` 建立隔离 iframe 与 Host API session；带 `nativeService` 的应用先连接 supervisor，再通过 `plugin_native_service_request` 转发请求和 `plugin://native-service-event` 接收事件。
 - `pluginHost.ts` 校验 JSON-RPC、权限、超时和消息大小；`pluginProbe.ts` 根据 manifest 选择 Host API 1.x 或 2.x。
-- HTTP 编辑器 UI 与业务逻辑位于 `attsontools/athttp`，宿主不复制其组件或 Store。
+- HTTP 与 Video 的 UI 和业务逻辑分别位于 `attsontools/athttp`、`attsontools/atvideo`，宿主不复制其组件、Store 或平台解析实现。
 
 ### 后端模块概览
 
@@ -243,15 +242,14 @@ export function useTheme(
 | `network/` | 网络诊断 | `ping_host` / `check_ports` / `resolve_dns` |
 | `updater/` | 自研更新：check / verify / download / apply | `updater_get_state` / `updater_check` / `updater_download` / `updater_apply` / `updater_cancel` |
 | `plugin/` | 签名包校验、staging/registry、Catalog、隔离资源协议、Host API 与 Native Service supervisor | `plugin_inspect_package` / `plugin_install_package` / `plugin_list_installed` / `plugin_set_enabled` / `plugin_uninstall` / `plugin_connect_native_service` / `plugin_native_service_request` |
-| `douyin.rs` / `bilibili.rs` / `xhs.rs` / `youtube.rs` | 视频链接解析；YouTube 通过共享 Python sidecar 调用内置 yt-dlp / EJS / QuickJS | `extract_douyin_video` / `extract_bilibili_video` / `extract_youtube_video` / `resolve_douyin_url` |
 
 ### 内置运行时
 
-- `runtime-manifest.json` 固定 Tesseract、tessdata、Aria2、yt-dlp、yt-dlp-ejs、QuickJS-ng 与 Linux GStreamer ABI 的版本和来源校验值。
+- `runtime-manifest.json` 固定 Tesseract、tessdata、Aria2 与 Linux GStreamer ABI 的版本和来源校验值。
 - CI 在五个发布目标编译前准备并 smoke-test 对应资产；`build.rs` 只在 release 构建中要求资产完整，并把文件生成为 `include_bytes!` 定义嵌入主程序。
 - `embedded_runtime.rs` 把各运行时释放到用户缓存的 `attool/runtime/<name>/<version>/`。文件按内容校验，经同目录临时文件原子落盘；损坏文件会自动修复，旧版本目录尽力清理。
 - 正式版只使用内置运行时；debug 可通过 `ATTOOL_*` 环境变量指定开发程序，缺省时允许使用系统 `PATH`。
-- OCR 始终传入私有 `tessdata` 目录，只接受界面公开的语言组合。YouTube 与 PSD 导入复用同一个 PyInstaller sidecar，但使用独立调用模式和 JSON 输出。
+- OCR 始终传入私有 `tessdata` 目录，只接受界面公开的语言组合。PyInstaller `psd-bridge` 只收集 `psd-tools` 并仅接受 PSD 输入，不包含视频模式或 JavaScript runtime。
 - Linux Wayland 录屏在 `gst::init()` 前设置私有插件目录和 registry；Deb 继续声明 GStreamer 核心 ABI 与基础包依赖。
 - 内置组件不自行更新，也不在首次调用时下载；它们只随通过 SHA256SUMS 和 Ed25519 校验的 AT Tool 更新升级。
 
@@ -417,3 +415,7 @@ Root 私钥保持离线，日常 Catalog 只使用 Root 授权的独立 Signing 
 ### 2026-11-16 视频应用自持完整解析运行时
 
 `atvideo` 的独立版和插件版共同持有四平台解析 service、专用 YouTube bridge 与固定 QuickJS runtime，不复用宿主或主图模板的 PSD sidecar。相比继续调用宿主命令或立即重写纯 Rust YouTube 提取器，该方案增加独立制品体积和 runtime 发布成本，但保证双制品行为一致，并允许宿主视频实现最终完整退场。
+
+### 2026-11-17 视频仅保留独立应用入口
+
+生产 Catalog、升级回滚和真实跨应用下载链路验证完成后，平台完整删除内置视频 UI、四平台解析 commands、进程内 Aria2 handoff 和视频 runtime，只保留动态应用所需的权限网关、Catalog policy 与 Host activation。相比隐藏旧入口或保留解析 fallback，完整退场避免形成两套解析行为和 runtime 发布责任，也确保停用或卸载插件不会触发不可见回退。

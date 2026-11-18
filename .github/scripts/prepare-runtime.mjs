@@ -1,5 +1,4 @@
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
 
@@ -26,7 +25,6 @@ const aria2Bin = resolve(output, 'aria2/bin', windows ? 'aria2c.exe' : 'aria2c')
 mkdirSync(resolve(output, 'tesseract/bin'), { recursive: true });
 mkdirSync(resolve(output, 'tesseract/tessdata'), { recursive: true });
 mkdirSync(resolve(output, 'aria2/bin'), { recursive: true });
-mkdirSync(resolve(output, 'quickjs/bin'), { recursive: true });
 copyFileSync(tesseract, tesseractBin);
 copyFileSync(aria2, aria2Bin);
 stageNativeDependencies(tesseract, resolve(output, 'tesseract/bin'));
@@ -37,32 +35,6 @@ if (!windows) {
   chmodSync(tesseractBin, 0o755);
   chmodSync(aria2Bin, 0o755);
 }
-
-const quickJsAsset = manifest.quickJs.assets[target];
-if (!quickJsAsset) throw new Error(`QuickJS does not support target ${target}`);
-const quickJsBin = resolve(output, 'quickjs/bin', windows ? 'qjs.exe' : 'qjs');
-const localQuickJs = process.env.ATTOOL_QUICKJS_PATH;
-if (localQuickJs) {
-  copyFileSync(resolve(localQuickJs), quickJsBin);
-} else {
-  const url = `https://github.com/quickjs-ng/quickjs/releases/download/v${manifest.quickJs.version}/${quickJsAsset.name}`;
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`download ${url}: HTTP ${response.status}`);
-  const bytes = Buffer.from(await response.arrayBuffer());
-  const actual = createHash('sha256').update(bytes).digest('hex');
-  if (actual !== quickJsAsset.sha256) throw new Error(`QuickJS checksum mismatch: expected ${quickJsAsset.sha256}, got ${actual}`);
-  writeFileSync(quickJsBin, bytes);
-}
-if (!windows) chmodSync(quickJsBin, 0o755);
-const quickJsVersion = spawnSync(quickJsBin, ['--help'], { encoding: 'utf8' });
-if (!`${quickJsVersion.stdout || ''}\n${quickJsVersion.stderr || ''}`.includes(`QuickJS-ng version ${manifest.quickJs.version}`)) {
-  throw new Error(`QuickJS-ng ${manifest.quickJs.version} required`);
-}
-const quickJsSmoke = spawnSync(quickJsBin, ['-e', "console.log('ATTOOL_QJS_OK')"], { encoding: 'utf8' });
-if (quickJsSmoke.status !== 0 || !quickJsSmoke.stdout.includes('ATTOOL_QJS_OK')) {
-  throw new Error(`QuickJS-ng execution smoke test failed: ${quickJsSmoke.stderr || quickJsSmoke.stdout}`);
-}
-writeFileSync(resolve(output, 'quickjs/VERSION'), `${manifest.quickJs.version}\n`);
 
 for (const language of manifest.tessdata.languages) {
   const destination = resolve(output, 'tesseract/tessdata', `${language}.traineddata`);
@@ -84,7 +56,7 @@ stageLicenses(output);
 
 writeFileSync(
   resolve(output, 'manifest.json'),
-  `${JSON.stringify({ target, tesseract: manifest.tesseract.version, aria2: manifest.aria2.version, quickJs: manifest.quickJs.version, tessdata: manifest.tessdata, gstreamer: target.includes('linux') ? manifest.gstreamer : undefined }, null, 2)}\n`,
+  `${JSON.stringify({ target, tesseract: manifest.tesseract.version, aria2: manifest.aria2.version, tessdata: manifest.tessdata, gstreamer: target.includes('linux') ? manifest.gstreamer : undefined }, null, 2)}\n`,
 );
 console.log(`Bundled runtime ready: ${output}`);
 
@@ -249,8 +221,6 @@ function stageLicenses(runtimeOutput) {
   const licenses = resolve(root, 'licenses');
   mkdirSync(licenses, { recursive: true });
   copyFileSync('src-tauri/THIRD_PARTY_NOTICES.md', resolve(root, 'THIRD_PARTY_NOTICES.md'));
-  copyFileSync('src-tauri/licenses/yt-dlp-UNLICENSE.txt', resolve(licenses, 'yt-dlp-UNLICENSE.txt'));
-  copyFileSync('src-tauri/licenses/QuickJS-ng-MIT.txt', resolve(licenses, 'QuickJS-ng-MIT.txt'));
   copyFileSync('src-tauri/licenses/libvpx-BSD-3-Clause.txt', resolve(licenses, 'libvpx-BSD-3-Clause.txt'));
   const ariaLicenseDirectory = resolve(aria2, '..');
   copyFileSync(resolve(ariaLicenseDirectory, 'aria2-COPYING'), resolve(licenses, 'aria2-GPL-2.0-or-later.txt'));

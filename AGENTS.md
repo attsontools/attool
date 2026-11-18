@@ -1,6 +1,6 @@
 # AGENTS.md
 
-个人桌面工具箱（Tauri 2 + Vue 3 + Naive UI）。平台内置 Aria2 下载、主图模板、视频链接抽取、图片（含跨平台截图与录屏）、网络、AI 对话（多提供商多模型 AI 助手：OpenAI 兼容 / Anthropic Claude / 本地 Ollama，流式 Markdown + 会话侧栏 + 模型热切换）。剪贴板、HTTP 请求、编码转换、文本工具、生成器、时间工具与 JSON 工具通过官方 Catalog 作为独立应用按需安装；剪贴板与 HTTP 使用 Host API 2.x + Native/Data Service 复用原有本地数据。
+个人桌面工具箱（Tauri 2 + Vue 3 + Naive UI）。平台内置 Aria2 下载、主图模板、图片（含跨平台截图与录屏）、网络、AI 对话（多提供商多模型 AI 助手：OpenAI 兼容 / Anthropic Claude / 本地 Ollama，流式 Markdown + 会话侧栏 + 模型热切换）。视频链接抽取、剪贴板、HTTP 请求、编码转换、文本工具、生成器、时间工具与 JSON 工具通过官方 Catalog 作为独立应用按需安装；视频、剪贴板与 HTTP 使用 Host API 2.x + Native/Data Service，视频 runtime 由 `com.attson.video` 自带。
 
 ## 技术栈
 
@@ -45,7 +45,7 @@ src/
 ├── styles/                      # tokens.css（设计 token）/ reset.css / template-editor.css
 ├── theme/index.ts               # Naive UI darkOverrides + lightOverrides
 ├── composables/                 # useTheme / useSidebarState / useLastTool / useUpdater
-│                                #   / useFileDrop / useAria2Handoff
+│                                #   / useFileDrop
 │                                #   / usePluginStore（应用 registry / Catalog / 生命周期）
 ├── components/
 │   ├── shell/                   # 外壳：AppShell / Sidebar / Topbar / Dashboard / ToolIcon
@@ -57,7 +57,6 @@ src/
 │   │                            #   + CaptureOverlay（截图浮层）+ CapturePinWindow
 │   ├── recording/               # 录屏：系统源选择/音频/暂停/预览 + 分块落盘
 │   ├── network/                 # 网络：URL 分解/Ping/端口/DNS
-│   ├── douyin/                  # 视频链接抽取（抖音，后端另支持 B站/小红书/YouTube）
 │   └── ai/                      # AI 对话：AiChatTool（容器）+ AiSessionList + AiMessageList
 │                                #   / AiMessageBubble + AiComposer + AiModelPicker
 │                                #   / AiSettingsModal + AiSystemPromptDrawer
@@ -80,7 +79,6 @@ src-tauri/
 │                                #   + scripts/{install-linux.sh, update-windows.bat}（embed）
 ├── src/ai/                      # AI 对话：mod / models / storage(SQLite) / session（cancel handle）
 │                                #   / commands / providers/{openai,anthropic,ollama}（统一 trait）
-├── src/{douyin,bilibili,xhs,youtube}.rs  # 单文件模块
 └── tauri.conf.json              # main / capture 固定窗口 + 动态 pin/plugin 辅助窗口
 
 .github/
@@ -200,5 +198,6 @@ AT.Tool_<v>_arm64.tar.gz
 - 不要把 `--bg-base` / `--text` 等 dark 假设硬写进选择器（应该让 `[data-theme=light]` 自动接管）
 - 不要在 `src/App.vue` 里塞业务逻辑 —— 当前已经是路由壳 + Aria2 工具，不要再扩。新增工具走独立组件
 - 不要把 HTTP 内置实现、宿主 HTTP SQLite owner 或旧 Tauri commands 加回来；HTTP 只通过 Catalog 应用、Host API 2.x 和 Native/Data Service 提供
+- 不要把视频内置 UI、四平台 Tauri commands、进程内 Aria2 handoff、宿主 yt-dlp / QuickJS runtime 加回来；视频只通过 Catalog 应用、Host API 2.x 和 Native Service 提供
 - 不要把"电商图片处理"功能加回来（已弃，主图模板覆盖该场景）
 - 不要重新引入 `tauri-plugin-updater` / `tauri-plugin-process` —— 已被自研 updater 替代
