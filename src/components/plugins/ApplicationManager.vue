@@ -20,7 +20,11 @@ import type { PluginStoreController } from '../../composables/usePluginStore';
 import type { ManagedCatalogApp, NativeServiceStatus, PluginHistoryRecord } from './types';
 import type { Tool } from '../../types/tool';
 import PluginInstallProbe from './PluginInstallProbe.vue';
-import { catalogRowStatus, permissionConfirmationComplete } from './catalogMerge';
+import {
+  catalogRowStatus,
+  catalogRowVersion,
+  permissionConfirmationComplete
+} from './catalogMerge';
 import { permissionDescription } from './permissionDescription';
 
 type View = 'catalog' | 'installed' | 'history';
@@ -491,7 +495,7 @@ function formatBytes(bytes: number) {
                 <n-tag size="small" :type="catalogRowStatus(app, operation).type" :bordered="false">
                   {{ catalogRowStatus(app, operation).label }}
                 </n-tag>
-                <span class="mono">{{ app.latestVersion }}</span>
+                <span class="mono">{{ catalogRowVersion(app) }}</span>
               </span>
             </button>
           </div>

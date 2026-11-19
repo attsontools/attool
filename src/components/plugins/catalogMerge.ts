@@ -10,6 +10,10 @@ export interface CatalogRowStatus {
   type: 'default' | 'success' | 'warning' | 'info';
 }
 
+export function catalogRowVersion(app: ManagedCatalogApp) {
+  return app.installedVersion ?? app.latestVersion;
+}
+
 export function catalogRowStatus(
   app: ManagedCatalogApp,
   operation: PluginOperationSnapshot | null

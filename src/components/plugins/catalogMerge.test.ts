@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  catalogRowVersion,
   catalogRowStatus,
   mergeCatalogApps,
   permissionConfirmationComplete
@@ -196,5 +197,19 @@ describe('catalogRowStatus', () => {
       label: '可获取',
       type: 'default'
     });
+  });
+});
+
+describe('catalogRowVersion', () => {
+  it('shows the installed version when an update is available', () => {
+    const [codec] = mergeCatalogApps(snapshot, [installedCodec]);
+
+    expect(catalogRowVersion(codec)).toBe('1.0.0');
+  });
+
+  it('shows the catalog version for an uninstalled app', () => {
+    const [codec] = mergeCatalogApps(snapshot, []);
+
+    expect(catalogRowVersion(codec)).toBe('1.1.0');
   });
 });
