@@ -1,6 +1,6 @@
 import { computed, ref } from 'vue';
 import type { ComputedRef, Ref } from 'vue';
-import type { Tool } from '../types/tool';
+import type { Tool, ToolGroup } from '../types/tool';
 
 export interface CommandItem {
   kind: 'tool';
@@ -26,6 +26,13 @@ export interface UseCommandPaletteReturn {
 }
 
 const PER_SECTION_LIMIT = 20;
+const GROUP_LABELS: Record<ToolGroup, string> = {
+  platform: '平台',
+  download: '下载',
+  edit: '编辑',
+  network: '网络',
+  utility: '实用'
+};
 
 // 拼音首字母映射（简版，覆盖常见工具名首字）。命中失败落回 substring。
 const PINYIN_INITIAL: Record<string, string> = {
@@ -82,7 +89,7 @@ export function useCommandPalette(input: UseCommandPaletteInput): UseCommandPale
         id: t.id,
         title: t.name,
         subtitle: t.description,
-        groupLabel: '工具',
+        groupLabel: GROUP_LABELS[t.group],
         onSelect: () => input.onOpenTool(t.id)
       }));
   });

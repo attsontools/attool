@@ -18,6 +18,16 @@ describe('useCommandPalette', () => {
     expect(cp.results.value.every((r) => r.kind === 'tool')).toBe(true);
   });
 
+  it('uses each tool group as the command section label', () => {
+    const cp = useCommandPalette({ tools: () => fakeTools, onOpenTool: vi.fn() });
+
+    expect(cp.results.value.map((result) => result.groupLabel)).toEqual([
+      '网络',
+      '编辑',
+      '下载'
+    ]);
+  });
+
   it('substring 匹配 name', () => {
     const cp = useCommandPalette({ tools: () => fakeTools, onOpenTool: vi.fn() });
     cp.query.value = 'json';

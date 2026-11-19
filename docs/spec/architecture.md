@@ -110,6 +110,7 @@ HTTP 与剪贴板数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app
 ### 前端装配与应用外置
 
 - `usePluginStore` 从 Tauri registry 加载插件并生成动态 `Tool`；“应用管理”固定在侧栏平台分组，负责本地包预览、权限确认、安装、启停、卸载、筛选和历史查看。
+- 动态 `Tool` 按稳定 `appId` 归入下载、编辑、网络或实用分组，未知应用回退到实用；侧栏与命令面板均消费同一个 `Tool.group`，Catalog schema 不承载宿主导航分组。
 - 平台不再内置 `codec`、`text`、`generator`、`time`、`json`、`http` 与 `clipboard`；对应插件是这些工具在平台中的唯一入口。停用或卸载插件后，平台不提供回退版内置工具。
 - `@attson/plugin-sdk` 定义 manifest、签名 canonical JSON、浏览器 Host bridge 和稳定错误；`atcodec`、`attext`、`atgenerator`、`attime` 与 `atjson` 通过 Vite host alias 在 Standalone Adapter 与 Plugin Adapter 间切换，各自共享独立版和插件版的 Vue UI 与核心逻辑。
 - `athttp` 与 `atclipboard` 同样通过 Vite adapter 复用 UI：独立版直接连接本地 service，插件版经 Host API 2.x 转发到相同 service。两者的生产 `0.1.0-alpha.2` 均已通过五目标 Release、Catalog 安装/升级/回滚和真实 Tauri 验收。
