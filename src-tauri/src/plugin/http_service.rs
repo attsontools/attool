@@ -1,9 +1,12 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration as StdDuration,
 };
 
@@ -16,7 +19,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{tcp::OwnedWriteHalf, TcpStream},
-    sync::{broadcast, oneshot, Mutex as AsyncMutex},
+    sync::{broadcast, oneshot, watch, Mutex as AsyncMutex},
     time::{sleep, timeout, Duration, Instant},
 };
 use uuid::Uuid;
@@ -25,6 +28,14 @@ use super::install::{InstalledPlugin, PluginStore};
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const RECOVERY_DELAYS: [Duration; 6] = [
+    Duration::from_millis(250),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(15),
+];
 
 trait NativeServiceEventSink: Send + Sync {
     fn emit(&self, app_id: &str, service_version: &str, event: Value);
@@ -91,12 +102,21 @@ pub struct NativeServiceRuntime {
     clients: Arc<Mutex<HashMap<String, ConnectedService>>>,
     connect_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     statuses: Arc<Mutex<HashMap<String, NativeServiceStatus>>>,
+    recovery: Arc<Mutex<RecoveryState>>,
+    next_connection_generation: Arc<AtomicU64>,
 }
 
 struct ConnectedService {
     version: String,
+    generation: u64,
     client: ServiceClient,
     process: Option<Box<dyn ServiceProcess>>,
+}
+
+#[derive(Default)]
+struct RecoveryState {
+    suppressed: HashSet<String>,
+    running: HashSet<String>,
 }
 
 impl NativeServiceRuntime {
@@ -125,10 +145,21 @@ impl NativeServiceRuntime {
             clients: Arc::new(Mutex::new(HashMap::new())),
             connect_locks: Arc::new(Mutex::new(HashMap::new())),
             statuses: Arc::new(Mutex::new(HashMap::new())),
+            recovery: Arc::new(Mutex::new(RecoveryState::default())),
+            next_connection_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
     pub async fn connect(&self, app_id: &str) -> Result<(), NativeServiceError> {
+        self.set_recovery_suppressed(app_id, false);
+        self.connect_observed(app_id, true).await
+    }
+
+    async fn connect_observed(
+        &self,
+        app_id: &str,
+        schedule_recovery: bool,
+    ) -> Result<(), NativeServiceError> {
         let correlation_id = Uuid::new_v4().to_string();
         self.record_status(NativeServiceStatus {
             app_id: app_id.to_string(),
@@ -158,6 +189,11 @@ impl NativeServiceRuntime {
             },
         };
         self.record_status(status);
+        if schedule_recovery {
+            if let Err(error) = &result {
+                self.schedule_recovery(app_id, error.clone());
+            }
+        }
         result
     }
 
@@ -222,25 +258,29 @@ impl NativeServiceRuntime {
             return Ok(());
         }
 
-        {
+        let stale = {
             let mut clients = self.clients.lock().map_err(|_| {
                 NativeServiceError::new(
                     "NATIVE_SERVICE_STATE_LOCK_FAILED",
                     "Native service state lock failed",
                 )
             })?;
-            let owned_previous = clients
-                .get_mut(app_id)
-                .filter(|connected| connected.version != plugin.version)
-                .and_then(|connected| connected.process.as_mut());
-            if let Some(process) = owned_previous {
-                process.terminate().map_err(|error| {
-                    NativeServiceError::new(
-                        "NATIVE_SERVICE_STOP_FAILED",
-                        format!("Cannot stop previous native service version: {error}"),
-                    )
-                })?;
-                clients.remove(app_id);
+            clients.remove(app_id)
+        };
+        if let Some(mut stale) = stale {
+            if let Some(process) = stale.process.as_mut() {
+                if let Err(error) = process.terminate() {
+                    self.clients
+                        .lock()
+                        .map_err(|_| {
+                            NativeServiceError::new(
+                                "NATIVE_SERVICE_STATE_LOCK_FAILED",
+                                "Native service state lock failed",
+                            )
+                        })?
+                        .insert(app_id.to_string(), stale);
+                    return Err(stop_failed("Cannot stop previous native service", error));
+                }
             }
         }
 
@@ -256,9 +296,14 @@ impl NativeServiceRuntime {
         );
         let (client, process) = supervisor.connect_managed().await?;
         let mut events = client.subscribe();
+        let mut disconnects = client.subscribe_disconnect();
         let event_sink = Arc::clone(&self.event_sink);
         let event_app_id = app_id.to_string();
         let event_service_version = plugin.version.clone();
+        let generation = self
+            .next_connection_generation
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         self.clients
             .lock()
             .map_err(|_| {
@@ -271,16 +316,38 @@ impl NativeServiceRuntime {
                 app_id.to_string(),
                 ConnectedService {
                     version: plugin.version,
+                    generation,
                     client,
                     process,
                 },
             );
+        let runtime = self.clone();
         tokio::spawn(async move {
             loop {
-                match events.recv().await {
-                    Ok(event) => event_sink.emit(&event_app_id, &event_service_version, event),
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
+                tokio::select! {
+                    biased;
+                    event = events.recv() => match event {
+                        Ok(event) => {
+                            if runtime.accepts_connection(
+                                &event_app_id,
+                                &event_service_version,
+                                generation,
+                            ) {
+                                event_sink.emit(&event_app_id, &event_service_version, event);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    },
+                    changed = disconnects.changed() => {
+                        let error = if changed.is_ok() {
+                            disconnects.borrow().clone().unwrap_or_else(disconnected)
+                        } else {
+                            disconnected()
+                        };
+                        runtime.handle_connection_closed(&event_app_id, generation, error);
+                        break;
+                    }
                 }
             }
         });
@@ -300,6 +367,7 @@ impl NativeServiceRuntime {
     }
 
     pub async fn disconnect(&self, app_id: &str) -> Result<(), NativeServiceError> {
+        self.set_recovery_suppressed(app_id, true);
         let connect_lock = {
             let mut locks = self.connect_locks.lock().map_err(|_| {
                 NativeServiceError::new(
@@ -339,10 +407,7 @@ impl NativeServiceRuntime {
                         )
                     })?
                     .insert(app_id.to_string(), connected);
-                return Err(NativeServiceError::new(
-                    "NATIVE_SERVICE_STOP_FAILED",
-                    format!("Cannot stop native service: {error}"),
-                ));
+                return Err(stop_failed("Cannot stop native service", error));
             }
         }
         self.record_disconnected(app_id);
@@ -389,6 +454,133 @@ impl NativeServiceRuntime {
         self.event_sink.emit_status(&status);
     }
 
+    fn set_recovery_suppressed(&self, app_id: &str, suppressed: bool) {
+        if let Ok(mut recovery) = self.recovery.lock() {
+            if suppressed {
+                recovery.suppressed.insert(app_id.to_string());
+            } else {
+                recovery.suppressed.remove(app_id);
+            }
+        }
+    }
+
+    fn recovery_allowed(&self, app_id: &str) -> bool {
+        if self
+            .recovery
+            .lock()
+            .map(|recovery| recovery.suppressed.contains(app_id))
+            .unwrap_or(true)
+        {
+            return false;
+        }
+        self.background_service_enabled(app_id)
+    }
+
+    pub(super) fn background_service_enabled(&self, app_id: &str) -> bool {
+        self.installed_plugin(app_id)
+            .ok()
+            .and_then(|plugin| plugin.native_service)
+            .is_some_and(|service| service.lifecycle == "background")
+    }
+
+    fn schedule_recovery(&self, app_id: &str, error: NativeServiceError) {
+        if !self.recovery_allowed(app_id) {
+            return;
+        }
+        let started = self
+            .recovery
+            .lock()
+            .map(|mut recovery| {
+                !recovery.suppressed.contains(app_id) && recovery.running.insert(app_id.to_string())
+            })
+            .unwrap_or(false);
+        if !started {
+            return;
+        }
+        self.record_recovering(app_id, &error);
+        let runtime = self.clone();
+        let app_id = app_id.to_string();
+        tokio::spawn(async move {
+            runtime.run_recovery(&app_id, error).await;
+            if let Ok(mut recovery) = runtime.recovery.lock() {
+                recovery.running.remove(&app_id);
+            }
+            if runtime.recovery_allowed(&app_id) && !runtime.is_connected(&app_id) {
+                runtime.schedule_recovery(&app_id, disconnected());
+            }
+        });
+    }
+
+    async fn run_recovery(&self, app_id: &str, mut last_error: NativeServiceError) {
+        let mut attempt = 0usize;
+        loop {
+            if !self.recovery_allowed(app_id) || self.is_connected(app_id) {
+                return;
+            }
+            self.record_recovering(app_id, &last_error);
+            sleep(RECOVERY_DELAYS[attempt.min(RECOVERY_DELAYS.len() - 1)]).await;
+            if !self.recovery_allowed(app_id) || self.is_connected(app_id) {
+                return;
+            }
+            match self.connect_observed(app_id, false).await {
+                Ok(()) => return,
+                Err(error) => last_error = error,
+            }
+            attempt = attempt.saturating_add(1);
+        }
+    }
+
+    fn record_recovering(&self, app_id: &str, error: &NativeServiceError) {
+        self.record_status(NativeServiceStatus {
+            app_id: app_id.to_string(),
+            state: "recovering".to_string(),
+            error_code: Some(error.code.clone()),
+            message: Some(error.message.clone()),
+            correlation_id: Some(Uuid::new_v4().to_string()),
+            updated_at: Utc::now().timestamp_millis(),
+        });
+    }
+
+    fn handle_connection_closed(&self, app_id: &str, generation: u64, error: NativeServiceError) {
+        let disconnected = self.clients.lock().ok().and_then(|mut clients| {
+            clients
+                .get(app_id)
+                .is_some_and(|connected| connected.generation == generation)
+                .then(|| clients.remove(app_id))
+                .flatten()
+        });
+        let Some(mut disconnected) = disconnected else {
+            return;
+        };
+        let error = if let Some(process) = disconnected.process.as_mut() {
+            match process.terminate() {
+                Ok(()) => error,
+                Err(terminate_error) => {
+                    let error =
+                        stop_failed("Cannot stop disconnected native service", terminate_error);
+                    if let Ok(mut clients) = self.clients.lock() {
+                        clients.insert(app_id.to_string(), disconnected);
+                    }
+                    error
+                }
+            }
+        } else {
+            error
+        };
+        if self.recovery_allowed(app_id) {
+            self.schedule_recovery(app_id, error);
+        } else {
+            self.record_status(NativeServiceStatus {
+                app_id: app_id.to_string(),
+                state: "unavailable".to_string(),
+                error_code: Some(error.code.clone()),
+                message: Some(error.message.clone()),
+                correlation_id: Some(Uuid::new_v4().to_string()),
+                updated_at: Utc::now().timestamp_millis(),
+            });
+        }
+    }
+
     pub(super) fn is_connected(&self, app_id: &str) -> bool {
         self.clients
             .lock()
@@ -432,6 +624,18 @@ impl NativeServiceRuntime {
             .and_then(|clients| {
                 clients.get(app_id).map(|connected| {
                     connected.version == service_version && !connected.client.is_disconnected()
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    fn accepts_connection(&self, app_id: &str, service_version: &str, generation: u64) -> bool {
+        self.clients
+            .lock()
+            .ok()
+            .and_then(|clients| {
+                clients.get(app_id).map(|connected| {
+                    connected.version == service_version && connected.generation == generation
                 })
             })
             .unwrap_or(false)
@@ -992,6 +1196,7 @@ struct ServiceClient {
     writer: Arc<AsyncMutex<OwnedWriteHalf>>,
     state: SharedClientState,
     events: broadcast::Sender<Value>,
+    disconnects: watch::Sender<Option<NativeServiceError>>,
 }
 
 impl ServiceClient {
@@ -1071,16 +1276,27 @@ impl ServiceClient {
 
         let state = Arc::new(Mutex::new(ClientState::default()));
         let (events, _) = broadcast::channel(256);
-        tokio::spawn(read_replies(reader, Arc::clone(&state), events.clone()));
+        let (disconnects, _) = watch::channel(None);
+        tokio::spawn(read_replies(
+            reader,
+            Arc::clone(&state),
+            events.clone(),
+            disconnects.clone(),
+        ));
         Ok(Self {
             writer: Arc::new(AsyncMutex::new(writer)),
             state,
             events,
+            disconnects,
         })
     }
 
     fn subscribe(&self) -> broadcast::Receiver<Value> {
         self.events.subscribe()
+    }
+
+    fn subscribe_disconnect(&self) -> watch::Receiver<Option<NativeServiceError>> {
+        self.disconnects.subscribe()
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value, NativeServiceError> {
@@ -1176,6 +1392,7 @@ async fn read_replies(
     mut reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
     state: SharedClientState,
     events: broadcast::Sender<Value>,
+    disconnects: watch::Sender<Option<NativeServiceError>>,
 ) {
     let mut line = Vec::new();
     let disconnect_error = loop {
@@ -1243,6 +1460,7 @@ async fn read_replies(
     for sender in senders {
         let _ = sender.send(Err(disconnect_error.clone()));
     }
+    disconnects.send_replace(Some(disconnect_error));
 }
 
 async fn write_json_line(
@@ -1296,6 +1514,10 @@ fn disconnected() -> NativeServiceError {
     )
 }
 
+fn stop_failed(context: &str, error: io::Error) -> NativeServiceError {
+    NativeServiceError::new("NATIVE_SERVICE_STOP_FAILED", format!("{context}: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1318,14 +1540,14 @@ mod tests {
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::TcpListener,
-        sync::Barrier,
+        sync::{oneshot, Barrier},
     };
 
     use super::{
-        data_directory_for, request_timeout, required_permission, ConnectedService, ErrorEnvelope,
-        NativeServiceError, NativeServiceEventSink, NativeServiceRuntime, ServiceClient,
-        ServiceLaunchSpec, ServiceLauncher, ServiceProcess, ServiceReply, ServiceSupervisor,
-        DEFAULT_REQUEST_TIMEOUT,
+        data_directory_for, disconnected, request_timeout, required_permission, ConnectedService,
+        ErrorEnvelope, NativeServiceError, NativeServiceEventSink, NativeServiceRuntime,
+        ServiceClient, ServiceLaunchSpec, ServiceLauncher, ServiceProcess, ServiceReply,
+        ServiceSupervisor, DEFAULT_REQUEST_TIMEOUT,
     };
     use crate::plugin::{install::PluginStore, package::HostEnvironment};
 
@@ -1335,6 +1557,10 @@ mod tests {
         sender: tokio::sync::mpsc::UnboundedSender<(String, serde_json::Value)>,
     }
 
+    struct RecordingStatusSink {
+        states: Arc<Mutex<Vec<String>>>,
+    }
+
     impl NativeServiceEventSink for NoopEventSink {
         fn emit(&self, _app_id: &str, _service_version: &str, _event: serde_json::Value) {}
     }
@@ -1342,6 +1568,14 @@ mod tests {
     impl NativeServiceEventSink for RecordingEventSink {
         fn emit(&self, app_id: &str, _service_version: &str, event: serde_json::Value) {
             let _ = self.sender.send((app_id.to_string(), event));
+        }
+    }
+
+    impl NativeServiceEventSink for RecordingStatusSink {
+        fn emit(&self, _app_id: &str, _service_version: &str, _event: serde_json::Value) {}
+
+        fn emit_status(&self, status: &super::NativeServiceStatus) {
+            self.states.lock().unwrap().push(status.state.clone());
         }
     }
 
@@ -1374,6 +1608,10 @@ mod tests {
     struct OwnedTestProcess {
         server: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
         stops: Arc<AtomicUsize>,
+    }
+
+    struct FailingTerminateProcess {
+        attempts: Arc<AtomicUsize>,
     }
 
     impl ServiceLauncher for PanicLauncher {
@@ -1521,6 +1759,17 @@ mod tests {
             }
             self.stops.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    impl ServiceProcess for FailingTerminateProcess {
+        fn try_exit(&mut self) -> io::Result<Option<i32>> {
+            Ok(None)
+        }
+
+        fn terminate(&mut self) -> io::Result<()> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("terminate failed"))
         }
     }
 
@@ -2306,6 +2555,7 @@ mod tests {
             "com.attson.http".to_string(),
             ConnectedService {
                 version: "0.1.0-alpha.0".to_string(),
+                generation: 1,
                 client,
                 process: Some(Box::new(OwnedTestProcess {
                     server: Arc::clone(&server),
@@ -2326,6 +2576,295 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "NATIVE_SERVICE_NOT_CONNECTED");
         runtime.disconnect("com.attson.http").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_explicit_disconnect_keeps_background_recovery_suppressed() {
+        let directory = tempdir().unwrap();
+        let store_root = directory.path().join("plugins");
+        let store = native_service_store(&store_root, b"signed-service", b"signed-service");
+        set_background_lifecycle(&store_root, "com.attson.http");
+        let data_directory = directory.path().join("http");
+        std::fs::create_dir_all(&data_directory).unwrap();
+        let endpoint_path = data_directory.join("service.endpoint.json");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        write_test_endpoint(&endpoint_path, listener.local_addr().unwrap().port());
+        let server = tokio::spawn(fake_service(
+            listener,
+            data_directory.to_string_lossy().to_string(),
+        ));
+        let client = ServiceClient::connect(
+            &endpoint_path,
+            &data_directory,
+            "com.attson.http",
+            "attool-test",
+        )
+        .await
+        .unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let runtime = NativeServiceRuntime::with_event_sink(
+            store,
+            directory.path().to_path_buf(),
+            Arc::new(NoopEventSink),
+        );
+        runtime.clients.lock().unwrap().insert(
+            "com.attson.http".to_string(),
+            ConnectedService {
+                version: "0.1.0-alpha.0".to_string(),
+                generation: 1,
+                client,
+                process: Some(Box::new(FailingTerminateProcess {
+                    attempts: Arc::clone(&attempts),
+                })),
+            },
+        );
+
+        let error = runtime.disconnect("com.attson.http").await.unwrap_err();
+
+        assert_eq!(error.code, "NATIVE_SERVICE_STOP_FAILED");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(!runtime.recovery_allowed("com.attson.http"));
+        assert!(runtime
+            .clients
+            .lock()
+            .unwrap()
+            .get("com.attson.http")
+            .is_some_and(|connected| connected.process.is_some()));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_disconnect_cleanup_retains_the_owned_process_for_recovery() {
+        let directory = tempdir().unwrap();
+        let store_root = directory.path().join("plugins");
+        let store = native_service_store(&store_root, b"signed-service", b"signed-service");
+        set_background_lifecycle(&store_root, "com.attson.http");
+        let data_directory = directory.path().join("http");
+        std::fs::create_dir_all(&data_directory).unwrap();
+        let endpoint_path = data_directory.join("service.endpoint.json");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        write_test_endpoint(&endpoint_path, listener.local_addr().unwrap().port());
+        let server = tokio::spawn(fake_service(
+            listener,
+            data_directory.to_string_lossy().to_string(),
+        ));
+        let client = ServiceClient::connect(
+            &endpoint_path,
+            &data_directory,
+            "com.attson.http",
+            "attool-test",
+        )
+        .await
+        .unwrap();
+        client.state.lock().unwrap().disconnected = Some(disconnected());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let runtime = NativeServiceRuntime::with_event_sink(
+            store,
+            directory.path().to_path_buf(),
+            Arc::new(NoopEventSink),
+        );
+        runtime.clients.lock().unwrap().insert(
+            "com.attson.http".to_string(),
+            ConnectedService {
+                version: "0.1.0-alpha.0".to_string(),
+                generation: 1,
+                client,
+                process: Some(Box::new(FailingTerminateProcess {
+                    attempts: Arc::clone(&attempts),
+                })),
+            },
+        );
+        runtime.set_recovery_suppressed("com.attson.http", true);
+
+        runtime.handle_connection_closed("com.attson.http", 1, disconnected());
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(runtime
+            .clients
+            .lock()
+            .unwrap()
+            .get("com.attson.http")
+            .is_some_and(|connected| connected.process.is_some()));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_enabled_background_service_reconnects_after_its_connection_closes() {
+        let directory = tempdir().unwrap();
+        let store_root = directory.path().join("plugins");
+        let store = native_service_store(&store_root, b"signed-service", b"signed-service");
+        set_background_lifecycle(&store_root, "com.attson.http");
+        let data_directory = directory.path().join("http");
+        std::fs::create_dir_all(&data_directory).unwrap();
+        let endpoint_path = data_directory.join("service.endpoint.json");
+        let first_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        write_test_endpoint(&endpoint_path, first_listener.local_addr().unwrap().port());
+        let (stop_first_tx, stop_first_rx) = oneshot::channel();
+        let first_server = tokio::spawn(fake_persistent_service(
+            first_listener,
+            data_directory.to_string_lossy().to_string(),
+            "com.attson.http",
+            1,
+            stop_first_rx,
+        ));
+        let states = Arc::new(Mutex::new(Vec::new()));
+        let runtime = NativeServiceRuntime::with_event_sink(
+            store,
+            directory.path().to_path_buf(),
+            Arc::new(RecordingStatusSink {
+                states: Arc::clone(&states),
+            }),
+        );
+        runtime.connect("com.attson.http").await.unwrap();
+        assert_eq!(
+            runtime
+                .request("com.attson.http", "data.tabs.list", json!({}))
+                .await
+                .unwrap(),
+            json!({ "generation": 1 })
+        );
+
+        let second_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        write_test_endpoint(&endpoint_path, second_listener.local_addr().unwrap().port());
+        let (stop_second_tx, stop_second_rx) = oneshot::channel();
+        let second_server = tokio::spawn(fake_persistent_service(
+            second_listener,
+            data_directory.to_string_lossy().to_string(),
+            "com.attson.http",
+            2,
+            stop_second_rx,
+        ));
+        stop_first_tx.send(()).unwrap();
+        first_server.await.unwrap();
+
+        let recovered = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(result) = runtime
+                    .request("com.attson.http", "data.tabs.list", json!({}))
+                    .await
+                {
+                    if result == json!({ "generation": 2 }) {
+                        break result;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("background service should reconnect without an explicit connect call");
+
+        assert_eq!(recovered, json!({ "generation": 2 }));
+        assert!(states
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|state| state == "recovering"));
+        runtime.handle_connection_closed("com.attson.http", 1, disconnected());
+        assert_eq!(
+            runtime
+                .request("com.attson.http", "data.tabs.list", json!({}))
+                .await
+                .unwrap(),
+            json!({ "generation": 2 })
+        );
+        runtime.disconnect("com.attson.http").await.unwrap();
+        let _ = stop_second_tx.send(());
+        second_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_initial_background_connection_failure_keeps_retrying() {
+        let directory = tempdir().unwrap();
+        let store_root = directory.path().join("plugins");
+        let store = native_service_store(&store_root, b"signed-service", b"signed-service");
+        set_background_lifecycle(&store_root, "com.attson.http");
+        let data_directory = directory.path().join("http");
+        let endpoint_path = data_directory.join("service.endpoint.json");
+        let runtime = NativeServiceRuntime::with_event_sink(
+            store,
+            directory.path().to_path_buf(),
+            Arc::new(NoopEventSink),
+        );
+
+        let error = runtime.connect("com.attson.http").await.unwrap_err();
+        assert_eq!(error.code, "NATIVE_SERVICE_START_FAILED");
+
+        std::fs::create_dir_all(&data_directory).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        write_test_endpoint(&endpoint_path, listener.local_addr().unwrap().port());
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let server = tokio::spawn(fake_persistent_service(
+            listener,
+            data_directory.to_string_lossy().to_string(),
+            "com.attson.http",
+            3,
+            stop_rx,
+        ));
+
+        let recovered = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(result) = runtime
+                    .request("com.attson.http", "data.tabs.list", json!({}))
+                    .await
+                {
+                    break result;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("initial background failure should keep retrying");
+
+        assert_eq!(recovered, json!({ "generation": 3 }));
+        runtime.disconnect("com.attson.http").await.unwrap();
+        let _ = stop_tx.send(());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_disconnect_suppresses_background_recovery() {
+        let directory = tempdir().unwrap();
+        let store_root = directory.path().join("plugins");
+        let store = native_service_store(&store_root, b"signed-service", b"signed-service");
+        set_background_lifecycle(&store_root, "com.attson.http");
+        let data_directory = directory.path().join("http");
+        std::fs::create_dir_all(&data_directory).unwrap();
+        let endpoint_path = data_directory.join("service.endpoint.json");
+        let first_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        write_test_endpoint(&endpoint_path, first_listener.local_addr().unwrap().port());
+        let (stop_first_tx, stop_first_rx) = oneshot::channel();
+        let first_server = tokio::spawn(fake_persistent_service(
+            first_listener,
+            data_directory.to_string_lossy().to_string(),
+            "com.attson.http",
+            1,
+            stop_first_rx,
+        ));
+        let runtime = NativeServiceRuntime::with_event_sink(
+            store,
+            directory.path().to_path_buf(),
+            Arc::new(NoopEventSink),
+        );
+        runtime.connect("com.attson.http").await.unwrap();
+
+        runtime.disconnect("com.attson.http").await.unwrap();
+        let _ = stop_first_tx.send(());
+        first_server.await.unwrap();
+        let second_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        write_test_endpoint(&endpoint_path, second_listener.local_addr().unwrap().port());
+        let accepted = tokio::time::timeout(Duration::from_millis(600), second_listener.accept())
+            .await
+            .is_ok();
+
+        assert!(
+            !accepted,
+            "explicit disconnect must cancel background recovery"
+        );
+        assert!(!runtime.is_connected("com.attson.http"));
+        assert_eq!(
+            runtime.status_for("com.attson.http").unwrap().state,
+            "disconnected"
+        );
     }
 
     #[cfg(unix)]
@@ -3553,6 +4092,96 @@ mod tests {
             )
             .unwrap();
         store
+    }
+
+    fn set_background_lifecycle(store_root: &Path, app_id: &str) {
+        let metadata = json!({
+            "entry": "native/service",
+            "version": "0.1.0-alpha.0",
+            "sha256": hex::encode(Sha256::digest(b"signed-service")),
+            "protocolVersion": 1,
+            "lifecycle": "background"
+        });
+        let connection = rusqlite::Connection::open(store_root.join("registry.sqlite3")).unwrap();
+        connection
+            .execute(
+                "UPDATE installed_plugins SET native_service_json = ?1 WHERE app_id = ?2",
+                rusqlite::params![metadata.to_string(), app_id],
+            )
+            .unwrap();
+    }
+
+    fn write_test_endpoint(path: &Path, port: u16) {
+        std::fs::write(
+            path,
+            serde_json::to_vec(&json!({
+                "port": port,
+                "token": "secret-token",
+                "serviceVersion": "0.1.0-alpha.0"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    async fn fake_persistent_service(
+        listener: TcpListener,
+        data_directory: String,
+        app_id: &'static str,
+        generation: u64,
+        mut stop: oneshot::Receiver<()>,
+    ) {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut reader = BufReader::new(read);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let handshake: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(handshake["token"], "secret-token");
+        assert_eq!(handshake["dataDirectory"], data_directory);
+        assert_eq!(handshake["appId"], app_id);
+        write
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({
+                        "kind": "handshake",
+                        "protocolVersion": 1,
+                        "requestId": handshake["requestId"],
+                        "appId": app_id,
+                        "hostApi": "2.0.0",
+                        "dataApi": "1.0.0",
+                        "serviceApi": "1.0.0",
+                        "schemaVersion": 1,
+                        "migrationState": "ready",
+                        "leaseState": "owner",
+                        "capabilities": {}
+                    })
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        loop {
+            line.clear();
+            tokio::select! {
+                _ = &mut stop => break,
+                read = reader.read_line(&mut line) => {
+                    if read.unwrap() == 0 {
+                        break;
+                    }
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    write.write_all(format!(
+                        "{}\n",
+                        json!({
+                            "kind": "response",
+                            "requestId": request["requestId"],
+                            "result": { "generation": generation }
+                        })
+                    ).as_bytes()).await.unwrap();
+                }
+            }
+        }
     }
 
     async fn fake_service(listener: TcpListener, data_directory: String) {

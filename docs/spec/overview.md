@@ -17,7 +17,7 @@ attool 是一个个人使用的桌面工具集合，运行在 Tauri 2 上。前�
 - HTTP 已完全外置为 `com.attson.http`：`athttp` 独立版和官方 Catalog 插件复用同一 UI、请求核心与 `${app_data_dir}/http/http.sqlite3`，由单一 Native/Data Service 提供请求、长连接和数据 API。平台只保留 Host API 2.x 桥接和 service supervisor，不再包含内置 HTTP UI、Store、Tauri commands 或 SQLite owner。
 - 剪贴板已完全外置为 `com.attson.clipboard`：`atclipboard` 独立版和官方 Catalog 插件复用同一 UI 与 `${app_data_dir}/clipboard`，由单一 background Native Service 持有历史、监听和快捷键。平台只保留 Host API 2.x、service supervisor、签名辅助窗口及通用系统剪贴板写入，不再包含内置剪贴板 UI、commands、SQLite owner 或固定历史/预览窗口。
 - 视频链接抽取的 `com.attson.video` 独立版与签名插件复用同一 UI、`atvideo-service` 和独立 YouTube runtime，并可通过 Host activation 把链接交给动态 Aria2；五目标 workflow、生产签名隔离、精确十资产和 Catalog 包布局已完成本地验证。生产 Publisher、正式 Release 与 Catalog 生命周期仍待远端验证，宿主内置视频入口及共享 runtime 在 P3 前继续保留。
-- 插件平台支持页面关闭后继续连接的 `background` Native Service，以及由 manifest 声明、宿主隔离承载的底部面板和居中对话框辅助窗口。后台连接失败不会阻止平台启动，应用入口和管理页会显示稳定错误码与关联 ID。
+- 插件平台支持页面关闭后继续连接的 `background` Native Service，以及由 manifest 声明、宿主隔离承载的底部面板和居中对话框辅助窗口。后台连接首次失败或意外断开不会阻止平台启动，而会在应用仍启用时按有界退避自动恢复；停用、卸载和显式断开会停止恢复。应用入口和管理页会显示 `recovering` 等连接状态、稳定错误码与关联 ID。
 
 下面详列两个“重后端”内置工具与 HTTP、剪贴板独立应用，其余见汇总表。
 
@@ -49,7 +49,7 @@ attool 是一个个人使用的桌面工具集合，运行在 Tauri 2 上。前�
 ### 剪贴板（独立应用 `com.attson.clipboard`）
 
 - 通过官方 Catalog 安装；启用后动态工具 ID 为 `plugin:com.attson.clipboard`，停用或卸载后入口消失，平台不提供内置回退或自动安装。
-- `atclipboard-service` 独占 `${app_data_dir}/clipboard`，页面关闭时仍采集文本、图片和文件；`CommandOrControl+Alt+V` 由 service 持有并通过签名 `history` 辅助窗口打开历史面板，预览使用签名 `preview` 辅助窗口。
+- `atclipboard-service` 独占 `${app_data_dir}/clipboard`，页面关闭时仍采集文本、图片和文件；每轮系统剪贴板读取在可超时终止的短生命周期 helper 中完成，单次读取卡死只会放弃该轮，不会永久阻塞后续采集。`CommandOrControl+Alt+V` 由 service 持有并通过签名 `history` 辅助窗口打开历史面板，预览使用签名 `preview` 辅助窗口。
 - 插件 iframe 通过 `host.clipboard.history` 的六个历史方法和两个设置方法访问 service；公共 DTO、分页、文本截断与图片预览均有界，不暴露内部图片、数据库或缓存路径。
 - 宿主启动不打开、迁移、清理或删除剪贴板数据库，不注册领域快捷键，也不保留固定窗口或旧 Tauri commands。截图、钉图等通用系统图片剪贴板写入仍由宿主提供。
 

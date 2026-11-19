@@ -996,7 +996,7 @@ async fn restore_native_service(
     app_id: &str,
     was_connected: bool,
 ) {
-    if !was_connected {
+    if !was_connected && !native_services.background_service_enabled(app_id) {
         return;
     }
     if let Err(error) = native_services.connect(app_id).await {
