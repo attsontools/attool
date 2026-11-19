@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { mergeCatalogApps, permissionConfirmationComplete } from './catalogMerge';
-import type { CatalogSnapshot, InstalledPlugin } from './types';
+import {
+  catalogRowStatus,
+  mergeCatalogApps,
+  permissionConfirmationComplete
+} from './catalogMerge';
+import type { CatalogSnapshot, InstalledPlugin, PluginOperationSnapshot } from './types';
 
 const installedCodec: InstalledPlugin = {
   appId: 'com.attson.codec',
@@ -48,6 +52,28 @@ const snapshot: CatalogSnapshot = {
       }
     }
   ]
+};
+
+const downloadOperation: PluginOperationSnapshot = {
+  operationId: 'operation-1',
+  correlationId: 'correlation-1',
+  appId: installedCodec.appId,
+  name: installedCodec.name,
+  version: '1.1.0',
+  publisherId: installedCodec.publisherId,
+  publisherName: installedCodec.publisherName,
+  publisherKeyId: installedCodec.publisherKeyId,
+  entry: installedCodec.entry,
+  windows: {},
+  permissions: installedCodec.permissions,
+  nativeService: null,
+  stage: 'download',
+  steps: ['download'],
+  downloadedBytes: 29,
+  totalBytes: 100,
+  errorCode: null,
+  message: null,
+  finalAvailableVersion: null
 };
 
 describe('mergeCatalogApps', () => {
@@ -115,5 +141,60 @@ describe('mergeCatalogApps', () => {
     expect(permissionConfirmationComplete(expected, [...expected, 'host.theme.read'])).toBe(false);
     expect(permissionConfirmationComplete(expected, [expected[1], expected[0]])).toBe(true);
     expect(permissionConfirmationComplete([], [])).toBe(true);
+  });
+});
+
+describe('catalogRowStatus', () => {
+  it('marks an installed app with a newer catalog version as upgradable', () => {
+    const [codec] = mergeCatalogApps(snapshot, [installedCodec]);
+
+    expect(catalogRowStatus(codec, null)).toEqual({
+      label: '可升级',
+      type: 'warning'
+    });
+  });
+
+  it('shows download progress before the available update state', () => {
+    const [codec] = mergeCatalogApps(snapshot, [installedCodec]);
+
+    expect(catalogRowStatus(codec, downloadOperation)).toEqual({
+      label: '下载 29%',
+      type: 'info'
+    });
+  });
+
+  it('clamps download progress to the zero-to-one-hundred range', () => {
+    const [codec] = mergeCatalogApps(snapshot, [installedCodec]);
+
+    expect(catalogRowStatus(codec, {
+      ...downloadOperation,
+      downloadedBytes: -1
+    }).label).toBe('下载 0%');
+    expect(catalogRowStatus(codec, {
+      ...downloadOperation,
+      downloadedBytes: 101
+    }).label).toBe('下载 100%');
+  });
+
+  it('keeps an installed app without an update marked as installed', () => {
+    const currentSnapshot = {
+      ...snapshot,
+      apps: [{ ...snapshot.apps[0], latestVersion: installedCodec.version }]
+    };
+    const [codec] = mergeCatalogApps(currentSnapshot, [installedCodec]);
+
+    expect(catalogRowStatus(codec, null)).toEqual({
+      label: '已安装',
+      type: 'success'
+    });
+  });
+
+  it('keeps an uninstalled app marked as available', () => {
+    const [codec] = mergeCatalogApps(snapshot, []);
+
+    expect(catalogRowStatus(codec, null)).toEqual({
+      label: '可获取',
+      type: 'default'
+    });
   });
 });

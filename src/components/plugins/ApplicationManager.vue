@@ -20,7 +20,7 @@ import type { PluginStoreController } from '../../composables/usePluginStore';
 import type { ManagedCatalogApp, NativeServiceStatus, PluginHistoryRecord } from './types';
 import type { Tool } from '../../types/tool';
 import PluginInstallProbe from './PluginInstallProbe.vue';
-import { permissionConfirmationComplete } from './catalogMerge';
+import { catalogRowStatus, permissionConfirmationComplete } from './catalogMerge';
 import { permissionDescription } from './permissionDescription';
 
 type View = 'catalog' | 'installed' | 'history';
@@ -488,8 +488,8 @@ function formatBytes(bytes: number) {
                 <span class="app-description">{{ app.description }}</span>
               </span>
               <span class="row-meta">
-                <n-tag size="small" :type="app.installedVersion ? 'success' : 'default'" :bordered="false">
-                  {{ app.installedVersion ? '已安装' : '可获取' }}
+                <n-tag size="small" :type="catalogRowStatus(app, operation).type" :bordered="false">
+                  {{ catalogRowStatus(app, operation).label }}
                 </n-tag>
                 <span class="mono">{{ app.latestVersion }}</span>
               </span>
@@ -731,8 +731,8 @@ function formatBytes(bytes: number) {
       preset="card"
       :title="catalogOperationMode === 'update' ? '升级官方应用' : '安装官方应用'"
       class="install-modal"
-      :mask-closable="!remoteInstalling"
-      :closable="!remoteInstalling"
+      :mask-closable="false"
+      :closable="true"
     >
       <template v-if="selectedCatalog">
         <div class="package-heading">
@@ -794,7 +794,9 @@ function formatBytes(bytes: number) {
       </template>
       <template #footer>
         <div class="modal-actions">
-          <n-button :disabled="remoteInstalling" @click="catalogInstallOpen = false">取消</n-button>
+          <n-button @click="catalogInstallOpen = false">
+            {{ remoteInstalling ? '收起到后台' : '取消' }}
+          </n-button>
           <n-button
             type="primary"
             :disabled="!catalogPermissionsConfirmed || remoteInstalling"
