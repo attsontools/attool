@@ -46,7 +46,7 @@ export interface InstalledPlugin {
 
 export interface NativeServiceStatus {
   appId: string;
-  state: 'connecting' | 'connected' | 'unavailable' | 'disconnected';
+  state: 'connecting' | 'connected' | 'recovering' | 'unavailable' | 'disconnected';
   errorCode: string | null;
   message: string | null;
   correlationId: string | null;

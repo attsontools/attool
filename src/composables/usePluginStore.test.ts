@@ -84,7 +84,7 @@ describe('usePluginStore', () => {
     const api = fakeApi();
     let statusListener: (status: {
       appId: string;
-      state: 'connecting' | 'connected' | 'unavailable' | 'disconnected';
+      state: 'connecting' | 'connected' | 'recovering' | 'unavailable' | 'disconnected';
       errorCode: string | null;
       message: string | null;
       correlationId: string | null;
