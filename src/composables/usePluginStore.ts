@@ -12,7 +12,24 @@ import type {
   PluginHistoryRecord,
   PluginOperationSnapshot
 } from '../components/plugins/types';
-import type { Tool, ToolIconId } from '../types/tool';
+import type { Tool, ToolGroup, ToolIconId } from '../types/tool';
+
+const catalogToolGroups: Record<string, ToolGroup> = {
+  'com.attson.aria2': 'download',
+  'com.attson.video': 'download',
+  'com.attson.text': 'edit',
+  'com.attson.template': 'edit',
+  'com.attson.http': 'network',
+  'com.attson.codec': 'utility',
+  'com.attson.generator': 'utility',
+  'com.attson.time': 'utility',
+  'com.attson.json': 'utility',
+  'com.attson.clipboard': 'utility'
+};
+
+export function catalogToolGroup(appId: string): ToolGroup {
+  return catalogToolGroups[appId] ?? 'utility';
+}
 
 function catalogToolIcon(icon: string | undefined): ToolIconId {
   const icons: Record<string, ToolIconId> = {
@@ -84,7 +101,7 @@ export function usePluginStore(api: PluginApi = createPluginApi()) {
             : `${app.publisherName} 提供的独立应用`,
           status: 'ready',
           icon: catalogToolIcon(catalogIcon),
-          group: 'utility',
+          group: catalogToolGroup(app.appId),
           source: 'plugin',
           pluginAppId: app.appId
         } as Tool;

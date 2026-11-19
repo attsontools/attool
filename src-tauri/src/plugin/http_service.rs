@@ -28,6 +28,7 @@ use super::install::{InstalledPlugin, PluginStore};
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const REPLACEMENT_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const RECOVERY_DELAYS: [Duration; 6] = [
     Duration::from_millis(250),
     Duration::from_secs(1),
@@ -104,6 +105,7 @@ pub struct NativeServiceRuntime {
     statuses: Arc<Mutex<HashMap<String, NativeServiceStatus>>>,
     recovery: Arc<Mutex<RecoveryState>>,
     next_connection_generation: Arc<AtomicU64>,
+    external_processes: Arc<dyn ExternalServiceProcessControl>,
 }
 
 struct ConnectedService {
@@ -138,6 +140,20 @@ impl NativeServiceRuntime {
         app_data_root: PathBuf,
         event_sink: Arc<dyn NativeServiceEventSink>,
     ) -> Self {
+        Self::with_process_control(
+            store,
+            app_data_root,
+            event_sink,
+            Arc::new(SystemExternalServiceProcessControl),
+        )
+    }
+
+    fn with_process_control(
+        store: PluginStore,
+        app_data_root: PathBuf,
+        event_sink: Arc<dyn NativeServiceEventSink>,
+        external_processes: Arc<dyn ExternalServiceProcessControl>,
+    ) -> Self {
         Self {
             store: Arc::new(Mutex::new(store)),
             app_data_root,
@@ -147,6 +163,7 @@ impl NativeServiceRuntime {
             statuses: Arc::new(Mutex::new(HashMap::new())),
             recovery: Arc::new(Mutex::new(RecoveryState::default())),
             next_connection_generation: Arc::new(AtomicU64::new(0)),
+            external_processes,
         }
     }
 
@@ -367,6 +384,18 @@ impl NativeServiceRuntime {
     }
 
     pub async fn disconnect(&self, app_id: &str) -> Result<(), NativeServiceError> {
+        self.disconnect_inner(app_id, false).await
+    }
+
+    pub async fn disconnect_for_replacement(&self, app_id: &str) -> Result<(), NativeServiceError> {
+        self.disconnect_inner(app_id, true).await
+    }
+
+    async fn disconnect_inner(
+        &self,
+        app_id: &str,
+        replacing_version: bool,
+    ) -> Result<(), NativeServiceError> {
         self.set_recovery_suppressed(app_id, true);
         let connect_lock = {
             let mut locks = self.connect_locks.lock().map_err(|_| {
@@ -382,6 +411,9 @@ impl NativeServiceRuntime {
             )
         };
         let _connect_guard = connect_lock.lock().await;
+        let plugin = replacing_version
+            .then(|| self.installed_plugin(app_id))
+            .transpose()?;
         let connected = self
             .clients
             .lock()
@@ -393,24 +425,156 @@ impl NativeServiceRuntime {
             })?
             .remove(app_id);
         let Some(mut connected) = connected else {
+            if let Some(plugin) = plugin.as_ref() {
+                self.stop_previous_host_service(plugin, false).await?;
+            }
             self.record_disconnected(app_id);
             return Ok(());
         };
-        if let Some(process) = connected.process.as_mut() {
-            if let Err(error) = process.terminate() {
-                self.clients
-                    .lock()
-                    .map_err(|_| {
-                        NativeServiceError::new(
-                            "NATIVE_SERVICE_STATE_LOCK_FAILED",
-                            "Native service state lock failed",
-                        )
-                    })?
-                    .insert(app_id.to_string(), connected);
-                return Err(stop_failed("Cannot stop native service", error));
-            }
+        let stop_result = if let Some(process) = connected.process.as_mut() {
+            process
+                .terminate()
+                .map_err(|error| stop_failed("Cannot stop native service", error))
+        } else if let Some(plugin) = plugin.as_ref() {
+            self.stop_previous_host_service(plugin, true).await
+        } else {
+            Ok(())
+        };
+        if let Err(error) = stop_result {
+            self.clients
+                .lock()
+                .map_err(|_| {
+                    NativeServiceError::new(
+                        "NATIVE_SERVICE_STATE_LOCK_FAILED",
+                        "Native service state lock failed",
+                    )
+                })?
+                .insert(app_id.to_string(), connected);
+            return Err(error);
         }
         self.record_disconnected(app_id);
+        Ok(())
+    }
+
+    async fn stop_previous_host_service(
+        &self,
+        plugin: &InstalledPlugin,
+        connection_verified: bool,
+    ) -> Result<(), NativeServiceError> {
+        let Some(service) = plugin.native_service.as_ref() else {
+            return Ok(());
+        };
+        let expected_executable = plugin.root.join(&service.entry);
+        let bytes = std::fs::read(&expected_executable).map_err(|error| {
+            NativeServiceError::new(
+                "NATIVE_SERVICE_BINARY_READ_FAILED",
+                format!("Cannot read installed native service: {error}"),
+            )
+        })?;
+        if hex::encode(Sha256::digest(&bytes)) != service.sha256 {
+            return Err(NativeServiceError::new(
+                "NATIVE_SERVICE_BINARY_HASH_MISMATCH",
+                "Installed native service does not match the signed manifest",
+            ));
+        }
+
+        let data_directory = data_directory_for(&self.app_data_root, &plugin.app_id)?;
+        let endpoint_path = data_directory.join("service.endpoint.json");
+        if !endpoint_path.exists() {
+            return if connection_verified {
+                Err(owner_unverified(
+                    "Native service endpoint disappeared before ownership was verified",
+                ))
+            } else {
+                Ok(())
+            };
+        }
+        let endpoint = read_endpoint(&endpoint_path)?;
+        if endpoint.service_version != plugin.version {
+            return Err(owner_unverified(format!(
+                "Running Native service version {} is not the installed plugin version {}",
+                endpoint.service_version, plugin.version
+            )));
+        }
+        let lock_path = data_directory.join("service.lock");
+        let lease = read_service_lease(&lock_path)?;
+        if lease.token != endpoint.token {
+            return Err(owner_unverified(
+                "Native service endpoint and process lease do not match",
+            ));
+        }
+        if lease.pid == std::process::id() {
+            return Err(owner_unverified(
+                "Native service lease points to the AT Tool host process",
+            ));
+        }
+        if !connection_verified {
+            let verification = ServiceClient::connect(
+                &endpoint_path,
+                &data_directory,
+                &plugin.app_id,
+                &format!("attool-replacement-check-{}", Uuid::new_v4()),
+            )
+            .await
+            .map_err(|error| {
+                owner_unverified(format!(
+                    "Cannot verify the running Native service owner [{}]: {}",
+                    error.code, error.message
+                ))
+            })?;
+            drop(verification);
+        }
+        let actual_executable =
+            self.external_processes
+                .executable_path(lease.pid)
+                .map_err(|error| {
+                    owner_unverified(format!("Cannot identify Native service process: {error}"))
+                })?;
+        let expected_executable = std::fs::canonicalize(&expected_executable).map_err(|error| {
+            owner_unverified(format!(
+                "Cannot resolve installed Native service path: {error}"
+            ))
+        })?;
+        let actual_executable = std::fs::canonicalize(&actual_executable).map_err(|error| {
+            owner_unverified(format!(
+                "Cannot resolve running Native service path: {error}"
+            ))
+        })?;
+        if !same_executable_path(&actual_executable, &expected_executable) {
+            return Err(owner_unverified(
+                "Another application owns the Native service; close it before retrying the update",
+            ));
+        }
+
+        let current_endpoint = read_endpoint(&endpoint_path)?;
+        let current_lease = read_service_lease(&lock_path)?;
+        let current_executable = self
+            .external_processes
+            .executable_path(current_lease.pid)
+            .and_then(std::fs::canonicalize)
+            .map_err(|error| {
+                owner_unverified(format!("Cannot revalidate Native service process: {error}"))
+            })?;
+        if current_endpoint.token != endpoint.token
+            || current_lease.token != endpoint.token
+            || current_lease.pid != lease.pid
+            || !same_executable_path(&current_executable, &expected_executable)
+        {
+            return Err(owner_unverified(
+                "Native service ownership changed before the previous process could be stopped",
+            ));
+        }
+
+        self.external_processes
+            .terminate(lease.pid)
+            .map_err(|error| stop_failed("Cannot stop previous Native service", error))?;
+        wait_for_external_process_exit(
+            self.external_processes.as_ref(),
+            lease.pid,
+            REPLACEMENT_STOP_TIMEOUT,
+        )
+        .await?;
+        cleanup_stopped_service_files(&endpoint_path, &lock_path, &endpoint.token)?;
         Ok(())
     }
 
@@ -748,6 +912,147 @@ pub struct ServiceLaunchSpec {
     pub endpoint_path: PathBuf,
     pub data_directory: PathBuf,
     pub service_version: String,
+}
+
+trait ExternalServiceProcessControl: Send + Sync {
+    fn executable_path(&self, pid: u32) -> io::Result<PathBuf>;
+    fn terminate(&self, pid: u32) -> io::Result<()>;
+    fn is_running(&self, pid: u32) -> io::Result<bool>;
+}
+
+struct SystemExternalServiceProcessControl;
+
+#[cfg(target_os = "linux")]
+impl ExternalServiceProcessControl for SystemExternalServiceProcessControl {
+    fn executable_path(&self, pid: u32) -> io::Result<PathBuf> {
+        std::fs::read_link(format!("/proc/{pid}/exe"))
+    }
+
+    fn terminate(&self, pid: u32) -> io::Result<()> {
+        unix_signal(pid, 15).map(|_| ())
+    }
+
+    fn is_running(&self, pid: u32) -> io::Result<bool> {
+        unix_process_is_running(pid)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ExternalServiceProcessControl for SystemExternalServiceProcessControl {
+    fn executable_path(&self, pid: u32) -> io::Result<PathBuf> {
+        use std::{ffi::c_void, os::unix::ffi::OsStringExt};
+
+        const PROC_PIDPATHINFO_MAXSIZE: usize = 4096;
+        #[link(name = "proc")]
+        unsafe extern "C" {
+            fn proc_pidpath(pid: i32, buffer: *mut c_void, buffersize: u32) -> i32;
+        }
+        let mut buffer = vec![0u8; PROC_PIDPATHINFO_MAXSIZE];
+        let length =
+            unsafe { proc_pidpath(pid as i32, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+        if length <= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        buffer.truncate(length as usize);
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(buffer)))
+    }
+
+    fn terminate(&self, pid: u32) -> io::Result<()> {
+        unix_signal(pid, 15).map(|_| ())
+    }
+
+    fn is_running(&self, pid: u32) -> io::Result<bool> {
+        unix_process_is_running(pid)
+    }
+}
+
+#[cfg(unix)]
+fn unix_signal(pid: u32, signal: i32) -> io::Result<i32> {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    let result = unsafe { kill(pid as i32, signal) };
+    if result == 0 {
+        Ok(result)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn unix_process_is_running(pid: u32) -> io::Result<bool> {
+    match unix_signal(pid, 0) {
+        Ok(_) => Ok(true),
+        Err(error) if error.raw_os_error() == Some(3) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl ExternalServiceProcessControl for SystemExternalServiceProcessControl {
+    fn executable_path(&self, pid: u32) -> io::Result<PathBuf> {
+        let command = format!(
+            "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); (Get-Process -Id {pid} -ErrorAction Stop).Path"
+        );
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &command])
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ));
+        }
+        let path = String::from_utf8(output.stdout)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "process executable path is not valid UTF-8",
+                )
+            })?
+            .trim()
+            .to_string();
+        if path.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "process executable path is empty",
+            ));
+        }
+        Ok(PathBuf::from(path))
+    }
+
+    fn terminate(&self, pid: u32) -> io::Result<()> {
+        let status = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!("Stop-Process -Id {pid} -Force -ErrorAction Stop"),
+            ])
+            .status()?;
+        status
+            .success()
+            .then_some(())
+            .ok_or_else(|| io::Error::other("Stop-Process failed"))
+    }
+
+    fn is_running(&self, pid: u32) -> io::Result<bool> {
+        let status = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 3 }}"
+                ),
+            ])
+            .status()?;
+        match status.code() {
+            Some(0) => Ok(true),
+            Some(3) => Ok(false),
+            _ => Err(io::Error::other("Get-Process failed")),
+        }
+    }
 }
 
 pub trait ServiceProcess: Send {
@@ -1146,6 +1451,11 @@ struct Endpoint {
     service_version: String,
 }
 
+struct ServiceLease {
+    token: String,
+    pid: u32,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ErrorEnvelope {
@@ -1507,6 +1817,105 @@ fn read_endpoint(path: &Path) -> Result<Endpoint, NativeServiceError> {
     Ok(endpoint)
 }
 
+fn read_service_lease(path: &Path) -> Result<ServiceLease, NativeServiceError> {
+    let lease = std::fs::read_to_string(path).map_err(|error| {
+        owner_unverified(format!("Cannot read Native service process lease: {error}"))
+    })?;
+    let mut lines = lease.lines();
+    let token = lines.next().unwrap_or_default().trim().to_string();
+    let pid = lines
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| owner_unverified("Native service process lease has an invalid PID"))?;
+    if token.is_empty() || pid == 0 || lines.any(|line| !line.trim().is_empty()) {
+        return Err(owner_unverified(
+            "Native service process lease fields are invalid",
+        ));
+    }
+    Ok(ServiceLease { token, pid })
+}
+
+fn cleanup_stopped_service_files(
+    endpoint_path: &Path,
+    lock_path: &Path,
+    expected_token: &str,
+) -> Result<(), NativeServiceError> {
+    if endpoint_path.exists() {
+        let endpoint = read_endpoint(endpoint_path)?;
+        if endpoint.token != expected_token {
+            return Err(owner_unverified(
+                "Native service endpoint changed while the previous service was stopping",
+            ));
+        }
+        remove_stale_endpoint(
+            endpoint_path,
+            endpoint_path.parent().ok_or_else(|| {
+                NativeServiceError::new(
+                    "NATIVE_SERVICE_ENDPOINT_INVALID",
+                    "Native service endpoint has no data directory",
+                )
+            })?,
+        )?;
+        return Ok(());
+    }
+    if lock_path.exists() {
+        let lease = read_service_lease(lock_path)?;
+        if lease.token != expected_token {
+            return Err(owner_unverified(
+                "Native service process lease changed while the previous service was stopping",
+            ));
+        }
+        std::fs::remove_file(lock_path).map_err(|error| {
+            NativeServiceError::new(
+                "NATIVE_SERVICE_ENDPOINT_WRITE_FAILED",
+                format!("Cannot remove stopped Native service lease: {error}"),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn same_executable_path(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .eq_ignore_ascii_case(right.to_string_lossy().trim_start_matches(r"\\?\"))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn same_executable_path(left: &Path, right: &Path) -> bool {
+    left == right
+}
+
+fn owner_unverified(message: impl Into<String>) -> NativeServiceError {
+    NativeServiceError::new("NATIVE_SERVICE_OWNER_UNVERIFIED", message)
+}
+
+async fn wait_for_external_process_exit(
+    processes: &dyn ExternalServiceProcessControl,
+    pid: u32,
+    stop_timeout: Duration,
+) -> Result<(), NativeServiceError> {
+    let deadline = Instant::now() + stop_timeout;
+    loop {
+        if !processes
+            .is_running(pid)
+            .map_err(|error| stop_failed("Cannot inspect previous Native service", error))?
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(NativeServiceError::new(
+                "NATIVE_SERVICE_STOP_TIMEOUT",
+                "Previous Native service did not stop before the replacement timeout",
+            ));
+        }
+        sleep(READINESS_POLL_INTERVAL).await;
+    }
+}
+
 fn disconnected() -> NativeServiceError {
     NativeServiceError::new(
         "NATIVE_SERVICE_DISCONNECTED",
@@ -1526,7 +1935,7 @@ mod tests {
         path::{Path, PathBuf},
         process::{Command, Stdio},
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc, Mutex,
         },
         time::Duration,
@@ -1544,10 +1953,11 @@ mod tests {
     };
 
     use super::{
-        data_directory_for, disconnected, request_timeout, required_permission, ConnectedService,
-        ErrorEnvelope, NativeServiceError, NativeServiceEventSink, NativeServiceRuntime,
-        ServiceClient, ServiceLaunchSpec, ServiceLauncher, ServiceProcess, ServiceReply,
-        ServiceSupervisor, DEFAULT_REQUEST_TIMEOUT,
+        data_directory_for, disconnected, request_timeout, required_permission,
+        wait_for_external_process_exit, ConnectedService, ErrorEnvelope,
+        ExternalServiceProcessControl, NativeServiceError, NativeServiceEventSink,
+        NativeServiceRuntime, ServiceClient, ServiceLaunchSpec, ServiceLauncher, ServiceProcess,
+        ServiceReply, ServiceSupervisor, DEFAULT_REQUEST_TIMEOUT,
     };
     use crate::plugin::{install::PluginStore, package::HostEnvironment};
 
@@ -1612,6 +2022,28 @@ mod tests {
 
     struct FailingTerminateProcess {
         attempts: Arc<AtomicUsize>,
+    }
+
+    struct ExternalTestProcessControl {
+        executable: PathBuf,
+        running: AtomicBool,
+        stops: AtomicUsize,
+    }
+
+    impl ExternalServiceProcessControl for ExternalTestProcessControl {
+        fn executable_path(&self, _pid: u32) -> io::Result<PathBuf> {
+            Ok(self.executable.clone())
+        }
+
+        fn terminate(&self, _pid: u32) -> io::Result<()> {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+            self.running.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn is_running(&self, _pid: u32) -> io::Result<bool> {
+            Ok(self.running.load(Ordering::SeqCst))
+        }
     }
 
     impl ServiceLauncher for PanicLauncher {
@@ -2576,6 +3008,195 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "NATIVE_SERVICE_NOT_CONNECTED");
         runtime.disconnect("com.attson.http").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replacement_stops_a_signed_service_left_by_the_previous_host() {
+        let directory = tempdir().unwrap();
+        let store_root = directory.path().join("plugins");
+        let store = native_service_store(&store_root, b"signed-service", b"signed-service");
+        let service_path = store_root.join("apps/com.attson.http/0.1.0-alpha.0/native/service");
+        let data_directory = directory.path().join("http");
+        std::fs::create_dir_all(&data_directory).unwrap();
+        let endpoint_path = data_directory.join("service.endpoint.json");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        write_test_endpoint(&endpoint_path, listener.local_addr().unwrap().port());
+        std::fs::write(data_directory.join("service.lock"), "secret-token\n4242").unwrap();
+        let server = tokio::spawn(fake_service(
+            listener,
+            data_directory.to_string_lossy().to_string(),
+        ));
+        let client = ServiceClient::connect(
+            &endpoint_path,
+            &data_directory,
+            "com.attson.http",
+            "attool-test",
+        )
+        .await
+        .unwrap();
+        let process_control = Arc::new(ExternalTestProcessControl {
+            executable: service_path,
+            running: AtomicBool::new(true),
+            stops: AtomicUsize::new(0),
+        });
+        let runtime = NativeServiceRuntime::with_process_control(
+            store,
+            directory.path().to_path_buf(),
+            Arc::new(NoopEventSink),
+            process_control.clone(),
+        );
+        runtime.clients.lock().unwrap().insert(
+            "com.attson.http".to_string(),
+            ConnectedService {
+                version: "0.1.0-alpha.0".to_string(),
+                generation: 1,
+                client,
+                process: None,
+            },
+        );
+
+        runtime
+            .disconnect_for_replacement("com.attson.http")
+            .await
+            .unwrap();
+
+        assert_eq!(process_control.stops.load(Ordering::SeqCst), 1);
+        assert!(!endpoint_path.exists());
+        assert!(!data_directory.join("service.lock").exists());
+        assert!(!runtime.is_connected("com.attson.http"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn replacement_refuses_to_stop_an_external_service_owner() {
+        let directory = tempdir().unwrap();
+        let store_root = directory.path().join("plugins");
+        let store = native_service_store(&store_root, b"signed-service", b"signed-service");
+        let external_executable = directory.path().join("standalone-service");
+        std::fs::write(&external_executable, b"standalone-service").unwrap();
+        let data_directory = directory.path().join("http");
+        std::fs::create_dir_all(&data_directory).unwrap();
+        let endpoint_path = data_directory.join("service.endpoint.json");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        write_test_endpoint(&endpoint_path, listener.local_addr().unwrap().port());
+        std::fs::write(data_directory.join("service.lock"), "secret-token\n4242").unwrap();
+        let server = tokio::spawn(fake_service(
+            listener,
+            data_directory.to_string_lossy().to_string(),
+        ));
+        let client = ServiceClient::connect(
+            &endpoint_path,
+            &data_directory,
+            "com.attson.http",
+            "attool-test",
+        )
+        .await
+        .unwrap();
+        let process_control = Arc::new(ExternalTestProcessControl {
+            executable: external_executable,
+            running: AtomicBool::new(true),
+            stops: AtomicUsize::new(0),
+        });
+        let runtime = NativeServiceRuntime::with_process_control(
+            store,
+            directory.path().to_path_buf(),
+            Arc::new(NoopEventSink),
+            process_control.clone(),
+        );
+        runtime.clients.lock().unwrap().insert(
+            "com.attson.http".to_string(),
+            ConnectedService {
+                version: "0.1.0-alpha.0".to_string(),
+                generation: 1,
+                client,
+                process: None,
+            },
+        );
+
+        let error = runtime
+            .disconnect_for_replacement("com.attson.http")
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "NATIVE_SERVICE_OWNER_UNVERIFIED");
+        assert_eq!(process_control.stops.load(Ordering::SeqCst), 0);
+        assert!(endpoint_path.exists());
+        assert!(runtime.is_connected("com.attson.http"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn replacement_rejects_mismatched_tokens_and_invalid_pids_without_stopping() {
+        for lease in ["other-token\n4242", "secret-token\nnot-a-pid"] {
+            let directory = tempdir().unwrap();
+            let store_root = directory.path().join("plugins");
+            let store = native_service_store(&store_root, b"signed-service", b"signed-service");
+            let service_path = store_root.join("apps/com.attson.http/0.1.0-alpha.0/native/service");
+            let data_directory = directory.path().join("http");
+            std::fs::create_dir_all(&data_directory).unwrap();
+            write_test_endpoint(&data_directory.join("service.endpoint.json"), 9);
+            std::fs::write(data_directory.join("service.lock"), lease).unwrap();
+            let process_control = Arc::new(ExternalTestProcessControl {
+                executable: service_path,
+                running: AtomicBool::new(true),
+                stops: AtomicUsize::new(0),
+            });
+            let runtime = NativeServiceRuntime::with_process_control(
+                store,
+                directory.path().to_path_buf(),
+                Arc::new(NoopEventSink),
+                process_control.clone(),
+            );
+
+            let error = runtime
+                .disconnect_for_replacement("com.attson.http")
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.code, "NATIVE_SERVICE_OWNER_UNVERIFIED");
+            assert_eq!(process_control.stops.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_rejects_a_tampered_signed_service_without_stopping() {
+        let directory = tempdir().unwrap();
+        let store_root = directory.path().join("plugins");
+        let store = native_service_store(&store_root, b"tampered", b"signed-service");
+        let process_control = Arc::new(ExternalTestProcessControl {
+            executable: store_root.join("apps/com.attson.http/0.1.0-alpha.0/native/service"),
+            running: AtomicBool::new(true),
+            stops: AtomicUsize::new(0),
+        });
+        let runtime = NativeServiceRuntime::with_process_control(
+            store,
+            directory.path().to_path_buf(),
+            Arc::new(NoopEventSink),
+            process_control.clone(),
+        );
+
+        let error = runtime
+            .disconnect_for_replacement("com.attson.http")
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "NATIVE_SERVICE_BINARY_HASH_MISMATCH");
+        assert_eq!(process_control.stops.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn replacement_reports_a_timeout_when_the_previous_service_does_not_exit() {
+        let process_control = ExternalTestProcessControl {
+            executable: PathBuf::new(),
+            running: AtomicBool::new(true),
+            stops: AtomicUsize::new(0),
+        };
+
+        let error = wait_for_external_process_exit(&process_control, 4242, Duration::ZERO)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "NATIVE_SERVICE_STOP_TIMEOUT");
     }
 
     #[tokio::test]

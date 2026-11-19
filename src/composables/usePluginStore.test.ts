@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { usePluginStore } from './usePluginStore';
+import { catalogToolGroup, usePluginStore } from './usePluginStore';
 import type {
   CatalogSnapshot,
   InstalledPlugin,
@@ -54,6 +54,22 @@ const catalog: CatalogSnapshot = {
     }
   ]
 };
+
+describe('catalogToolGroup', () => {
+  it.each([
+    'com.attson.codec',
+    'com.attson.generator',
+    'com.attson.time',
+    'com.attson.json',
+    'com.attson.clipboard'
+  ])('keeps the official utility app %s under utility navigation', (appId) => {
+    expect(catalogToolGroup(appId)).toBe('utility');
+  });
+
+  it('falls back to utility navigation for an unknown app', () => {
+    expect(catalogToolGroup('com.example.unknown')).toBe('utility');
+  });
+});
 
 function fakeApi(): PluginApi {
   return {
@@ -144,6 +160,50 @@ describe('usePluginStore', () => {
     expect(store.apps.value).toHaveLength(1);
     expect(store.apps.value[0].enabled).toBe(false);
     expect(store.navigationTools.value).toEqual([]);
+  });
+
+  it('groups enabled download plugins under download navigation', async () => {
+    const api = fakeApi();
+    vi.mocked(api.listInstalled).mockResolvedValue([
+      { ...codec, appId: 'com.attson.aria2', name: 'Aria2 下载' },
+      { ...codec, appId: 'com.attson.video', name: '视频链接抽取' }
+    ]);
+    const store = usePluginStore(api);
+
+    await store.load();
+
+    expect(store.navigationTools.value.map((tool) => tool.group)).toEqual([
+      'download',
+      'download'
+    ]);
+  });
+
+  it('groups enabled editing plugins under edit navigation', async () => {
+    const api = fakeApi();
+    vi.mocked(api.listInstalled).mockResolvedValue([
+      { ...codec, appId: 'com.attson.text', name: '文本工具' },
+      { ...codec, appId: 'com.attson.template', name: '主图模板' }
+    ]);
+    const store = usePluginStore(api);
+
+    await store.load();
+
+    expect(store.navigationTools.value.map((tool) => tool.group)).toEqual([
+      'edit',
+      'edit'
+    ]);
+  });
+
+  it('groups the enabled HTTP plugin under network navigation', async () => {
+    const api = fakeApi();
+    vi.mocked(api.listInstalled).mockResolvedValue([
+      { ...codec, appId: 'com.attson.http', name: 'HTTP 请求' }
+    ]);
+    const store = usePluginStore(api);
+
+    await store.load();
+
+    expect(store.navigationTools.value[0].group).toBe('network');
   });
 
   it('does not report a completed install as failed when history refresh fails', async () => {

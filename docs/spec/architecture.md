@@ -93,7 +93,7 @@ HTTP 与剪贴板数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app
 ### 原生 Service 与共享数据
 
 - `com.attson.http` 的独立版和插件版都是 Native/Data Service 客户端。service 通过权限受限的 endpoint 文件发布临时 loopback 端口和 UUID token，客户端完成 Host/Data/Service API 握手后才能调用业务方法。
-- 平台 supervisor 从已安装且签名校验通过的插件版本启动或复用 service；声明 `background` 的已启用应用在平台启动、安装或启用后即连接，不依赖页面是否打开。并发启动者按 app 收敛到同一连接，不同 app 可并行启动；`service.lock` 和 endpoint 竞争收敛到同一实例，过期租约只在确认进程已失效后清理。background service 首次连接失败或当前 generation 意外断开后进入单应用有界退避恢复；恢复前重新确认应用仍安装、启用且保持 background 生命周期，旧 generation 不得移除新连接。显式断开、停用和卸载会抑制恢复，后续显式连接或启用才解除。Host 保留自己启动的子进程句柄，重连、停用、卸载或插件版本切换前先可靠终止该 owned service；终止失败时保留句柄并禁止启动第二实例。独立版或其他外部进程不被越权终止，版本不匹配时明确失败。连接状态以 `connecting | connected | recovering | unavailable | disconnected`、稳定错误码和 correlation ID 暴露给导航与应用管理。
+- 平台 supervisor 从已安装且签名校验通过的插件版本启动或复用 service；声明 `background` 的已启用应用在平台启动、安装或启用后即连接，不依赖页面是否打开。并发启动者按 app 收敛到同一连接，不同 app 可并行启动；`service.lock` 和 endpoint 竞争收敛到同一实例，过期租约只在确认进程已失效后清理。background service 首次连接失败或当前 generation 意外断开后进入单应用有界退避恢复；恢复前重新确认应用仍安装、启用且保持 background 生命周期，旧 generation 不得移除新连接。显式断开、停用和卸载会抑制恢复，后续显式连接或启用才解除。Host 保留自己启动的子进程句柄，重连、停用、卸载或插件版本切换前先可靠终止该 owned service；终止失败时保留句柄并禁止启动第二实例。版本替换还可接管上一轮 Host 留下的 service，但必须在 registry 激活前同时校验签名文件 hash、endpoint 与 lock token/PID、握手身份和实际可执行路径，并在有界时间内确认进程退出；任一校验或停止步骤失败都保留当前版本。独立版或其他外部进程不被越权终止，版本不匹配时明确失败。连接状态以 `connecting | connected | recovering | unavailable | disconnected`、稳定错误码和 correlation ID 暴露给导航与应用管理。
 - Native Service 事件按当前已连接的 app 和 service 版本验收，再路由到该应用的主页面及辅助窗口。保留的 `host.ui.open` 事件只激活已签名且已授权的目标窗口，不作为普通业务事件广播；同一 app/window 的并发打开串行化，握手期间只保留最后一次 activation。
 - service 对新客户端独占 `${app_data_dir}/http/http.sqlite3`，首次接管任何已有非空数据库时创建 `http.sqlite3.pre-service-v1.bak`，再执行 schema 迁移和完整性检查。迁移失败返回稳定错误，不回退到宿主内置 HTTP。
 - 同一客户端连接允许请求并发分派，因此 `http.cancel` 可以中断仍在执行的 `http.send`；响应写入仍串行化，SSE/WS 保持 2000 条、5 MiB buffer 和 generation 语义。`stream.open` response 前到达的事件由客户端按 generation 暂存并在响应后交付，不能因 RPC/event 时序丢失首帧。
@@ -110,6 +110,7 @@ HTTP 与剪贴板数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app
 ### 前端装配与应用外置
 
 - `usePluginStore` 从 Tauri registry 加载插件并生成动态 `Tool`；“应用管理”固定在侧栏平台分组，负责本地包预览、权限确认、安装、启停、卸载、筛选和历史查看。
+- 动态 `Tool` 按稳定 `appId` 归入下载、编辑、网络或实用分组，未知应用回退到实用；侧栏与命令面板均消费同一个 `Tool.group`，Catalog schema 不承载宿主导航分组。
 - 平台不再内置 `codec`、`text`、`generator`、`time`、`json`、`http` 与 `clipboard`；对应插件是这些工具在平台中的唯一入口。停用或卸载插件后，平台不提供回退版内置工具。
 - `@attson/plugin-sdk` 定义 manifest、签名 canonical JSON、浏览器 Host bridge 和稳定错误；`atcodec`、`attext`、`atgenerator`、`attime` 与 `atjson` 通过 Vite host alias 在 Standalone Adapter 与 Plugin Adapter 间切换，各自共享独立版和插件版的 Vue UI 与核心逻辑。
 - `athttp` 与 `atclipboard` 同样通过 Vite adapter 复用 UI：独立版直接连接本地 service，插件版经 Host API 2.x 转发到相同 service。两者的生产 `0.1.0-alpha.2` 均已通过五目标 Release、Catalog 安装/升级/回滚和真实 Tauri 验收。
@@ -120,7 +121,7 @@ HTTP 与剪贴板数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app
 - 平台验证 Root、Catalog、Publisher manifest 签名、目标制品 SHA-256/大小和包内文件 hash。新元数据无效、过期或序列回退时不得覆盖上一份有效缓存；缓存过期后可继续运行已安装应用，但禁止新的远程安装和升级。
 - `github.com` 或 `raw.githubusercontent.com` 的规范 HTTPS URL 始终映射到 `gh-proxy.com` 下载；其他 URL 不改写。传输中断时最多执行三次严格 Range 续传，代理响应仍必须通过相同的 Root、Catalog、Publisher 签名、大小、SHA-256 与包内文件 hash 校验，代理不进入信任边界。
 - 远程安装与升级先下载到 staging 并登记 `pending`，通过 target、Host API、权限和隔离健康检查后再原子切换 `current`。切换前失败保持旧版本不变；首次运行确认失败恢复 `previous`，并记录稳定错误码与 correlation ID。
-- 应用管理合并 Catalog 与本地 registry，提供“应用目录 / 已安装 / 操作记录”。升级只接受严格更高 SemVer；新增权限必须由用户确认完整差集，权限不变或减少不重复授权。
+- 应用管理合并 Catalog 与本地 registry，提供“应用目录 / 已安装 / 操作记录”。目录行对已安装应用显示 registry 的实际版本，对未安装应用显示 Catalog 最新版本；详情分别保留最新版本与已安装版本，自动回滚后仍按 SemVer 显示“可升级”。升级只接受严格更高 SemVer；新增权限必须由用户确认完整差集，权限不变或减少不重复授权。
 
 ### Catalog 发布链
 

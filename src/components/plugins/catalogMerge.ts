@@ -1,8 +1,36 @@
 import type {
   CatalogSnapshot,
   InstalledPlugin,
-  ManagedCatalogApp
+  ManagedCatalogApp,
+  PluginOperationSnapshot
 } from './types';
+
+export interface CatalogRowStatus {
+  label: string;
+  type: 'default' | 'success' | 'warning' | 'info';
+}
+
+export function catalogRowVersion(app: ManagedCatalogApp) {
+  return app.installedVersion ?? app.latestVersion;
+}
+
+export function catalogRowStatus(
+  app: ManagedCatalogApp,
+  operation: PluginOperationSnapshot | null
+): CatalogRowStatus {
+  if (operation?.appId === app.appId && operation.stage === 'download') {
+    const progress = operation.totalBytes
+      ? Math.round((operation.downloadedBytes / operation.totalBytes) * 100)
+      : 0;
+    return {
+      label: `下载 ${Math.min(100, Math.max(0, progress))}%`,
+      type: 'info'
+    };
+  }
+  if (app.updateAvailable) return { label: '可升级', type: 'warning' };
+  if (app.installedVersion) return { label: '已安装', type: 'success' };
+  return { label: '可获取', type: 'default' };
+}
 
 export function mergeCatalogApps(
   snapshot: CatalogSnapshot,

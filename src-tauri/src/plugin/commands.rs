@@ -692,6 +692,13 @@ impl PluginRuntime {
             })
     }
 
+    fn catalog_operation_requires_replacement(
+        &self,
+        operation_id: &str,
+    ) -> Result<bool, PluginCommandError> {
+        Ok(self.operation(operation_id)?.action == CatalogOperationMode::Update.action())
+    }
+
     fn latest_operation(&self) -> Result<Option<OperationSnapshot>, PluginCommandError> {
         self.store
             .lock()
@@ -1089,7 +1096,7 @@ pub async fn plugin_install_package(
         .any(|plugin| plugin.app_id == app_id);
     let was_connected = native_services.is_connected(&app_id);
     if replacing {
-        native_services.disconnect(&app_id).await?;
+        native_services.disconnect_for_replacement(&app_id).await?;
         if let Err(error) = auxiliary_windows.close_for_app(&app, &app_id) {
             restore_native_service(&native_services, &app_id, was_connected).await;
             return Err(error.into());
@@ -1322,12 +1329,16 @@ pub async fn plugin_complete_catalog_install(
     auxiliary_windows: State<'_, AuxiliaryWindowRuntime>,
     app: AppHandle,
 ) -> Result<CatalogInstallResult, PluginCommandError> {
-    let app_id = runtime.operation(&operation_id)?.app_id;
+    let operation = runtime.operation(&operation_id)?;
+    let app_id = operation.app_id;
+    let replacing = runtime.catalog_operation_requires_replacement(&operation_id)?;
     let was_connected = native_services.is_connected(&app_id);
-    native_services.disconnect(&app_id).await?;
-    if let Err(error) = auxiliary_windows.close_for_app(&app, &app_id) {
-        restore_native_service(&native_services, &app_id, was_connected).await;
-        return Err(error.into());
+    if replacing {
+        native_services.disconnect_for_replacement(&app_id).await?;
+        if let Err(error) = auxiliary_windows.close_for_app(&app, &app_id) {
+            restore_native_service(&native_services, &app_id, was_connected).await;
+            return Err(error.into());
+        }
     }
     let runtime = runtime.inner().clone();
     let worker = runtime.clone();
@@ -1347,7 +1358,9 @@ pub async fn plugin_complete_catalog_install(
     if was_connected || should_connect_background(&result.installed) {
         connect_native_service_observed(&native_services, &app_id).await;
     }
-    close_auxiliary_windows_observed(&auxiliary_windows, &app, &app_id);
+    if replacing {
+        close_auxiliary_windows_observed(&auxiliary_windows, &app, &app_id);
+    }
     Ok(result)
 }
 
@@ -1615,6 +1628,26 @@ mod tests {
 
         assert_eq!(error.code, "PLUGIN_INSTALL_IN_PROGRESS");
         assert_eq!(error.correlation_id, "correlation-operation-2");
+    }
+
+    #[test]
+    fn catalog_completion_replaces_services_only_for_updates() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime =
+            PluginRuntime::p0(PluginStore::open(directory.path().join("plugins")).unwrap())
+                .unwrap();
+        let install = operation("install-operation", OperationStage::Complete);
+        let mut update = operation("update-operation", OperationStage::HealthCheck);
+        update.action = "update".to_string();
+        runtime.reserve_operation(install).unwrap();
+        runtime.reserve_operation(update).unwrap();
+
+        assert!(!runtime
+            .catalog_operation_requires_replacement("install-operation")
+            .unwrap());
+        assert!(runtime
+            .catalog_operation_requires_replacement("update-operation")
+            .unwrap());
     }
 
     #[test]
