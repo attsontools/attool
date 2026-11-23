@@ -6,7 +6,7 @@ defineProps<{
   tools: Tool[];
   activeId: string | null;
   collapsed: boolean;
-  fullBleed?: boolean;
+  pluginWorkspace?: boolean;
   theme: 'dark' | 'light';
 }>();
 
@@ -36,7 +36,7 @@ const emit = defineEmits<{
     />
     <main class="main">
       <slot name="banner" />
-      <div class="content" :class="{ 'content--full-bleed': fullBleed }">
+      <div class="content" :class="{ 'content--plugin': pluginWorkspace }">
         <slot />
       </div>
     </main>
@@ -64,8 +64,8 @@ const emit = defineEmits<{
   padding: 18px 22px;
 }
 
-.content--full-bleed {
+.content--plugin {
   overflow: hidden;
-  padding: 0;
+  padding: 0 12px;
 }
 </style>

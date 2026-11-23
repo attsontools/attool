@@ -465,7 +465,7 @@ async function clearCompleted() {
         :tools="tools"
         :active-id="selectedToolId"
         :collapsed="sidebarCollapsed"
-        :full-bleed="selectedTool?.source === 'plugin'"
+        :plugin-workspace="selectedTool?.source === 'plugin'"
         :theme="theme"
         @select="selectTool"
         @toggle="toggleSidebar"
