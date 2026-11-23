@@ -1578,6 +1578,7 @@ pub fn run() {
             plugin::commands::plugin_fail_catalog_install,
             plugin::commands::plugin_get_operation,
             plugin::commands::plugin_get_latest_operation,
+            plugin::commands::plugin_get_latest_operations,
             plugin::commands::plugin_confirm_plugin_launch,
             plugin::commands::plugin_rollback_plugin_launch,
             plugin::auxiliary_window::plugin_open_auxiliary_window,

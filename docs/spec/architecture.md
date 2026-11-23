@@ -121,6 +121,7 @@ HTTP 与剪贴板数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app
 - 平台验证 Root、Catalog、Publisher manifest 签名、目标制品 SHA-256/大小和包内文件 hash。新元数据无效、过期或序列回退时不得覆盖上一份有效缓存；缓存过期后可继续运行已安装应用，但禁止新的远程安装和升级。
 - `github.com` 或 `raw.githubusercontent.com` 的规范 HTTPS URL 始终映射到 `gh-proxy.com` 下载；其他 URL 不改写。传输中断时最多执行三次严格 Range 续传，代理响应仍必须通过相同的 Root、Catalog、Publisher 签名、大小、SHA-256 与包内文件 hash 校验，代理不进入信任边界。
 - 远程安装与升级先下载到 staging 并登记 `pending`，通过 target、Host API、权限和隔离健康检查后再原子切换 `current`。切换前失败保持旧版本不变；首次运行确认失败恢复 `previous`，并记录稳定错误码与 correlation ID。
+- 安装与升级 operation 按 `appId` 独立持久化和展示；应用管理重载时恢复每个应用的最新快照，事件、进度、健康探针和完成/失败动作只更新对应应用。恢复出的非终态快照只用于展示，不视为当前进程仍活动的任务，也不会阻塞重试或触发健康探针。
 - 应用管理合并 Catalog 与本地 registry，提供“应用目录 / 已安装 / 操作记录”。目录行对已安装应用显示 registry 的实际版本，对未安装应用显示 Catalog 最新版本；详情分别保留最新版本与已安装版本，自动回滚后仍按 SemVer 显示“可升级”。升级只接受严格更高 SemVer；新增权限必须由用户确认完整差集，权限不变或减少不重复授权。
 
 ### Catalog 发布链

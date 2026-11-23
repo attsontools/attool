@@ -87,6 +87,7 @@ function fakeApi(): PluginApi {
     failCatalogInstall: vi.fn(),
     getOperation: vi.fn(),
     getLatestOperation: vi.fn().mockResolvedValue(null),
+    getLatestOperations: vi.fn().mockResolvedValue([]),
     listenOperations: vi.fn().mockResolvedValue(() => {}),
     confirmPluginLaunch: vi.fn(),
     rollbackPluginLaunch: vi.fn(),
@@ -348,12 +349,113 @@ describe('usePluginStore', () => {
       message: null,
       finalAvailableVersion: codec.version
     };
-    vi.mocked(api.getLatestOperation).mockResolvedValue(persisted);
+    vi.mocked(api.getLatestOperations).mockResolvedValue([persisted]);
     const store = usePluginStore(api);
 
     await store.load();
 
     expect(store.operation.value).toEqual(persisted);
+  });
+
+  it('restores the latest persisted operation for each application', async () => {
+    const codecOperation: PluginOperationSnapshot = {
+      operationId: 'operation-codec',
+      correlationId: 'correlation-codec',
+      appId: codec.appId,
+      name: codec.name,
+      version: '1.1.0',
+      publisherId: codec.publisherId,
+      publisherName: codec.publisherName,
+      publisherKeyId: codec.publisherKeyId,
+      entry: codec.entry,
+      windows: {},
+      permissions: codec.permissions,
+      nativeService: null,
+      stage: 'download',
+      steps: ['download'],
+      downloadedBytes: 1024,
+      totalBytes: 4096,
+      errorCode: null,
+      message: null,
+      finalAvailableVersion: codec.version
+    };
+    const clipboardOperation: PluginOperationSnapshot = {
+      ...codecOperation,
+      operationId: 'operation-clipboard',
+      correlationId: 'correlation-clipboard',
+      appId: 'com.attson.clipboard',
+      name: '剪贴板',
+      version: '1.0.6',
+      stage: 'verify',
+      steps: ['download', 'verify'],
+      downloadedBytes: 4096
+    };
+    const api = fakeApi();
+    vi.mocked(api.getLatestOperations).mockResolvedValue([codecOperation, clipboardOperation]);
+    const store = usePluginStore(api);
+
+    await store.load();
+
+    expect(store.operationForApp(codec.appId)).toEqual(codecOperation);
+    expect(store.operationForApp('com.attson.clipboard')).toEqual(clipboardOperation);
+    expect(store.operationIsActive(codec.appId)).toBe(false);
+    expect(store.operationIsActive('com.attson.clipboard')).toBe(false);
+  });
+
+  it('keeps operation events independent for different applications', async () => {
+    const api = fakeApi();
+    let operationListener: (operation: PluginOperationSnapshot) => void = () => {};
+    vi.mocked(api.listenOperations).mockImplementation(async (listener) => {
+      operationListener = listener;
+      return () => {};
+    });
+    const codecOperation: PluginOperationSnapshot = {
+      operationId: 'operation-codec',
+      correlationId: 'correlation-codec',
+      appId: codec.appId,
+      name: codec.name,
+      version: '1.1.0',
+      publisherId: codec.publisherId,
+      publisherName: codec.publisherName,
+      publisherKeyId: codec.publisherKeyId,
+      entry: codec.entry,
+      windows: {},
+      permissions: codec.permissions,
+      nativeService: null,
+      stage: 'download',
+      steps: ['download'],
+      downloadedBytes: 1024,
+      totalBytes: 4096,
+      errorCode: null,
+      message: null,
+      finalAvailableVersion: codec.version
+    };
+    const clipboardOperation: PluginOperationSnapshot = {
+      ...codecOperation,
+      operationId: 'operation-clipboard',
+      correlationId: 'correlation-clipboard',
+      appId: 'com.attson.clipboard',
+      name: '剪贴板',
+      version: '1.0.6',
+      stage: 'verify',
+      steps: ['download', 'verify'],
+      downloadedBytes: 4096
+    };
+    const store = usePluginStore(api);
+    await store.load();
+
+    operationListener(codecOperation);
+    operationListener(clipboardOperation);
+
+    expect(store.operationForApp(codec.appId)).toEqual(codecOperation);
+    expect(store.operationForApp('com.attson.clipboard')).toEqual(clipboardOperation);
+    expect(store.operationIsActive(codec.appId)).toBe(true);
+    expect(store.operationIsActive('com.attson.clipboard')).toBe(true);
+
+    operationListener({ ...codecOperation, stage: 'error', steps: ['download', 'error'] });
+
+    expect(store.operationIsActive(codec.appId)).toBe(false);
+    expect(store.operationIsActive('com.attson.clipboard')).toBe(true);
   });
 
   it('preserves the cached catalog when refresh fails', async () => {
@@ -411,8 +513,10 @@ describe('usePluginStore', () => {
     await store.installCatalog(codec.appId, codec.permissions);
     expect(store.navigationTools.value).toEqual([]);
     expect(store.operation.value?.stage).toBe('health-check');
+    expect(store.operationForApp(codec.appId)?.stage).toBe('health-check');
 
     await store.completeCatalogInstall('operation-1');
+    expect(store.operationForApp(codec.appId)?.stage).toBe('complete');
     expect(store.navigationTools.value.map((tool) => tool.id)).toEqual([
       'plugin:com.attson.codec'
     ]);
@@ -450,6 +554,7 @@ describe('usePluginStore', () => {
     expect(api.updateCatalogApp).toHaveBeenCalledWith(codec.appId, []);
     expect(store.apps.value[0].version).toBe(codec.version);
     expect(store.operation.value).toEqual(pending);
+    expect(store.operationForApp(codec.appId)).toEqual(pending);
   });
 
   it('replaces the current navigation version after automatic rollback', async () => {

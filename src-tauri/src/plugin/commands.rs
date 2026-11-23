@@ -709,6 +709,16 @@ impl PluginRuntime {
             .map_err(Into::into)
     }
 
+    fn latest_operations(&self) -> Result<Vec<OperationSnapshot>, PluginCommandError> {
+        self.store
+            .lock()
+            .map_err(|_| {
+                PluginCommandError::new("PLUGIN_STORE_LOCK_FAILED", "Plugin store lock failed")
+            })?
+            .latest_operations()
+            .map_err(Into::into)
+    }
+
     fn reserve_operation(&self, snapshot: OperationSnapshot) -> Result<(), PluginCommandError> {
         let operation_id = snapshot.operation_id.clone();
         let mut operations = self.operations.lock().map_err(|_| {
@@ -1389,6 +1399,13 @@ pub async fn plugin_get_latest_operation(
     runtime: State<'_, PluginRuntime>,
 ) -> Result<Option<OperationSnapshot>, PluginCommandError> {
     runtime.latest_operation()
+}
+
+#[tauri::command]
+pub async fn plugin_get_latest_operations(
+    runtime: State<'_, PluginRuntime>,
+) -> Result<Vec<OperationSnapshot>, PluginCommandError> {
+    runtime.latest_operations()
 }
 
 #[tauri::command]
