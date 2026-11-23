@@ -76,8 +76,32 @@ export function usePluginStore(api: PluginApi = createPluginApi()) {
   const error = ref<PluginCommandError | null>(null);
   const catalogError = ref<PluginCommandError | null>(null);
   const operation = ref<PluginOperationSnapshot | null>(null);
+  const operationsByApp = ref<Map<string, PluginOperationSnapshot>>(new Map());
+  const activeOperationAppIds = ref<Set<string>>(new Set());
   let operationUnlisten: (() => void) | null = null;
   let nativeServiceStatusUnlisten: (() => void) | null = null;
+
+  function applyOperation(next: PluginOperationSnapshot) {
+    const operations = new Map(operationsByApp.value);
+    operations.set(next.appId, next);
+    operationsByApp.value = operations;
+    const activeAppIds = new Set(activeOperationAppIds.value);
+    if (next.stage === 'complete' || next.stage === 'rolled-back' || next.stage === 'error') {
+      activeAppIds.delete(next.appId);
+    } else {
+      activeAppIds.add(next.appId);
+    }
+    activeOperationAppIds.value = activeAppIds;
+    operation.value = next;
+  }
+
+  function operationForApp(appId: string) {
+    return operationsByApp.value.get(appId) ?? null;
+  }
+
+  function operationIsActive(appId: string) {
+    return activeOperationAppIds.value.has(appId);
+  }
 
   function applyNativeServiceStatus(status: NativeServiceStatus) {
     const current = nativeServiceStatuses.value.get(status.appId);
@@ -126,7 +150,7 @@ export function usePluginStore(api: PluginApi = createPluginApi()) {
       if (!operationUnlisten) {
         try {
           operationUnlisten = await api.listenOperations((next) => {
-            operation.value = next;
+            applyOperation(next);
             if (next.stage === 'complete' || next.stage === 'rolled-back' || next.stage === 'error') {
               void refreshHistory();
             }
@@ -150,7 +174,13 @@ export function usePluginStore(api: PluginApi = createPluginApi()) {
       }
       await refreshHistory();
       try {
-        operation.value = await api.getLatestOperation();
+        const restored = await api.getLatestOperations();
+        const restoredByApp = new Map(restored.map((next) => [next.appId, next]));
+        for (const [appId, current] of operationsByApp.value) {
+          restoredByApp.set(appId, current);
+        }
+        operationsByApp.value = restoredByApp;
+        operation.value ??= restored.at(-1) ?? null;
       } catch (reason) {
         error.value = commandError(reason);
       }
@@ -214,8 +244,9 @@ export function usePluginStore(api: PluginApi = createPluginApi()) {
     busyAppIds.value = new Set(busyAppIds.value).add(appId);
     error.value = null;
     try {
-      operation.value = await api.installCatalogApp(appId, acceptedPermissions);
-      return operation.value;
+      const next = await api.installCatalogApp(appId, acceptedPermissions);
+      applyOperation(next);
+      return next;
     } catch (reason) {
       const operationError = commandError(reason);
       await refreshHistory();
@@ -232,8 +263,9 @@ export function usePluginStore(api: PluginApi = createPluginApi()) {
     busyAppIds.value = new Set(busyAppIds.value).add(appId);
     error.value = null;
     try {
-      operation.value = await api.updateCatalogApp(appId, acceptedAddedPermissions);
-      return operation.value;
+      const next = await api.updateCatalogApp(appId, acceptedAddedPermissions);
+      applyOperation(next);
+      return next;
     } catch (reason) {
       const operationError = commandError(reason);
       await refreshHistory();
@@ -254,7 +286,7 @@ export function usePluginStore(api: PluginApi = createPluginApi()) {
     error.value = null;
     try {
       const result = await api.completeCatalogInstall(operationId);
-      operation.value = result.operation;
+      applyOperation(result.operation);
       replaceInstalled(result.installed);
       await refreshHistory();
       return result.installed;
@@ -266,9 +298,10 @@ export function usePluginStore(api: PluginApi = createPluginApi()) {
 
   async function failCatalogInstall(operationId: string) {
     try {
-      operation.value = await api.failCatalogInstall(operationId);
+      const next = await api.failCatalogInstall(operationId);
+      applyOperation(next);
       await refreshHistory();
-      return operation.value;
+      return next;
     } catch (reason) {
       error.value = commandError(reason);
       throw reason;
@@ -324,6 +357,8 @@ export function usePluginStore(api: PluginApi = createPluginApi()) {
     error,
     catalogError,
     operation,
+    operationForApp,
+    operationIsActive,
     navigationTools,
     catalogApps,
     load,

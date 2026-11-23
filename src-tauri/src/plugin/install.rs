@@ -1500,6 +1500,24 @@ impl PluginStore {
         stored.map(decode_operation).transpose()
     }
 
+    pub fn latest_operations(&self) -> Result<Vec<OperationSnapshot>, InstallError> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "{} WHERE id IN (
+                    SELECT MAX(id) FROM plugin_operations GROUP BY app_id
+                 ) ORDER BY id ASC",
+                operation_select_sql()
+            ))
+            .map_err(registry_read_error)?;
+        let operations = statement
+            .query_map([], stored_operation_from_row)
+            .map_err(registry_read_error)?
+            .map(|stored| stored.map_err(registry_read_error).and_then(decode_operation))
+            .collect();
+        operations
+    }
+
     fn find(&self, app_id: &str) -> Result<Option<InstalledPlugin>, InstallError> {
         Ok(self
             .list()?
@@ -2871,6 +2889,66 @@ mod tests {
 
         let reopened = PluginStore::open(store_root).unwrap();
         assert_eq!(reopened.latest_operation().unwrap(), Some(operation));
+    }
+
+    #[test]
+    fn recovers_the_latest_operation_for_each_application() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = PluginStore::open(directory.path().join("plugins")).unwrap();
+        let mut codec = crate::plugin::remote_install::OperationSnapshot {
+            action: "update".to_string(),
+            operation_id: "codec-old".to_string(),
+            correlation_id: "correlation-codec-old".to_string(),
+            app_id: "com.attson.codec".to_string(),
+            name: "编码转换".to_string(),
+            version: "1.0.0".to_string(),
+            publisher_id: "com.attson".to_string(),
+            publisher_name: "Attson".to_string(),
+            publisher_key_id: "codec-key".to_string(),
+            entry: Some("ui/index.html".to_string()),
+            windows: std::collections::BTreeMap::new(),
+            permissions: vec!["host.theme.read".to_string()],
+            native_service: None,
+            stage: crate::plugin::remote_install::OperationStage::Error,
+            steps: vec!["download".to_string(), "error".to_string()],
+            downloaded_bytes: 1024,
+            total_bytes: 4096,
+            error_code: Some("PLUGIN_DOWNLOAD_FAILED".to_string()),
+            message: Some("Application download failed".to_string()),
+            final_available_version: Some("1.0.0".to_string()),
+        };
+        store.save_operation(&codec).unwrap();
+
+        let mut clipboard = codec.clone();
+        clipboard.operation_id = "clipboard-current".to_string();
+        clipboard.correlation_id = "correlation-clipboard".to_string();
+        clipboard.app_id = "com.attson.clipboard".to_string();
+        clipboard.name = "剪贴板".to_string();
+        clipboard.stage = crate::plugin::remote_install::OperationStage::HealthCheck;
+        clipboard.steps = vec![
+            "download".to_string(),
+            "verify".to_string(),
+            "staging".to_string(),
+            "health-check".to_string(),
+        ];
+        clipboard.error_code = None;
+        clipboard.message = None;
+        store.save_operation(&clipboard).unwrap();
+
+        codec.operation_id = "codec-current".to_string();
+        codec.correlation_id = "correlation-codec-current".to_string();
+        codec.version = "1.1.0".to_string();
+        codec.stage = crate::plugin::remote_install::OperationStage::Download;
+        codec.steps = vec!["download".to_string()];
+        codec.error_code = None;
+        codec.message = None;
+        store.save_operation(&codec).unwrap();
+
+        let operations = store.latest_operations().unwrap();
+
+        assert_eq!(operations.len(), 2);
+        assert_eq!(operations[0].operation_id, "clipboard-current");
+        assert_eq!(operations[1].operation_id, "codec-current");
     }
 
     #[test]

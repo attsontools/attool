@@ -64,7 +64,6 @@ const installing = ref(false);
 const catalogInstallOpen = ref(false);
 const catalogOperationMode = ref<'install' | 'update'>('install');
 const acceptedCatalogPermissions = ref<string[]>([]);
-const remoteInstalling = ref(false);
 const uninstallOpen = ref(false);
 const deleteData = ref(false);
 const deleteDataConfirmOpen = ref(false);
@@ -124,10 +123,19 @@ const preview = computed(() => props.store.preview.value);
 const storeError = computed(() => props.store.error.value);
 const catalogError = computed(() => props.store.catalogError.value);
 const catalog = computed(() => props.store.catalog.value);
-const operation = computed(() => props.store.operation.value);
 const selectedOperation = computed(() =>
-  operation.value?.appId === selectedCatalog.value?.appId ? operation.value : null
+  selectedCatalog.value ? props.store.operationForApp(selectedCatalog.value.appId) : null
 );
+const selectedRemoteBusy = computed(() => {
+  const appId = selectedCatalog.value?.appId;
+  if (!appId) return false;
+  if (props.store.busyAppIds.value.has(appId)) return true;
+  return props.store.operationIsActive(appId);
+});
+
+function activeOperationForApp(appId: string) {
+  return props.store.operationIsActive(appId) ? props.store.operationForApp(appId) : null;
+}
 const installProgress = computed(() => {
   const current = selectedOperation.value;
   if (!current?.totalBytes) return 0;
@@ -230,7 +238,6 @@ function requestCatalogUpdate() {
 async function confirmCatalogInstall() {
   const app = selectedCatalog.value;
   if (!app || !catalogPermissionsConfirmed.value) return;
-  remoteInstalling.value = true;
   try {
     if (catalogOperationMode.value === 'update') {
       await props.store.updateCatalog(app.appId, [...acceptedCatalogPermissions.value]);
@@ -238,7 +245,7 @@ async function confirmCatalogInstall() {
       await props.store.installCatalog(app.appId, [...acceptedCatalogPermissions.value]);
     }
   } catch {
-    remoteInstalling.value = false;
+    // The stable command error is rendered in-page.
   }
 }
 
@@ -259,12 +266,11 @@ function requestHistoryRetry(record: PluginHistoryRecord) {
   selectedCatalogId.value = app.appId;
   catalogOperationMode.value = record.action === 'install' ? 'install' : 'update';
   acceptedCatalogPermissions.value = [];
-  remoteInstalling.value = false;
   catalogInstallOpen.value = true;
 }
 
 async function completeCatalogInstall() {
-  const current = operation.value;
+  const current = selectedOperation.value;
   if (!current || current.stage !== 'health-check') return;
   try {
     const installed = await props.store.completeCatalogInstall(current.operationId);
@@ -274,20 +280,16 @@ async function completeCatalogInstall() {
     message.success(`${installed.name} 已${catalogOperationMode.value === 'update' ? '升级' : '安装'}`);
   } catch {
     // The stable command error is rendered in-page.
-  } finally {
-    remoteInstalling.value = false;
   }
 }
 
 async function failCatalogInstall() {
-  const current = operation.value;
+  const current = selectedOperation.value;
   if (!current || current.stage !== 'health-check') return;
   try {
     await props.store.failCatalogInstall(current.operationId);
   } catch {
     // The stable command error is rendered in-page.
-  } finally {
-    remoteInstalling.value = false;
   }
 }
 
@@ -492,8 +494,8 @@ function formatBytes(bytes: number) {
                 <span class="app-description">{{ app.description }}</span>
               </span>
               <span class="row-meta">
-                <n-tag size="small" :type="catalogRowStatus(app, operation).type" :bordered="false">
-                  {{ catalogRowStatus(app, operation).label }}
+                <n-tag size="small" :type="catalogRowStatus(app, activeOperationForApp(app.appId)).type" :bordered="false">
+                  {{ catalogRowStatus(app, activeOperationForApp(app.appId)).label }}
                 </n-tag>
                 <span class="mono">{{ catalogRowVersion(app) }}</span>
               </span>
@@ -578,7 +580,7 @@ function formatBytes(bytes: number) {
                 v-if="selectedCatalog.updateAvailable"
                 secondary
                 :disabled="!selectedCatalog.remoteActionsAllowed"
-                :loading="remoteInstalling || store.busyAppIds.value.has(selectedCatalog.appId)"
+                :loading="selectedRemoteBusy"
                 @click="requestCatalogUpdate"
               >升级</n-button>
             </template>
@@ -586,7 +588,7 @@ function formatBytes(bytes: number) {
               v-else
               type="primary"
               :disabled="!selectedCatalog.remoteActionsAllowed"
-              :loading="remoteInstalling || store.busyAppIds.value.has(selectedCatalog.appId)"
+              :loading="selectedRemoteBusy"
               @click="requestCatalogInstall"
             >安装</n-button>
           </div>
@@ -724,8 +726,8 @@ function formatBytes(bytes: number) {
     </div>
 
     <PluginInstallProbe
-      v-if="operation?.stage === 'health-check' && operation.entry"
-      :operation="operation"
+      v-if="selectedOperation?.stage === 'health-check' && selectedOperation.entry && store.operationIsActive(selectedOperation.appId)"
+      :operation="selectedOperation"
       @ready="completeCatalogInstall"
       @failed="failCatalogInstall"
     />
@@ -755,7 +757,7 @@ function formatBytes(bytes: number) {
             v-if="requiredCatalogPermissions.length"
             v-model:value="acceptedCatalogPermissions"
             class="permission-checks"
-            :disabled="remoteInstalling"
+            :disabled="selectedRemoteBusy"
           >
             <n-checkbox
               v-for="permission in requiredCatalogPermissions"
@@ -799,12 +801,12 @@ function formatBytes(bytes: number) {
       <template #footer>
         <div class="modal-actions">
           <n-button @click="catalogInstallOpen = false">
-            {{ remoteInstalling ? '收起到后台' : '取消' }}
+            {{ selectedRemoteBusy ? '收起到后台' : '取消' }}
           </n-button>
           <n-button
             type="primary"
-            :disabled="!catalogPermissionsConfirmed || remoteInstalling"
-            :loading="remoteInstalling"
+            :disabled="!catalogPermissionsConfirmed || selectedRemoteBusy"
+            :loading="selectedRemoteBusy"
             @click="confirmCatalogInstall"
           >
             {{ selectedOperation?.stage === 'error' ? '重试' : catalogOperationMode === 'update' ? '下载并升级' : '下载并安装' }}

@@ -173,6 +173,7 @@ export interface PluginApi {
   failCatalogInstall(operationId: string): Promise<PluginOperationSnapshot>;
   getOperation(operationId: string): Promise<PluginOperationSnapshot>;
   getLatestOperation(): Promise<PluginOperationSnapshot | null>;
+  getLatestOperations(): Promise<PluginOperationSnapshot[]>;
   listenOperations(listener: (operation: PluginOperationSnapshot) => void): Promise<() => void>;
   confirmPluginLaunch(appId: string, version: string): Promise<boolean>;
   rollbackPluginLaunch(appId: string, version: string): Promise<InstalledPlugin | null>;
