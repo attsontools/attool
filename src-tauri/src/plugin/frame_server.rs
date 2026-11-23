@@ -497,9 +497,10 @@ fn escape_attribute(value: &str) -> String {
 fn status_for_error(error: &PluginCommandError) -> (u16, &'static str) {
     match error.code.as_str() {
         "PLUGIN_DISABLED" => (403, "Forbidden"),
-        "PLUGIN_NOT_FOUND" | "PLUGIN_ASSET_NOT_FOUND" | "PLUGIN_ASSET_NOT_DECLARED" => {
-            (404, "Not Found")
-        }
+        "PLUGIN_NOT_FOUND"
+        | "PLUGIN_ASSET_NOT_FOUND"
+        | "PLUGIN_DEV_ASSET_NOT_FOUND"
+        | "PLUGIN_ASSET_NOT_DECLARED" => (404, "Not Found"),
         "PLUGIN_ASSET_PATH_INVALID" => (400, "Bad Request"),
         "PLUGIN_ASSET_HASH_MISMATCH" => (409, "Conflict"),
         _ => (500, "Internal Server Error"),

@@ -5,6 +5,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(debug_assertions)]
+use std::fs;
+
 use ed25519_dalek::VerifyingKey;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
@@ -26,10 +29,138 @@ use super::{
     },
 };
 
+#[cfg(debug_assertions)]
+use super::install::content_type;
+
 const P0_TEST_PUBLIC_KEY: [u8; 32] = [
     0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
     0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
 ];
+
+#[cfg(debug_assertions)]
+const PLUGIN_DEV_OVERRIDES_ENV: &str = "ATTOOL_PLUGIN_DEV_OVERRIDES";
+
+#[cfg(debug_assertions)]
+fn load_dev_ui_roots() -> Result<HashMap<String, PathBuf>, String> {
+    let raw = match std::env::var(PLUGIN_DEV_OVERRIDES_ENV) {
+        Ok(raw) if !raw.trim().is_empty() => raw,
+        Ok(_) | Err(std::env::VarError::NotPresent) => return Ok(HashMap::new()),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!(
+                "{PLUGIN_DEV_OVERRIDES_ENV} must contain valid UTF-8 JSON"
+            ));
+        }
+    };
+    let configured: HashMap<String, String> = serde_json::from_str(&raw)
+        .map_err(|error| format!("cannot parse {PLUGIN_DEV_OVERRIDES_ENV}: {error}"))?;
+    let mut roots = HashMap::with_capacity(configured.len());
+    for (app_id, configured_root) in configured {
+        if !is_valid_dev_app_id(&app_id) {
+            return Err(format!("invalid plugin development app ID: {app_id}"));
+        }
+        if configured_root.trim().is_empty() {
+            return Err(format!("plugin development UI root is empty for {app_id}"));
+        }
+        let root = fs::canonicalize(&configured_root).map_err(|error| {
+            format!(
+                "cannot resolve plugin development UI root for {app_id} ({configured_root}): {error}"
+            )
+        })?;
+        if !root.is_dir() {
+            return Err(format!(
+                "plugin development UI root is not a directory for {app_id}: {}",
+                root.display()
+            ));
+        }
+        let entry = root.join("index.html");
+        if !entry.is_file() {
+            return Err(format!(
+                "plugin development UI entry does not exist for {app_id}: {}",
+                entry.display()
+            ));
+        }
+        eprintln!("[plugin-dev] using {app_id} UI from {}", root.display());
+        roots.insert(app_id, root);
+    }
+    Ok(roots)
+}
+
+#[cfg(debug_assertions)]
+fn is_valid_dev_app_id(value: &str) -> bool {
+    (value.contains('.') || value.contains('-'))
+        && value.split(['.', '-']).all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
+}
+
+#[cfg(debug_assertions)]
+fn read_dev_ui_asset(
+    root: &std::path::Path,
+    relative: &str,
+) -> Result<PluginAsset, PluginCommandError> {
+    let local_relative = relative.strip_prefix("ui/").ok_or_else(|| {
+        PluginCommandError::new(
+            "PLUGIN_ASSET_PATH_INVALID",
+            "Plugin development override only serves UI assets",
+        )
+    })?;
+    if !is_safe_dev_relative_path(local_relative) {
+        return Err(PluginCommandError::new(
+            "PLUGIN_ASSET_PATH_INVALID",
+            "Plugin development asset path is invalid",
+        ));
+    }
+    let unresolved = root.join(local_relative);
+    let resolved = fs::canonicalize(&unresolved).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            PluginCommandError::new(
+                "PLUGIN_DEV_ASSET_NOT_FOUND",
+                "Plugin development asset was not found",
+            )
+        } else {
+            PluginCommandError::new(
+                "PLUGIN_DEV_ASSET_READ_FAILED",
+                format!("Cannot resolve plugin development asset: {error}"),
+            )
+        }
+    })?;
+    if !resolved.starts_with(root) || resolved == root {
+        return Err(PluginCommandError::new(
+            "PLUGIN_ASSET_PATH_INVALID",
+            "Plugin development asset resolves outside its UI root",
+        ));
+    }
+    let bytes = fs::read(&resolved).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            PluginCommandError::new(
+                "PLUGIN_DEV_ASSET_NOT_FOUND",
+                "Plugin development asset was not found",
+            )
+        } else {
+            PluginCommandError::new(
+                "PLUGIN_DEV_ASSET_READ_FAILED",
+                format!("Cannot read plugin development asset: {error}"),
+            )
+        }
+    })?;
+    Ok(PluginAsset {
+        bytes,
+        content_type: content_type(relative),
+    })
+}
+
+#[cfg(debug_assertions)]
+fn is_safe_dev_relative_path(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('/')
+        && !value.contains('\\')
+        && value
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+}
 
 #[derive(Clone)]
 pub struct PluginRuntime {
@@ -40,6 +171,8 @@ pub struct PluginRuntime {
     operations: Arc<Mutex<HashMap<String, OperationSnapshot>>>,
     pending: Arc<Mutex<HashMap<String, PendingCatalogInstall>>>,
     frame_sessions: FrameSessionRuntime,
+    #[cfg(debug_assertions)]
+    dev_ui_roots: Arc<HashMap<String, PathBuf>>,
 }
 
 struct PendingCatalogInstall {
@@ -73,6 +206,8 @@ impl PluginRuntime {
     pub fn p0(store: PluginStore) -> Result<Self, String> {
         let key = VerifyingKey::from_bytes(&P0_TEST_PUBLIC_KEY)
             .map_err(|error| format!("invalid P0 plugin public key: {error}"))?;
+        #[cfg(debug_assertions)]
+        let dev_ui_roots = Arc::new(load_dev_ui_roots()?);
         Ok(Self {
             store: Arc::new(Mutex::new(store)),
             environment: HostEnvironment::current("2.0.0"),
@@ -86,7 +221,19 @@ impl PluginRuntime {
             operations: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             frame_sessions: FrameSessionRuntime::default(),
+            #[cfg(debug_assertions)]
+            dev_ui_roots,
         })
+    }
+
+    #[cfg(all(test, debug_assertions))]
+    fn p0_with_dev_ui_roots(
+        store: PluginStore,
+        dev_ui_roots: HashMap<String, PathBuf>,
+    ) -> Result<Self, String> {
+        let mut runtime = Self::p0(store)?;
+        runtime.dev_ui_roots = Arc::new(dev_ui_roots);
+        Ok(runtime)
     }
 
     fn inspect(&self, path: PathBuf) -> Result<InspectedPackage, PluginCommandError> {
@@ -148,13 +295,15 @@ impl PluginRuntime {
         app_id: &str,
         relative: &str,
     ) -> Result<PluginAsset, PluginCommandError> {
-        self.store
-            .lock()
-            .map_err(|_| {
-                PluginCommandError::new("PLUGIN_STORE_LOCK_FAILED", "Plugin store lock failed")
-            })?
-            .read_asset(app_id, relative)
-            .map_err(Into::into)
+        let store = self.store.lock().map_err(|_| {
+            PluginCommandError::new("PLUGIN_STORE_LOCK_FAILED", "Plugin store lock failed")
+        })?;
+        #[cfg(debug_assertions)]
+        if let Some(root) = self.dev_ui_roots.get(app_id) {
+            store.ensure_dev_asset_access(app_id, relative)?;
+            return read_dev_ui_asset(root, relative);
+        }
+        store.read_asset(app_id, relative).map_err(Into::into)
     }
 
     fn read_entry_html(
@@ -1458,7 +1607,8 @@ pub async fn plugin_rollback_plugin_launch(
 #[cfg(test)]
 mod tests {
     use std::{
-        fs::File,
+        collections::HashMap,
+        fs::{self, File},
         io::{Read, Write},
         net::TcpStream,
     };
@@ -1627,6 +1777,127 @@ mod tests {
             .unwrap();
         assert!(get(&probe.url).contains("<title>Frame test</title>"));
         probe_runtime.revoke_frame_session(&probe.session_id);
+    }
+
+    #[test]
+    fn debug_ui_override_serves_local_assets_for_an_installed_plugin() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = signed_test_package(directory.path());
+        let ui_root = directory.path().join("dist-plugin");
+        fs::create_dir_all(ui_root.join("assets")).unwrap();
+        fs::write(
+            ui_root.join("index.html"),
+            "<!doctype html><title>Local frame</title>",
+        )
+        .unwrap();
+        fs::write(ui_root.join("assets/app.js"), "globalThis.local = true;").unwrap();
+        let runtime = PluginRuntime::p0_with_dev_ui_roots(
+            PluginStore::open(directory.path().join("plugins")).unwrap(),
+            HashMap::from([("com.attson.frame-test".to_string(), ui_root)]),
+        )
+        .unwrap();
+        runtime.install(package).unwrap();
+
+        let frame = runtime
+            .create_frame_session("com.attson.frame-test".to_string(), None)
+            .unwrap();
+        assert!(get(&frame.url).contains("<title>Local frame</title>"));
+        runtime.revoke_frame_session(&frame.session_id);
+        assert_eq!(
+            runtime
+                .read_asset("com.attson.frame-test", "ui/assets/app.js")
+                .unwrap()
+                .bytes,
+            b"globalThis.local = true;"
+        );
+    }
+
+    #[test]
+    fn debug_ui_override_fails_closed_for_missing_assets_and_disabled_plugins() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = signed_test_package(directory.path());
+        let ui_root = directory.path().join("dist-plugin");
+        fs::create_dir_all(&ui_root).unwrap();
+        fs::write(
+            ui_root.join("index.html"),
+            "<!doctype html><title>Local frame</title>",
+        )
+        .unwrap();
+        let runtime = PluginRuntime::p0_with_dev_ui_roots(
+            PluginStore::open(directory.path().join("plugins")).unwrap(),
+            HashMap::from([("com.attson.frame-test".to_string(), ui_root)]),
+        )
+        .unwrap();
+        runtime.install(package).unwrap();
+
+        let missing = runtime
+            .read_asset("com.attson.frame-test", "ui/app.js")
+            .unwrap_err();
+        assert_eq!(missing.code, "PLUGIN_DEV_ASSET_NOT_FOUND");
+
+        runtime
+            .set_enabled("com.attson.frame-test".to_string(), false)
+            .unwrap();
+        let disabled = runtime
+            .read_asset("com.attson.frame-test", "ui/index.html")
+            .unwrap_err();
+        assert_eq!(disabled.code, "PLUGIN_DISABLED");
+    }
+
+    #[test]
+    fn debug_ui_override_rejects_uninstalled_plugins_and_unsafe_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let ui_root = directory.path().join("dist-plugin");
+        fs::create_dir_all(&ui_root).unwrap();
+        fs::write(ui_root.join("index.html"), "<!doctype html>").unwrap();
+        let runtime = PluginRuntime::p0_with_dev_ui_roots(
+            PluginStore::open(directory.path().join("plugins")).unwrap(),
+            HashMap::from([("com.attson.frame-test".to_string(), ui_root)]),
+        )
+        .unwrap();
+
+        let uninstalled = runtime
+            .read_asset("com.attson.frame-test", "ui/index.html")
+            .unwrap_err();
+        assert_eq!(uninstalled.code, "PLUGIN_NOT_FOUND");
+
+        let package = signed_test_package(directory.path());
+        runtime.install(package).unwrap();
+        for path in ["LICENSE", "ui/../LICENSE", "ui//index.html"] {
+            let error = runtime
+                .read_asset("com.attson.frame-test", path)
+                .unwrap_err();
+            assert_eq!(error.code, "PLUGIN_ASSET_PATH_INVALID", "path: {path}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn debug_ui_override_rejects_symlinks_outside_the_ui_root() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let package = signed_test_package(directory.path());
+        let ui_root = directory.path().join("dist-plugin");
+        fs::create_dir_all(&ui_root).unwrap();
+        fs::write(ui_root.join("index.html"), "<!doctype html>").unwrap();
+        fs::write(directory.path().join("secret.txt"), "secret").unwrap();
+        symlink(
+            directory.path().join("secret.txt"),
+            ui_root.join("escaped.txt"),
+        )
+        .unwrap();
+        let runtime = PluginRuntime::p0_with_dev_ui_roots(
+            PluginStore::open(directory.path().join("plugins")).unwrap(),
+            HashMap::from([("com.attson.frame-test".to_string(), ui_root)]),
+        )
+        .unwrap();
+        runtime.install(package).unwrap();
+
+        let error = runtime
+            .read_asset("com.attson.frame-test", "ui/escaped.txt")
+            .unwrap_err();
+        assert_eq!(error.code, "PLUGIN_ASSET_PATH_INVALID");
     }
 
     #[test]

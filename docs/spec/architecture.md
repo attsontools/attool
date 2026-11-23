@@ -115,6 +115,12 @@ HTTP 与剪贴板数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app
 - `@attson/plugin-sdk` 定义 manifest、签名 canonical JSON、浏览器 Host bridge 和稳定错误；`atcodec`、`attext`、`atgenerator`、`attime` 与 `atjson` 通过 Vite host alias 在 Standalone Adapter 与 Plugin Adapter 间切换，各自共享独立版和插件版的 Vue UI 与核心逻辑。
 - `athttp` 与 `atclipboard` 同样通过 Vite adapter 复用 UI：独立版直接连接本地 service，插件版经 Host API 2.x 转发到相同 service。两者的生产 `0.1.0-alpha.2` 均已通过五目标 Release、Catalog 安装/升级/回滚和真实 Tauri 验收。
 
+### 本地插件联调
+
+- `pnpm tauri:dev` 可读取仓库根目录下被 Git 忽略的 `.attool-plugins.local.json`，将显式配置的 `appId` 映射到插件 `dist-plugin` UI 根目录。启动器把相对路径解析为绝对路径并要求存在 `index.html`，不自动扫描或猜测兄弟仓库。
+- 本地 UI 覆盖只编译进 `debug_assertions` 构建。映射命中的应用仍须已安装且启用，只能读取映射目录内与签名入口对应的 `ui/` 资源；本地文件缺失、不可读或越界时明确失败，不回退已安装的旧资源。未映射应用继续使用 registry 中声明并通过 SHA-256 校验的资源。
+- release 构建不包含本地映射状态和读取分支，即使外部设置同名环境变量也只使用签名 registry；Native Service、权限和应用生命周期始终来自已安装包，不受本地 UI 覆盖影响。
+
 ### 官方 Catalog、升级与回滚
 
 - `catalog/v1/root.json` 授权 Catalog Signing Key 与各独立应用的 Publisher Key；Root 由离线 Root Key 签名，AT Tool 正式构建只嵌入 Root 公钥。Catalog 与 AT Tool updater 使用相互独立的密钥体系，每个应用使用独立 Publisher Key。
