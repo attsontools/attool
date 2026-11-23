@@ -22,7 +22,6 @@ import ShortcutErrorNotifier from './components/shell/ShortcutErrorNotifier.vue'
 import Dashboard from './components/shell/Dashboard.vue';
 import CommandPalette from './components/shell/CommandPalette.vue';
 import { useCommandPalette } from './composables/useCommandPalette';
-import StatPill from './components/ui/StatPill.vue';
 import Panel from './components/ui/Panel.vue';
 import TaskRow from './components/ui/TaskRow.vue';
 import { useSidebarState } from './composables/useSidebarState';
@@ -225,10 +224,6 @@ onUnmounted(() => {
   window.removeEventListener('keydown', handleHotkey);
 });
 
-const activeCount = computed(
-  () => tasks.value.filter((task) => task.status === 'queued' || task.status === 'running').length
-);
-const completedCount = computed(() => tasks.value.filter((task) => task.status === 'completed').length);
 const selectedTool = computed(() =>
   tools.value.find((tool) => tool.id === selectedToolId.value) ?? null
 );
@@ -470,7 +465,7 @@ async function clearCompleted() {
         :tools="tools"
         :active-id="selectedToolId"
         :collapsed="sidebarCollapsed"
-        :crumb="selectedTool?.name"
+        :full-bleed="selectedTool?.source === 'plugin'"
         :theme="theme"
         @select="selectTool"
         @toggle="toggleSidebar"
@@ -488,13 +483,6 @@ async function clearCompleted() {
             @dismiss="updaterDismiss"
           />
         </template>
-        <template #topbar-right>
-          <template v-if="selectedTool?.id === 'aria2'">
-            <StatPill tone="accent">进行中 {{ activeCount }}</StatPill>
-            <StatPill>已完成 {{ completedCount }}</StatPill>
-          </template>
-        </template>
-
         <Dashboard
           v-if="!selectedTool"
           :tools="tools"

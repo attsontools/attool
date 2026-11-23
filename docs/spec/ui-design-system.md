@@ -83,23 +83,22 @@
 
 ```
 ┌──────────┬────────────────────────────────────────────┐
-│  brand   │  [面包屑] 工具 / Aria2 下载    [pill][pill] │
-│  ⌘K      ├────────────────────────────────────────────┤
-│ ● Aria2  │                                            │
-│ ○ 模板   │   <slot />                                 │
+│  brand   │                                            │
+│  ⌘K      │                                            │
+│ ● Aria2  │   <slot />                                 │
+│ ○ 模板   │                                            │
 │ ○ 剪贴板  │                                            │
-│ ○ ...    │                                             │
-│ v0.1 ☀ ‹ │                                             │
+│ ○ ...    │                                            │
+│ v0.1 ☀ ‹ │                                            │
 └──────────┴────────────────────────────────────────────┘
 ```
 
-外壳自 v0.8.6 起：`AppShell` 用 `height: 100vh` 锁定视口，内容区自身滚动，sidebar 不再随内容一起滚走；工具列表不再分「已就绪 / 规划中」标题，全部工具在一个 `.nav` 容器里连续排列，容器自身可垂直滚动，工具再多也不会撑破外壳或推走底部按钮。
+`AppShell` 用 `height: 100vh` 锁定视口，内容区自身滚动，sidebar 不再随内容一起滚走；工具列表不再分「已就绪 / 规划中」标题，全部工具在一个 `.nav` 容器里连续排列，容器自身可垂直滚动，工具再多也不会撑破外壳或推走底部按钮。宿主不再渲染重复的顶栏，搜索、主题和设置入口统一收在 sidebar；插件应用填满内容区，品牌顶栏由插件仅在 standalone 模式展示。
 
 | 部件 | 文件 | 关键行为 |
 |---|---|---|
-| AppShell | `src/components/shell/AppShell.vue` | sidebar + topbar + content slot；外壳 `height: 100vh`（v0.8.6+） |
+| AppShell | `src/components/shell/AppShell.vue` | sidebar + banner slot + content slot；外壳 `height: 100vh`，插件内容支持 full-bleed |
 | Sidebar | `src/components/shell/Sidebar.vue` | 220 ↔ 56 折叠（`useSidebarState`），无分组标题（v0.8.6+），活跃项 emerald 高亮，⌘K 打开命令面板，底部 theme toggle + collapse toggle |
-| Topbar | `src/components/shell/Topbar.vue` | 面包屑 `工具 / <name>` + 右侧 pill 槽（工具自定义渲染） |
 | Dashboard | `src/components/shell/Dashboard.vue` | 首屏：欢迎语 + 上次使用 + 快速入口；首次启动落在这里，之后恢复 `useLastTool` |
 | BrandMark | `src/components/shell/BrandMark.vue` | 26px emerald 方块 "A" |
 | ToolIcon | `src/components/shell/ToolIcon.vue` | 内联 SVG 图标库（`download / layout / clipboard / type / wifi / hash`），`stroke="currentColor"` 让色彩随父容器流转 |
@@ -110,7 +109,6 @@
 |---|---|
 | `Panel` | 卡片容器（替代多数 NCard）。带 title slot + right slot + body slot；body 可加 `flush` 去 padding |
 | `TaskRow` | Aria2 任务行：标题 + url + 速度/ETA/% + 3px 进度条 + 取消/打开按钮 |
-| `StatPill` | Topbar 右侧 pill。tone: `default / accent / warning / error` |
 | `Kbd` | 键盘快捷键标签（如 `⌘K`） |
 
 ## Naive UI 主题策略
@@ -125,7 +123,7 @@
 - `Modal`（color）
 - `Slider`（fillColor / railColor / handleColor）
 
-少数复杂组件**不使用 Naive UI**（自写更可控）：sidebar / topbar / dashboard / panel / task-row / stat-pill / kbd / brand-mark / tool-icon / layer 系列。
+少数复杂组件**不使用 Naive UI**（自写更可控）：sidebar / dashboard / panel / task-row / kbd / brand-mark / tool-icon / layer 系列。
 
 ## 多工具通用 UI 模式
 

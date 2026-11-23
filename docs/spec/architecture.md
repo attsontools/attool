@@ -6,10 +6,10 @@
 ┌──────────────────────────────────────────────────────────┐
 │  Vue 3 SFC（src/）                                       │
 │  ├─ App.vue          主路由壳 + theme + Aria2 工具页       │
-│  ├─ shell/*          AppShell / Sidebar / Topbar /        │
+│  ├─ shell/*          AppShell / Sidebar / Dashboard /     │
 │  │                   Dashboard / SettingsModal /           │
 │  │                   UpdateBanner / ...                    │
-│  ├─ ui/*             Panel / TaskRow / StatPill / Kbd     │
+│  ├─ ui/*             Panel / TaskRow / Kbd                │
 │  ├─ <5 工具>/*       image / network / douyin /            │
 │  │                   ecommerce / ai                       │
 │  │                   （懒加载）                             │
@@ -181,7 +181,7 @@ HTTP 与剪贴板数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app
 ### 前端
 
 - `src/composables/useUpdater.ts`：兼容旧 UI 接口（`state / check / install / relaunch / dismiss`）；内部 `invoke() + listen('updater://state')`
-- UI：`SettingsModal.vue`（sidebar 齿轮打开）+ `UpdateBanner.vue`（topbar 下）
+- UI：`SettingsModal.vue`（sidebar 齿轮打开）+ `UpdateBanner.vue`（内容区顶部）
 
 ## 关键模块
 

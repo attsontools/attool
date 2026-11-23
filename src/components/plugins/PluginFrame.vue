@@ -442,10 +442,8 @@ onBeforeUnmount(() => {
   position: relative;
   width: 100%;
   height: 100%;
-  min-height: 480px;
+  min-height: 0;
   overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-md);
   background: var(--bg-elevated);
 }
 
@@ -460,7 +458,7 @@ iframe {
   display: block;
   width: 100%;
   height: 100%;
-  min-height: 480px;
+  min-height: 0;
   border: 0;
   background: var(--bg-base);
 }

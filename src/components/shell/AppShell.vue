@@ -1,13 +1,12 @@
 <script setup lang="ts">
 import Sidebar from './Sidebar.vue';
-import Topbar from './Topbar.vue';
 import type { Tool } from '../../types/tool';
 
 defineProps<{
   tools: Tool[];
   activeId: string | null;
   collapsed: boolean;
-  crumb?: string;
+  fullBleed?: boolean;
   theme: 'dark' | 'light';
 }>();
 
@@ -36,13 +35,8 @@ const emit = defineEmits<{
       @settings-toggle="emit('settingsToggle')"
     />
     <main class="main">
-      <Topbar :crumb="crumb" @search="emit('search')">
-        <template #right>
-          <slot name="topbar-right" />
-        </template>
-      </Topbar>
       <slot name="banner" />
-      <div class="content">
+      <div class="content" :class="{ 'content--full-bleed': fullBleed }">
         <slot />
       </div>
     </main>
@@ -68,5 +62,10 @@ const emit = defineEmits<{
   min-height: 0;
   overflow: auto;
   padding: 18px 22px;
+}
+
+.content--full-bleed {
+  overflow: hidden;
+  padding: 0;
 }
 </style>
