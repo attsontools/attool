@@ -739,6 +739,7 @@ describe('Catalog release generation', () => {
       assert.deepEqual(Object.keys(inspected.manifest.files).sort(), [
         'LICENSE',
         'licenses/aria2-COPYING',
+        'licenses/aria2-LICENSE.OpenSSL',
         'native/aria2c',
         'native/ataria2-service',
         'ui/assets/app.js',
@@ -753,7 +754,7 @@ describe('Catalog release generation', () => {
         {
           application: aria2Application,
           publisherKeyId: aria2PublisherKeyId,
-          omitFile: 'licenses/aria2-COPYING'
+          omitFile: 'licenses/aria2-LICENSE.OpenSSL'
         }
       );
       await assert.rejects(
@@ -1466,9 +1467,7 @@ async function createPluginPackage(
     const payloads = {
       LICENSE: Buffer.from('AT Aria2 license fixture'),
       'licenses/aria2-COPYING': Buffer.from('aria2 GPL fixture'),
-      ...(os === 'windows'
-        ? { 'licenses/aria2-LICENSE.OpenSSL': Buffer.from('OpenSSL notice fixture') }
-        : {}),
+      'licenses/aria2-LICENSE.OpenSSL': Buffer.from('OpenSSL notice fixture'),
       [`native/aria2c${os === 'windows' ? '.exe' : ''}`]: Buffer.from(`aria2-${os}-${arch}`),
       'ui/assets/app.js': Buffer.from('console.log("aria2 fixture")')
     };
