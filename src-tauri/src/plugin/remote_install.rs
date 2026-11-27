@@ -14,7 +14,8 @@ use super::{
     package::{AuxiliaryWindow, InspectedPackage, NativeService},
 };
 
-const DOWNLOAD_ATTEMPTS: usize = 4;
+const DOWNLOAD_NO_PROGRESS_ATTEMPTS: usize = 4;
+const DOWNLOAD_MAX_SEGMENTS: usize = 64;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -280,7 +281,9 @@ pub async fn download_artifact(
         })?;
         let mut downloaded = 0_u64;
         let mut hash = Sha256::new();
-        for attempt in 0..DOWNLOAD_ATTEMPTS {
+        let mut no_progress_attempts = 0;
+        for segment in 0..DOWNLOAD_MAX_SEGMENTS {
+            let segment_start = downloaded;
             let response = match send_with_fallback_from(
                 client,
                 &artifact.url,
@@ -289,10 +292,11 @@ pub async fn download_artifact(
             .await
             {
                 Ok(response) => response,
-                Err(_error) if attempt + 1 < DOWNLOAD_ATTEMPTS => {
-                    continue;
-                }
                 Err(error) => {
+                    no_progress_attempts += 1;
+                    if no_progress_attempts < DOWNLOAD_NO_PROGRESS_ATTEMPTS {
+                        continue;
+                    }
                     let code = if downloaded == 0 {
                         "PLUGIN_DOWNLOAD_HTTP_FAILED"
                     } else {
@@ -342,7 +346,14 @@ pub async fn download_artifact(
             let interruption = interrupted.unwrap_or_else(|| {
                 "response ended before the Catalog size was reached".to_string()
             });
-            if attempt + 1 == DOWNLOAD_ATTEMPTS {
+            if downloaded > segment_start {
+                no_progress_attempts = 0;
+            } else {
+                no_progress_attempts += 1;
+            }
+            if no_progress_attempts >= DOWNLOAD_NO_PROGRESS_ATTEMPTS
+                || segment + 1 == DOWNLOAD_MAX_SEGMENTS
+            {
                 return Err(download_interrupted(Some(&interruption)));
             }
         }
@@ -514,6 +525,79 @@ mod tests {
                 .await
                 .unwrap();
             resumed.write_all(&body[interrupted_at..]).await.unwrap();
+        });
+        format!("http://{address}/codec.atpkg")
+    }
+
+    async fn serve_repeated_interruptions(
+        body: Vec<u8>,
+        chunk_size: usize,
+        interruptions: usize,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut offset = 0;
+            for request_index in 0..=interruptions {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                let read = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+                if offset > 0 {
+                    assert!(request.contains(&format!("range: bytes={offset}-")));
+                }
+                let status = if offset == 0 {
+                    "HTTP/1.1 200 OK".to_string()
+                } else {
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}",
+                        offset,
+                        body.len() - 1,
+                        body.len()
+                    )
+                };
+                stream
+                    .write_all(
+                        format!(
+                            "{status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len() - offset
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                let end = if request_index < interruptions {
+                    (offset + chunk_size).min(body.len())
+                } else {
+                    body.len()
+                };
+                stream.write_all(&body[offset..end]).await.unwrap();
+                stream.shutdown().await.unwrap();
+                offset = end;
+            }
+        });
+        format!("http://{address}/codec.atpkg")
+    }
+
+    async fn serve_empty_responses(content_length: usize, attempts: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..attempts {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                let _ = stream.read(&mut request).await;
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                stream.shutdown().await.unwrap();
+            }
         });
         format!("http://{address}/codec.atpkg")
     }
@@ -735,6 +819,42 @@ mod tests {
 
         assert_eq!(tokio::fs::read(&destination).await.unwrap(), body);
         assert_eq!(progress.last(), Some(&interrupted_artifact.size));
+    }
+
+    #[tokio::test]
+    async fn resumes_after_more_than_four_interruptions_when_each_attempt_makes_progress() {
+        let body = b"signed plugin package resumed across many interrupted responses".to_vec();
+        let url = serve_repeated_interruptions(body.clone(), 8, 5).await;
+        let interrupted_artifact = artifact(url, &body);
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("codec.atpkg");
+
+        download_artifact(
+            &reqwest::Client::new(),
+            &interrupted_artifact,
+            &destination,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(tokio::fs::read(destination).await.unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn stops_retrying_when_repeated_interruptions_make_no_progress() {
+        let body = b"complete package".to_vec();
+        let url = serve_empty_responses(body.len(), 4).await;
+        let artifact = artifact(url, &body);
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("codec.atpkg");
+
+        let error = download_artifact(&reqwest::Client::new(), &artifact, &destination, |_| {})
+            .await
+            .expect_err("repeated empty responses must fail");
+
+        assert_eq!(error.code, "PLUGIN_DOWNLOAD_INTERRUPTED");
+        assert!(!destination.exists());
     }
 
     #[tokio::test]
