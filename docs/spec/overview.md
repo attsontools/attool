@@ -16,7 +16,7 @@ attool 是一个个人使用的桌面工具集合，运行在 Tauri 2 上。前�
 - 官方 Catalog 由 AT Tool 主仓维护并签名，平台可按当前 OS/架构远程安装和主动升级多个官方应用；新版本先进入 `pending`，健康检查与原子切换通过后成为 `current`，失败时保留或恢复上一可用版本。
 - HTTP 已完全外置为 `com.attson.http`：`athttp` 独立版和官方 Catalog 插件复用同一 UI、请求核心与 `${app_data_dir}/http/http.sqlite3`，由单一 Native/Data Service 提供请求、长连接和数据 API。平台只保留 Host API 2.x 桥接和 service supervisor，不再包含内置 HTTP UI、Store、Tauri commands 或 SQLite owner。
 - 剪贴板已完全外置为 `com.attson.clipboard`：`atclipboard` 独立版和官方 Catalog 插件复用同一 UI 与 `${app_data_dir}/clipboard`，由单一 background Native Service 持有历史、监听和快捷键。平台只保留 Host API 2.x、service supervisor、签名辅助窗口及通用系统剪贴板写入，不再包含内置剪贴板 UI、commands、SQLite owner 或固定历史/预览窗口。
-- 视频链接抽取的 `com.attson.video` 独立版与签名插件复用同一 UI、`atvideo-service` 和独立 YouTube runtime，并可通过 Host activation 把链接交给动态 Aria2；五目标 workflow、生产签名隔离、精确十资产和 Catalog 包布局已完成本地验证。生产 Publisher、正式 Release 与 Catalog 生命周期仍待远端验证，宿主内置视频入口及共享 runtime 在 P3 前继续保留。
+- 视频链接抽取的 `com.attson.video` 独立版与签名插件复用同一 UI、`atvideo-service` 和独立 YouTube runtime，并可通过 Host activation 把链接交给动态 Aria2；生产 Publisher、五目标 Release、生产 Catalog、安装升级回滚与停启卸载重装生命周期均已验证，紧凑布局版 `0.1.0-alpha.2` 已进入 Catalog sequence 28。宿主内置视频入口及共享 runtime 在退场 PR 合入前继续保留。
 - 插件平台支持页面关闭后继续连接的 `background` Native Service，以及由 manifest 声明、宿主隔离承载的底部面板和居中对话框辅助窗口。后台连接首次失败或意外断开不会阻止平台启动，而会在应用仍启用时按有界退避自动恢复；停用、卸载和显式断开会停止恢复。应用入口和管理页会显示 `recovering` 等连接状态、稳定错误码与关联 ID。
 
 下面详列两个“重后端”内置工具与 HTTP、剪贴板独立应用，其余见汇总表。
