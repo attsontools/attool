@@ -583,7 +583,7 @@ function requireApplicationPackageLayout(application, manifest) {
   const expectedFiles = [
     'LICENSE',
     'licenses/aria2-COPYING',
-    ...(windows ? ['licenses/aria2-LICENSE.OpenSSL'] : []),
+    'licenses/aria2-LICENSE.OpenSSL',
     `native/aria2c${windows ? '.exe' : ''}`,
     serviceEntry,
     'ui/index.html'
