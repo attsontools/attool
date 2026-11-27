@@ -1066,6 +1066,30 @@ impl PluginStore {
             .collect())
     }
 
+    #[cfg(debug_assertions)]
+    pub(super) fn ensure_dev_asset_access(
+        &self,
+        app_id: &str,
+        relative: &str,
+    ) -> Result<(), InstallError> {
+        if !is_safe_relative_path(relative) {
+            return Err(InstallError::new(
+                "PLUGIN_ASSET_PATH_INVALID",
+                "Plugin asset path is invalid",
+            ));
+        }
+        let plugin = self.find(app_id)?.ok_or_else(|| {
+            InstallError::new("PLUGIN_NOT_FOUND", "Installed plugin was not found")
+        })?;
+        if !plugin.enabled {
+            return Err(InstallError::new(
+                "PLUGIN_DISABLED",
+                "Plugin is not enabled",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn read_asset(&self, app_id: &str, relative: &str) -> Result<PluginAsset, InstallError> {
         if !is_safe_relative_path(relative) {
             return Err(InstallError::new(
@@ -2042,7 +2066,7 @@ fn remove_directory_if_exists(path: &Path, code: &str, context: &str) -> Result<
     }
 }
 
-fn content_type(path: &str) -> &'static str {
+pub(super) fn content_type(path: &str) -> &'static str {
     match Path::new(path).extension().and_then(|value| value.to_str()) {
         Some("html") | Some("htm") => "text/html; charset=utf-8",
         Some("js") | Some("mjs") => "text/javascript; charset=utf-8",

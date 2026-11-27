@@ -48,9 +48,9 @@ src/
 │                                #   / useFileDrop / useAria2Handoff
 │                                #   / usePluginStore（应用 registry / Catalog / 生命周期）
 ├── components/
-│   ├── shell/                   # 外壳：AppShell / Sidebar / Topbar / Dashboard / ToolIcon
+│   ├── shell/                   # 外壳：AppShell / Sidebar / Dashboard / ToolIcon
 │   │                            #   / SettingsModal / UpdateBanner / ShortcutErrorNotifier
-│   ├── ui/                      # 通用原子：Panel / TaskRow / StatPill / Kbd
+│   ├── ui/                      # 通用原子：Panel / TaskRow / Kbd
 │   ├── plugins/                 # 应用管理、隔离 iframe、Host API 与 Catalog UI
 │   ├── ecommerce/               # 主图模板：TemplateTool + 5 子组件（图层树/属性/画布/资源/批量）
 │   ├── image/                   # 图片：ImageTool（tabs：压缩/转换/EXIF/标注/OCR/截图）
@@ -119,7 +119,7 @@ docs/tasks/                      # 本地任务过程稿（intent / roadmap / sp
   - `apply/macos.rs` tar 解 `.app.tar.gz` + rename swap `.app.old` + `open` 拉起
   - `apply/windows.rs` PowerShell Expand-Archive + embed `update-windows.bat`（timeout + 同步替换主程序和 PSD sidecar + start）
   - `apply/linux.rs` embed `install-linux.sh`（等父进程死 + tar 解 + 同步替换主程序和 PSD sidecar / 失败走 `pkexec` 提权 + `setsid` 分离）
-- UI：sidebar 底部齿轮打开 `SettingsModal`；topbar 下方 `UpdateBanner`；发现新版点"现在安装"触发 download + apply
+- UI：sidebar 底部齿轮打开 `SettingsModal`；内容区顶部显示 `UpdateBanner`；发现新版点"现在安装"触发 download + apply
 
 ### 密钥（Ed25519）
 

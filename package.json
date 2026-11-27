@@ -11,7 +11,7 @@
     "build:psd-sidecar": "node .github/scripts/build-psd-sidecar.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
-    "tauri:dev": "tauri dev",
+    "tauri:dev": "tsx scripts/tauri-dev.ts",
     "tauri:build": "tauri build --config src-tauri/tauri.release.conf.json",
     "publish:catalog": "tsx .github/scripts/publish-catalog.mjs",
     "rotate:catalog-keys": "tsx .github/scripts/rotate-catalog-keys.mjs",

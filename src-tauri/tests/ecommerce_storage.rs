@@ -35,6 +35,7 @@ fn sample_project() -> TemplateProject {
                 align: Some(TextAlign::Center),
                 font_style: Some(TextFontStyle::Italic),
                 text_decoration: Some(TextDecoration::Underline),
+                orientation: None,
                 background_color: Some("#fff1b8".to_string()),
                 background_radius: Some(12.0),
                 shadow_color: Some("#000000".to_string()),

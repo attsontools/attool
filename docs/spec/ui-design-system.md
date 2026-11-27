@@ -83,23 +83,22 @@
 
 ```
 ┌──────────┬────────────────────────────────────────────┐
-│  brand   │  [面包屑] 工具 / Aria2 下载    [pill][pill] │
-│  ⌘K      ├────────────────────────────────────────────┤
-│ ● Aria2  │                                            │
-│ ○ 模板   │   <slot />                                 │
+│  brand   │                                            │
+│  ⌘K      │                                            │
+│ ● Aria2  │   <slot />                                 │
+│ ○ 模板   │                                            │
 │ ○ 剪贴板  │                                            │
-│ ○ ...    │                                             │
-│ v0.1 ☀ ‹ │                                             │
+│ ○ ...    │                                            │
+│ v0.1 ☀ ‹ │                                            │
 └──────────┴────────────────────────────────────────────┘
 ```
 
-外壳自 v0.8.6 起：`AppShell` 用 `height: 100vh` 锁定视口，内容区自身滚动，sidebar 不再随内容一起滚走；工具列表不再分「已就绪 / 规划中」标题，全部工具在一个 `.nav` 容器里连续排列，容器自身可垂直滚动，工具再多也不会撑破外壳或推走底部按钮。
+`AppShell` 用 `height: 100vh` 锁定视口，内容区自身滚动，sidebar 不再随内容一起滚走；工具列表不再分「已就绪 / 规划中」标题，全部工具在一个 `.nav` 容器里连续排列，容器自身可垂直滚动，工具再多也不会撑破外壳或推走底部按钮。宿主不再渲染重复的顶栏，搜索、主题和设置入口统一收在 sidebar；插件应用占满内容区高度并保留紧凑的左右 gutter，品牌顶栏由插件仅在 standalone 模式展示。
 
 | 部件 | 文件 | 关键行为 |
 |---|---|---|
-| AppShell | `src/components/shell/AppShell.vue` | sidebar + topbar + content slot；外壳 `height: 100vh`（v0.8.6+） |
+| AppShell | `src/components/shell/AppShell.vue` | sidebar + banner slot + content slot；外壳 `height: 100vh`，插件内容使用紧凑左右 gutter |
 | Sidebar | `src/components/shell/Sidebar.vue` | 220 ↔ 56 折叠（`useSidebarState`），无分组标题（v0.8.6+），活跃项 emerald 高亮，⌘K 打开命令面板，底部 theme toggle + collapse toggle |
-| Topbar | `src/components/shell/Topbar.vue` | 面包屑 `工具 / <name>` + 右侧 pill 槽（工具自定义渲染） |
 | Dashboard | `src/components/shell/Dashboard.vue` | 首屏：欢迎语 + 上次使用 + 快速入口；首次启动落在这里，之后恢复 `useLastTool` |
 | BrandMark | `src/components/shell/BrandMark.vue` | 26px emerald 方块 "A" |
 | ToolIcon | `src/components/shell/ToolIcon.vue` | 内联 SVG 图标库（`download / layout / clipboard / type / wifi / hash`），`stroke="currentColor"` 让色彩随父容器流转 |
@@ -110,7 +109,6 @@
 |---|---|
 | `Panel` | 卡片容器（替代多数 NCard）。带 title slot + right slot + body slot；body 可加 `flush` 去 padding |
 | `TaskRow` | Aria2 任务行：标题 + url + 速度/ETA/% + 3px 进度条 + 取消/打开按钮 |
-| `StatPill` | Topbar 右侧 pill。tone: `default / accent / warning / error` |
 | `Kbd` | 键盘快捷键标签（如 `⌘K`） |
 
 ## Naive UI 主题策略
@@ -125,7 +123,7 @@
 - `Modal`（color）
 - `Slider`（fillColor / railColor / handleColor）
 
-少数复杂组件**不使用 Naive UI**（自写更可控）：sidebar / topbar / dashboard / panel / task-row / stat-pill / kbd / brand-mark / tool-icon / layer 系列。
+少数复杂组件**不使用 Naive UI**（自写更可控）：sidebar / dashboard / panel / task-row / kbd / brand-mark / tool-icon / layer 系列。
 
 ## 多工具通用 UI 模式
 
@@ -134,7 +132,7 @@
 - **工具页容器**：`Panel`（`title` + 右上 `#right` slot）分区；多子功能的内置工具（图片 / 网络）用顶部 tab 切分 pane。
 - **快捷键录制**：图片截图页和录屏页提供"修改 / 恢复默认"按钮 + 键盘录制框（`keydown` 捕获组合键），注册失败时就地红色 alert 提示。剪贴板快捷键与错误状态由独立应用设置页维护。
 - **多窗口**：统一捕获浮层（`capture-overlay`，透明全屏，顶部切换截图 / 录屏；截图支持选区 + 标注，录屏支持区域 / 窗口 / 全屏与区域调整）和截图钉图窗（`capture-pin-*`）由宿主持有。插件辅助窗口由签名 manifest 声明为 `bottomPanel` 或 `centeredDialog`；剪贴板 history/preview 也走该通用路径，由宿主决定尺寸、位置、置顶和无边框样式，窗口内容仍由 `PluginFrame` 的主题通知和 opaque iframe 隔离。
-- **插件应用容器**：`PluginFrame` 填满宿主工具内容区，不额外套卡片；loading、连接和错误状态由宿主统一呈现。插件内部设计由对应应用仓库维护，但必须通过 Host API 主题通知跟随当前 dark / light 主题。
+- **插件应用容器**：`PluginFrame` 填满宿主工具内容区高度，宿主只保留 12px 左右 gutter，不额外套卡片；loading、连接和错误状态由宿主统一呈现。插件内部设计由对应应用仓库维护，但必须通过 Host API 主题通知跟随当前 dark / light 主题。
 
 ## 模板编辑器画布
 
