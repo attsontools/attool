@@ -154,6 +154,8 @@ AT.Tool_<v>_amd64.app.tar.gz
 AT.Tool_<v>_amd64.exe.zip       # updater 归档（Windows exe + PSD sidecar）
 AT.Tool_<v>_amd64.tar.gz        # updater 归档（Linux 二进制 + PSD sidecar + layer-shell 运行库）
 AT.Tool_<v>_arm64.tar.gz
+
+aria2-1.37.0-source.tar.gz      # GPL 源码合规制品（固定版本与 SHA-256）
 ```
 
 **Linux 覆盖**：v0.8.5 起 Linux `.deb` 装的用户也走 in-app 升级；`install-linux.sh` 覆盖 `/usr/bin/attool` 通过 `pkexec` 提权，无 pkexec 环境会友好报错并要求手动 `sudo mv`。
@@ -173,9 +175,9 @@ AT.Tool_<v>_arm64.tar.gz
 3. tag push 触发 `.github/workflows/build.yml`：
 
    - **build job（matrix × 5）**：每个 runner 先跑「Sync version from git tag」步骤，把 `github.ref_name` 去掉 `v` 前缀写入三个版本号文件；然后 `pnpm tauri build --target <triple>`，跑完 `stage-bundles.sh` 把 dmg/deb/exe 复制到 `runner.temp/stage` 并**同时打包 updater archive**（macOS 用 `tar` 打 `.app`；Windows 用 `7z` 打 exe；Linux 用 `tar` 打二进制与 layer-shell 运行库），上传成 artifact
-   - **release job（单 ubuntu，`environment: prod`）**：下载所有 artifact 到一个目录 → `find` 生成 `SHA256SUMS` → `sign-checksums.mjs` 签成 `.sig` → `gh release create` 直接发布正式 release（不再走草稿）
+   - **release job（单 ubuntu，`environment: prod`）**：下载所有 artifact 到一个目录 → 按 runtime manifest 下载并校验 aria2 源码包 → `find` 生成 `SHA256SUMS` → `sign-checksums.mjs` 签成 `.sig` → `gh release create` 直接发布正式 release（不再走草稿）
 
-4. 全部跑完（约 6-10 分钟）后 GitHub Releases 会直接公开正式 release。文件名应该正好是上面 §Release 产物列的 12 个
+4. 全部跑完后 GitHub Releases 会直接公开正式 release。文件名应该正好是上面 §Release 产物列的 13 个
 
 5. release 公开后约 5 分钟（GitHub CDN 缓存），装着旧版的客户端启动 5 秒就会看到 banner
 

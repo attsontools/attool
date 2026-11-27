@@ -345,9 +345,10 @@ export function useTheme(
 2. **release job（单 ubuntu-latest，`environment: prod`）** 仅在 tag push 时跑
 
    - `actions/download-artifact@v4 merge-multiple: true` 把 5 个 bundle artifact 合并到一个目录
-   - `find` 生成 `SHA256SUMS`（覆盖所有 dmg / deb / exe / tar.gz / zip）
+   - 按 `runtime-manifest.json` 下载固定版本的 `aria2-1.37.0-source.tar.gz`，并在发布前校验固定 SHA-256
+   - `find` 生成 `SHA256SUMS`（覆盖 10 个安装/更新制品和 aria2 源码包）
    - `node .github/scripts/sign-checksums.mjs SHA256SUMS`（读 `ATTOOL_UPDATE_SIGNING_PRIVATE_KEY` env）产 `SHA256SUMS.sig`
-   - `gh release create <tag> --title "AT Tool <tag>" --notes "" <all files>` 直接发布正式 release
+   - `gh release create <tag> --title "AT Tool <tag>" --notes "" <all files>` 直接发布包含 13 个资产的正式 release
 
 ### 触发条件
 
