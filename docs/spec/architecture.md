@@ -133,7 +133,7 @@ HTTP 与剪贴板数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app
 ### Catalog 发布链
 
 - 独立应用的一个 tag 由受保护 `prod` Environment 构建五个目标，每个目标同时产生独立安装包和 Publisher 签名 `.atpkg`。普通应用的正式 Release 必须恰好包含十个非空资产；Aria2 还必须附带固定 SHA-256 的 `aria2-1.37.0-source.tar.gz`，共十一项。
-- `.github/catalog/apps.json` 是官方应用来源注册表，固定声明 `appId`、仓库、资产前缀、展示信息、Host API、权限和 Publisher secret 名。`.github/workflows/catalog.yml` 只接受注册表中的 `attsontools/*` 公开 Release，通过 `gh-proxy.com` 下载五个 `.atpkg`，逐包核对不可变 Release URL、文件名、目标、版本、Publisher Key、签名、Host API、权限、文件集合与 hash；Aria2 包还必须包含目标对应的 `ataria2-service`、`aria2c`、COPYING 和 Windows OpenSSL notice，Template 包必须包含目标对应的 `attemplate-service`、`psd-bridge` 和 LICENSE，Video 包必须包含目标对应的 `atvideo-service`、`youtube-bridge`、QuickJS、runtime manifest、主许可证和三份第三方许可证，这些应用的额外文件都只允许位于已签名的 `ui/` 目录。
+- `.github/catalog/apps.json` 是官方应用来源注册表，固定声明 `appId`、仓库、资产前缀、展示信息、Host API、权限和 Publisher secret 名。`.github/workflows/catalog.yml` 只接受注册表中的 `attsontools/*` 公开 Release，通过 `gh-proxy.com` 下载五个 `.atpkg`，逐包核对不可变 Release URL、文件名、目标、版本、Publisher Key、签名、Host API、权限、文件集合与 hash；Aria2 包还必须包含目标对应的 `ataria2-service`、`aria2c`、COPYING 和 OpenSSL notice，Template 包必须包含目标对应的 `attemplate-service`、`psd-bridge` 和 LICENSE，Video 包必须包含目标对应的 `atvideo-service`、`youtube-bridge`、QuickJS、runtime manifest、主许可证和三份第三方许可证，这些应用的额外文件都只允许位于已签名的 `ui/` 目录。
 - Catalog 发布器先离线验证已提交的 Root 和上一版 Catalog，再使用 Root 授权且处于有效窗口的 Catalog Signing Key 生成 7 天有效、严格递增的下一序列。首次发布从 `sequence: 1` 开始；已有应用只接受严格更高版本，首次接入的应用追加到 `apps` 且不得改写其他应用。
 - `.github/workflows/catalog-renew.yml` 每周一、周四续签 Catalog：递增序列并更新生成与过期时间，但必须逐字保留 `apps` 及其制品信息；续签只能使用 Root 当前授权且处于有效窗口的 Catalog Signing Key。
 - 发布和续签共享 `production-catalog` 并发组，且任一 `catalog/*` PR 未合并时都拒绝生成新候选，避免多个候选从同一序列分叉。
