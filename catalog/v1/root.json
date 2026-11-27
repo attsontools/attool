@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "sequence": 10,
-  "issuedAt": "2026-11-17T09:16:42.000Z",
+  "sequence": 11,
+  "issuedAt": "2026-11-27T16:06:35.000Z",
   "expiresAt": "2031-11-11T03:17:47.000Z",
   "catalogKeys": [
     {
@@ -97,6 +97,14 @@
           "status": "active",
           "notBefore": "2026-11-17T09:16:42.000Z",
           "notAfter": "2027-11-17T09:16:42.000Z"
+        },
+        {
+          "keyId": "attson-aria2-2026-01",
+          "algorithm": "ed25519",
+          "publicKey": "Z43uiKJexZvk4H29nmLbyH1E5XLYkOifGFJl3Dzu+RM=",
+          "status": "active",
+          "notBefore": "2026-11-27T16:06:35.000Z",
+          "notAfter": "2027-11-27T16:06:35.000Z"
         }
       ]
     }
