@@ -1,6 +1,6 @@
 # AGENTS.md
 
-个人桌面工具箱（Tauri 2 + Vue 3 + Naive UI）。平台内置 Aria2 下载、主图模板、视频链接抽取、图片（含跨平台截图与录屏）、网络、AI 对话（多提供商多模型 AI 助手：OpenAI 兼容 / Anthropic Claude / 本地 Ollama，流式 Markdown + 会话侧栏 + 模型热切换）。剪贴板、HTTP 请求、编码转换、文本工具、生成器、时间工具与 JSON 工具通过官方 Catalog 作为独立应用按需安装；剪贴板与 HTTP 使用 Host API 2.x + Native/Data Service 复用原有本地数据。
+个人桌面工具箱（Tauri 2 + Vue 3 + Naive UI）。平台内置主图模板、视频链接抽取、图片（含跨平台截图与录屏）、网络、AI 对话（多提供商多模型 AI 助手：OpenAI 兼容 / Anthropic Claude / 本地 Ollama，流式 Markdown + 会话侧栏 + 模型热切换）。Aria2 下载、剪贴板、HTTP 请求、编码转换、文本工具、生成器、时间工具与 JSON 工具通过官方 Catalog 作为独立应用按需安装；Aria2、剪贴板与 HTTP 使用 Host API 2.x + Native/Data Service 复用原有本地数据。
 
 ## 技术栈
 
@@ -14,7 +14,7 @@
 | 本地存储 | rusqlite（bundled SQLite） |
 | 截图 | macOS core-graphics / Linux·Windows xcap 0.8 |
 | 更新 | 自研 updater（Ed25519 签名 SHA256SUMS + 平台专用 apply 脚本，覆盖 mac/win/**Linux**） |
-| 外部命令 | `aria2c`（下载）；PSD 解析器以 PyInstaller sidecar 随正式包分发 |
+| 外部命令 | PSD 解析器以 PyInstaller sidecar 随正式包分发；Aria2 runtime 只随独立应用分发 |
 
 ## 常用命令
 
@@ -40,17 +40,17 @@ pnpm test           # vitest run
 
 ```
 src/
-├── App.vue                      # 顶层：theme switch + AppShell + 工具路由 + Aria2 UI
+├── App.vue                      # 顶层：theme switch + AppShell + 工具路由
 ├── main.ts                      # 仅引样式 + mount
 ├── styles/                      # tokens.css（设计 token）/ reset.css / template-editor.css
 ├── theme/index.ts               # Naive UI darkOverrides + lightOverrides
 ├── composables/                 # useTheme / useSidebarState / useLastTool / useUpdater
-│                                #   / useFileDrop / useAria2Handoff
+│                                #   / useFileDrop
 │                                #   / usePluginStore（应用 registry / Catalog / 生命周期）
 ├── components/
 │   ├── shell/                   # 外壳：AppShell / Sidebar / Dashboard / ToolIcon
 │   │                            #   / SettingsModal / UpdateBanner / ShortcutErrorNotifier
-│   ├── ui/                      # 通用原子：Panel / TaskRow / Kbd
+│   ├── ui/                      # 通用原子：Panel / Kbd
 │   ├── plugins/                 # 应用管理、隔离 iframe、Host API 与 Catalog UI
 │   ├── ecommerce/               # 主图模板：TemplateTool + 5 子组件（图层树/属性/画布/资源/批量）
 │   ├── image/                   # 图片：ImageTool（tabs：压缩/转换/EXIF/标注/OCR/截图）
@@ -62,12 +62,12 @@ src/
 │                                #   / AiMessageBubble + AiComposer + AiModelPicker
 │                                #   / AiSettingsModal + AiSystemPromptDrawer
 │                                #   + aiApi.ts / markdown.ts（手写渲染器）/ useAiChat.ts（带测试）
-├── types/                       # tool.ts / download.ts / ecommerceTemplate.ts
-└── utils/                       # ecommerceTemplate.ts / downloadFormat.ts 等
+├── types/                       # tool.ts / ecommerceTemplate.ts 等
+└── utils/                       # ecommerceTemplate.ts 等
 
 src-tauri/
 ├── build.rs                     # 注入 ATTOOL_UPDATE_VERIFY_PUBLIC_KEY 到 OUT_DIR/verify_public_key.pem
-├── src/lib.rs                   # 主入口 run() + Aria2 下载全部逻辑 + command 注册
+├── src/lib.rs                   # 主入口 run() + command 注册 + Aria2 旧库接管标记
 ├── src/clipboard/               # 系统图片剪贴板写入 + Linux capture layer-shell
 ├── src/imaging/                 # 图片：commands / compress / convert / exif / ocr
 │                                #   / capture（截图）/ windows（xcap 窗口枚举）
@@ -155,7 +155,6 @@ AT.Tool_<v>_amd64.exe.zip       # updater 归档（Windows exe + PSD sidecar）
 AT.Tool_<v>_amd64.tar.gz        # updater 归档（Linux 二进制 + PSD sidecar + layer-shell 运行库）
 AT.Tool_<v>_arm64.tar.gz
 
-aria2-1.37.0-source.tar.gz      # GPL 源码合规制品（固定版本与 SHA-256）
 ```
 
 **Linux 覆盖**：v0.8.5 起 Linux `.deb` 装的用户也走 in-app 升级；`install-linux.sh` 覆盖 `/usr/bin/attool` 通过 `pkexec` 提权，无 pkexec 环境会友好报错并要求手动 `sudo mv`。
@@ -175,9 +174,9 @@ aria2-1.37.0-source.tar.gz      # GPL 源码合规制品（固定版本与 SHA-2
 3. tag push 触发 `.github/workflows/build.yml`：
 
    - **build job（matrix × 5）**：每个 runner 先跑「Sync version from git tag」步骤，把 `github.ref_name` 去掉 `v` 前缀写入三个版本号文件；然后 `pnpm tauri build --target <triple>`，跑完 `stage-bundles.sh` 把 dmg/deb/exe 复制到 `runner.temp/stage` 并**同时打包 updater archive**（macOS 用 `tar` 打 `.app`；Windows 用 `7z` 打 exe；Linux 用 `tar` 打二进制与 layer-shell 运行库），上传成 artifact
-   - **release job（单 ubuntu，`environment: prod`）**：下载所有 artifact 到一个目录 → 按 runtime manifest 下载并校验 aria2 源码包 → `find` 生成 `SHA256SUMS` → `sign-checksums.mjs` 签成 `.sig` → `gh release create` 直接发布正式 release（不再走草稿）
+   - **release job（单 ubuntu，`environment: prod`）**：下载所有 artifact 到一个目录 → `find` 生成 `SHA256SUMS` → `sign-checksums.mjs` 签成 `.sig` → `gh release create` 直接发布正式 release（不再走草稿）
 
-4. 全部跑完后 GitHub Releases 会直接公开正式 release。文件名应该正好是上面 §Release 产物列的 13 个
+4. 全部跑完后 GitHub Releases 会直接公开正式 release。文件名应该正好是上面 §Release 产物列的 12 个
 
 5. release 公开后约 5 分钟（GitHub CDN 缓存），装着旧版的客户端启动 5 秒就会看到 banner
 
@@ -200,7 +199,8 @@ aria2-1.37.0-source.tar.gz      # GPL 源码合规制品（固定版本与 SHA-2
 - 不要在组件里写散装 hex 色、`rgba(...)`、不在 token 列表里的 `border-radius`
 - 不要在 `<style scoped>` 里复制粘贴另一个组件的样式（应该走 token + 共享 class，或者放到 `src/styles/*.css`）
 - 不要把 `--bg-base` / `--text` 等 dark 假设硬写进选择器（应该让 `[data-theme=light]` 自动接管）
-- 不要在 `src/App.vue` 里塞业务逻辑 —— 当前已经是路由壳 + Aria2 工具，不要再扩。新增工具走独立组件
+- 不要在 `src/App.vue` 里塞业务逻辑 —— 当前只保留路由与平台装配；新增工具走独立组件
+- 不要把 Aria2 内置 UI、下载 commands、宿主 SQLite owner 或 bundled runtime 加回来；下载只通过 Catalog 应用、Host activation、Host API 2.x 和 Native Service 提供
 - 不要把 HTTP 内置实现、宿主 HTTP SQLite owner 或旧 Tauri commands 加回来；HTTP 只通过 Catalog 应用、Host API 2.x 和 Native/Data Service 提供
 - 不要把"电商图片处理"功能加回来（已弃，主图模板覆盖该场景）
 - 不要重新引入 `tauri-plugin-updater` / `tauri-plugin-process` —— 已被自研 updater 替代

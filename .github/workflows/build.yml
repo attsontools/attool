@@ -113,8 +113,7 @@ jobs:
         with:
           path: |
             ${{ runner.temp }}/attool-vcpkg
-            ${{ runner.temp }}/attool-native
-          key: native-runtimes-v1-${{ matrix.os }}-${{ matrix.target }}-${{ hashFiles('src-tauri/vcpkg.json', 'src-tauri/runtime-manifest.json', '.github/scripts/build-aria2.mjs') }}
+          key: native-runtimes-v1-${{ matrix.os }}-${{ matrix.target }}-${{ hashFiles('src-tauri/vcpkg.json', 'src-tauri/runtime-manifest.json') }}
 
       - name: Build pinned native runtimes
         if: steps.native-runtime-cache.outputs.cache-hit != 'true'
@@ -128,9 +127,6 @@ jobs:
           PREFIX="$INSTALL_ROOT/${{ matrix.vcpkg }}"
           TESSERACT=$(find "$PREFIX/tools/tesseract" -maxdepth 2 -type f \( -name tesseract -o -name tesseract.exe \) | head -1)
           test -n "$TESSERACT"
-          if [[ "${{ matrix.target }}" == *windows* ]]; then ARIA2_NAME=aria2c.exe; else ARIA2_NAME=aria2c; fi
-          ARIA2="${RUNNER_TEMP}/attool-native/$ARIA2_NAME"
-          ATTOOL_NATIVE_RUNTIME_PREFIX="$PREFIX" node .github/scripts/build-aria2.mjs "${{ matrix.target }}" "$ARIA2"
 
       - name: Configure pinned native runtimes
         shell: bash
@@ -139,11 +135,7 @@ jobs:
           PREFIX="$INSTALL_ROOT/${{ matrix.vcpkg }}"
           TESSERACT=$(find "$PREFIX/tools/tesseract" -maxdepth 2 -type f \( -name tesseract -o -name tesseract.exe \) | head -1)
           test -n "$TESSERACT"
-          if [[ "${{ matrix.target }}" == *windows* ]]; then ARIA2_NAME=aria2c.exe; else ARIA2_NAME=aria2c; fi
-          ARIA2="${RUNNER_TEMP}/attool-native/$ARIA2_NAME"
-          test -f "$ARIA2"
           echo "ATTOOL_TESSERACT_PATH=$TESSERACT" >> "$GITHUB_ENV"
-          echo "ATTOOL_ARIA2_PATH=$ARIA2" >> "$GITHUB_ENV"
           echo "ATTOOL_NATIVE_RUNTIME_PREFIX=$PREFIX" >> "$GITHUB_ENV"
 
       - name: Save pinned native runtimes
@@ -152,7 +144,6 @@ jobs:
         with:
           path: |
             ${{ runner.temp }}/attool-vcpkg
-            ${{ runner.temp }}/attool-native
           key: ${{ steps.native-runtime-cache.outputs.cache-primary-key }}
 
       - name: Install PSD sidecar build dependencies
@@ -230,12 +221,6 @@ jobs:
       - name: Generate SHA256SUMS
         working-directory: ${{ runner.temp }}/all-bundles
         run: |
-          ARIA2_VERSION=$(node -e "process.stdout.write(require('${{ github.workspace }}/src-tauri/runtime-manifest.json').aria2.version)")
-          ARIA2_SHA256=$(node -e "process.stdout.write(require('${{ github.workspace }}/src-tauri/runtime-manifest.json').aria2.sourceSha256)")
-          curl --retry 3 -fsSL \
-            "https://github.com/aria2/aria2/releases/download/release-${ARIA2_VERSION}/aria2-${ARIA2_VERSION}.tar.gz" \
-            -o aria2-1.37.0-source.tar.gz
-          printf '%s  %s\n' "$ARIA2_SHA256" aria2-1.37.0-source.tar.gz | sha256sum --check --strict
           find . -maxdepth 1 -type f \
             \( -name '*.dmg' -o -name '*.deb' -o -name '*.exe' \
                -o -name '*.tar.gz' -o -name '*.zip' \) \

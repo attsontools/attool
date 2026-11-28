@@ -5,11 +5,11 @@
 ```
 ┌──────────────────────────────────────────────────────────┐
 │  Vue 3 SFC（src/）                                       │
-│  ├─ App.vue          主路由壳 + theme + Aria2 工具页       │
+│  ├─ App.vue          主路由壳 + theme + 平台装配           │
 │  ├─ shell/*          AppShell / Sidebar / Dashboard /     │
 │  │                   Dashboard / SettingsModal /           │
 │  │                   UpdateBanner / ...                    │
-│  ├─ ui/*             Panel / TaskRow / Kbd                │
+│  ├─ ui/*             Panel / Kbd                          │
 │  ├─ <5 工具>/*       image / network / douyin /            │
 │  │                   ecommerce / ai                       │
 │  │                   （懒加载）                             │
@@ -18,14 +18,14 @@
 │  ├─ plugins/*        应用管理 / PluginFrame / Host API     │
 │  ├─ theme/index.ts   Naive UI overrides（dark + light）    │
 │  ├─ styles/*.css     tokens + reset + template-editor     │
-│  ├─ types/*          Tool / DownloadTask / Template...    │
-│  └─ utils/*          ecommerceTemplate / downloadFormat   │
+│  ├─ types/*          Tool / Template...                   │
+│  └─ utils/*          ecommerceTemplate 等                 │
 │                                                          │
 │           ↕ invoke() / listen()                          │
 │                                                          │
 │  Rust（src-tauri/src/）                                  │
 │  ├─ build.rs         注入 updater 公钥 → OUT_DIR/*.pem     │
-│  ├─ lib.rs           run() + Aria2 下载 + command 注册    │
+│  ├─ lib.rs           run() + command 注册 + 接管标记       │
 │  ├─ embedded_runtime / bundled_tools  内置运行时释放与定位 │
 │  ├─ clipboard/       系统图片剪贴板写入 + capture 浮层     │
 │  ├─ imaging/         压缩/转换/EXIF/OCR/截图（xcap）       │
@@ -41,7 +41,7 @@
 │           ↕ Command::new / xcap / reqwest                │
 │                                                          │
 │  内置运行时 / 系统能力                                     │
-│  ├─ aria2c / tesseract    内嵌并释放到版本化缓存           │
+│  ├─ tesseract             内嵌并释放到版本化缓存           │
 │  ├─ psd-bridge sidecar    Python + psd-tools + yt-dlp    │
 │  ├─ QuickJS / GStreamer plugins  YouTube / Linux 录屏    │
 │  ├─ xcap / core-graphics  屏幕截图                        │
@@ -55,7 +55,7 @@
 
 - **请求-响应：** `invoke<T>('command_name', { arg })` （`@tauri-apps/api/core`）
 - **流式事件：** Rust `app_handle.emit("event-name", payload)` → 前端 `listen<T>('event-name', cb)`
-  - `download-progress`（aria2 输出解析后推送）、`capture-overlay-init` / `capture-failed`（统一捕获浮层）、`capture-overlay-recording-toggle`（录屏快捷键切换 / 停止）、`recording://completed` / `recording://native-error`（录屏结果与原生错误）、`updater://state`（自研 updater 状态机推送）、`plugin://native-service-event`（Native Service 事件统一转发）等
+  - `capture-overlay-init` / `capture-failed`（统一捕获浮层）、`capture-overlay-recording-toggle`（录屏快捷键切换 / 停止）、`recording://completed` / `recording://native-error`（录屏结果与原生错误）、`updater://state`（自研 updater 状态机推送）、`plugin://native-service-event`（Native Service 事件统一转发）等
 - **错误：** Rust 命令返回 `Result<T, String>`，前端 `try { await invoke(...) } catch (e)` 捕获
 
 ## 状态分层
@@ -64,11 +64,11 @@
 |---|---|---|
 | UI session | Vue ref | 当前选中工具、表单值、loading flags（应用退出即清） |
 | 浏览器持久 | `localStorage` | sidebar 折叠状态、上次打开工具、主题、属性面板折叠 |
-| 应用持久 | rusqlite（Tauri data dir） | 下载任务历史、模板项目 / 素材库、插件 registry 与管理历史 |
+| 应用持久 | rusqlite（Tauri data dir） | 模板项目 / 素材库、插件 registry 与管理历史 |
 | updater 缓存 | 文件（`app_cache_dir/updater/`） | 已下载但未 apply 的 archive stage |
-| 临时 | Tauri runtime State | 进行中的下载子进程句柄（`DownloadTasks`）、录屏分块文件 / Wayland 原生录制 session（`RecordingStore`）、Updater 状态机 `UpdaterState`、插件 registry/runtime 与 Native Service supervisor |
+| 临时 | Tauri runtime State | 录屏分块文件 / Wayland 原生录制 session（`RecordingStore`）、Updater 状态机 `UpdaterState`、插件 registry/runtime 与 Native Service supervisor |
 
-HTTP 与剪贴板数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app_data_dir}/clipboard/clipboard_history.sqlite3`，但不属于宿主 rusqlite 状态。对应 Native/Data Service 独占数据库、迁移和领域状态；平台只把原数据目录交给已验签 service。停用或卸载插件默认保留数据，平台启动不打开、改写或删除两者数据库。
+HTTP、剪贴板与 Aria2 数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app_data_dir}/clipboard/clipboard_history.sqlite3`、`${app_data_dir}/aria2/aria2-tasks.sqlite3`，但不属于宿主 rusqlite 状态。对应 Native/Data Service 独占数据库、迁移和领域状态；平台只把原数据目录交给已验签 service。停用或卸载插件默认保留数据，平台启动不打开、改写或删除这些数据库。Aria2 旧根库只作为 service 的迁移源，宿主仅在其存在时写 capability marker。
 
 ## 可插拔应用
 
@@ -103,7 +103,7 @@ HTTP 与剪贴板数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app
 
 `com.attson.clipboard` 的独立版与插件版复用 `atclipboard-service`，固定原位接管 `${app_data_dir}/clipboard`，并通过 `host.clipboard.history` 的双层白名单访问。service 以生命周期锁和 `migrating / owned` marker 保证单一 owner；旧设置表为空时沿用历史默认值且不改写数据库，部分缺失或非法设置继续 fail closed。正式后台 watcher 通过同一已验签 service 可执行文件启动短生命周期 helper 读取系统剪贴板；父进程对整份文本、文件和图片快照设置固定时限，超时终止并回收 helper、清理随机临时文件，本轮失败不部分入库且不阻塞后续采集。公共图片条目不得返回 asset、数据库或缓存路径，预览只接受 PNG/JPEG/WebP base64 data URL 且整串不超过 2 MiB；列表单页最多 100 条。后台采集、三类恢复、暂停、保留策略、清空未收藏、停启、卸载、重装、升级和首启失败回滚已通过两版生产 Catalog 与真实 500 条旧库验证；Wayland 插件模式使用宿主 `--plugin-window` 命令激活签名 history 窗口。宿主旧 UI、SQLite owner、watcher、领域快捷键、commands 和固定窗口已删除；停用或卸载插件不触发宿主回退。
 
-`com.attson.aria2` 已完成双制品、五目标正式 Release 与完整 Catalog 生命周期验证：独立 Tauri 与签名 `.atpkg` 复用同一 Vue UI 和 `ataria2-service`，service 通过跨平台文件锁独占 `${app_data_dir}/aria2`、SQLite、固定 aria2 1.37.0 runtime 和取消句柄。首次接管先要求宿主写入 capability，再写 `migrating` marker，并以 SQLite exclusive barrier 等待 marker 前的旧写事务完成；一致快照通过 schema、完整性和行数校验后切换为永久 `owned`。旧库保留只读，宿主旧 owner 的所有读写在 marker 存在时拒绝，写路径取得 SQLite write transaction 后还会再次检查，停用或卸载插件也不恢复旧 owner。生产 Publisher 已授权，`alpha.0` 的安装、真实下载、停启、卸载保留数据与重装恢复历史，以及 `alpha.0 → alpha.1` 升级、首启失败回滚和再次升级均已通过正式制品与生产 Catalog sequence 31 验证；宿主内置 Aria2 仍保留到 P3 物理退场完成。
+`com.attson.aria2` 已完成双制品、五目标正式 Release 与完整 Catalog 生命周期验证：独立 Tauri 与签名 `.atpkg` 复用同一 Vue UI 和 `ataria2-service`，service 通过跨平台文件锁独占 `${app_data_dir}/aria2`、SQLite、固定 aria2 1.37.0 runtime 和取消句柄。首次接管先要求宿主写入 capability，再写 `migrating` marker，并以 SQLite exclusive barrier 等待 marker 前的旧写事务完成；一致快照通过 schema、完整性和行数校验后切换为永久 `owned`。旧库保留只读，停用或卸载插件也不恢复旧 owner。生产 Publisher 已授权，`alpha.0` 的安装、真实下载、停启、卸载保留数据与重装恢复历史，以及 `alpha.0 → alpha.1` 升级、首启失败回滚和再次升级均已通过正式制品与生产 Catalog sequence 31 验证。宿主现只在旧根库存在时幂等写入 capability marker，不再包含第二套 UI、commands、SQLite owner、下载事件或 aria2c runtime；动态应用是唯一入口。
 
 `com.attson.video` 的独立 Tauri 与签名 `.atpkg` 复用同一 Vue 页面、`atvideo-service` 协议和固定的 yt-dlp 2026.10.21、yt-dlp-ejs 0.8.0、QuickJS-ng 0.17.0 runtime bytes。插件只声明 `host.theme.read`、`host.video.extract`、`host.clipboard.write`、`host.external.open`、`host.app.activate`，Host 与 service 共同限制五个视频方法、平台 host、精确参数和无凭证代理；30 秒平台/runtime 超时外由 standalone client 和 Host 各保留 35 秒响应预算。动态 Video 通过 `host.app.activate` 把有界 URL 批次交给动态 Aria2，Aria2 原子填入输入框但不自动创建任务。Linux x86_64 最终测试包已通过签名重装、全部 native hash/`0700` 权限、四平台解析、复制、外链、断线后 remount、停启、卸载重装和 Video 到 Aria2 流程；五目标原生 runner workflow、固定 SDK 提交、生产/测试签名隔离、runtime smoke、精确十资产和 Catalog 包布局已完成验证。生产 Publisher 已授权，`alpha.0 → alpha.1` 的安装、升级、失败回滚、停启、卸载和重装生命周期已通过生产 Catalog 验证；紧凑布局版 `alpha.2` 的五目标 Release 与生产 Catalog sequence 28 也已完成。宿主内置视频实现和共享 runtime 在退场 PR 合入前继续保留。
 
@@ -111,7 +111,7 @@ HTTP 与剪贴板数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app
 
 - `usePluginStore` 从 Tauri registry 加载插件并生成动态 `Tool`；“应用管理”固定在侧栏平台分组，负责本地包预览、权限确认、安装、启停、卸载、筛选和历史查看。
 - 动态 `Tool` 按稳定 `appId` 归入下载、编辑、网络或实用分组，未知应用回退到实用；侧栏与命令面板均消费同一个 `Tool.group`，Catalog schema 不承载宿主导航分组。
-- 平台不再内置 `codec`、`text`、`generator`、`time`、`json`、`http` 与 `clipboard`；对应插件是这些工具在平台中的唯一入口。停用或卸载插件后，平台不提供回退版内置工具。
+- 平台不再内置 `codec`、`text`、`generator`、`time`、`json`、`http`、`clipboard` 与 `aria2`；对应插件是这些工具在平台中的唯一入口。停用或卸载插件后，平台不提供回退版内置工具。
 - `@attson/plugin-sdk` 定义 manifest、签名 canonical JSON、浏览器 Host bridge 和稳定错误；`atcodec`、`attext`、`atgenerator`、`attime` 与 `atjson` 通过 Vite host alias 在 Standalone Adapter 与 Plugin Adapter 间切换，各自共享独立版和插件版的 Vue UI 与核心逻辑。
 - `athttp` 与 `atclipboard` 同样通过 Vite adapter 复用 UI：独立版直接连接本地 service，插件版经 Host API 2.x 转发到相同 service。两者的生产 `0.1.0-alpha.2` 均已通过五目标 Release、Catalog 安装/升级/回滚和真实 Tauri 验收。
 
@@ -199,7 +199,7 @@ HTTP 与剪贴板数据分别位于 `${app_data_dir}/http/http.sqlite3`、`${app
 - 起 composable：`useSidebarState` / `useLastTool` / `useTheme`
 - Naive UI ConfigProvider 切换主题
 - 渲染 `<AppShell>` + `<template v-else-if="selectedTool.id === '<id>'">` 分支
-- 嵌入 Aria2 工具页（典型 form + list 形态，作为参考实现）
+- 以可信 adapter 把内置视频 URL 批次交给通用 Host activation coordinator
 - 注册全局快捷键 `⌘\` / `⌘K`
 
 ### `src/composables/`
@@ -239,11 +239,11 @@ export function useTheme(
 
 ### 后端模块概览
 
-`lib.rs` 承载主入口 `run()`、Aria2 下载全部逻辑与 command 注册；其余能力按模块拆分：
+`lib.rs` 承载主入口 `run()`、通用 command 注册与 Aria2 旧库 capability marker；其余能力按模块拆分：
 
 | 模块 | 职责 | 关键 command |
 |---|---|---|
-| `lib.rs` | Aria2 下载（正式版启动内置 `aria2c` + 进度事件）、command 注册 | `start_download` / `cancel_download` / `list_download_tasks` / `open_external_url` |
+| `lib.rs` | 应用装配、通用 command 注册、Aria2 旧库 capability marker | `open_external_url` 等通用 command |
 | `clipboard/` | 截图/钉图共用的跨平台系统图片剪贴板写入，以及 Linux capture overlay layer-shell | 无领域 command |
 | `imaging/` | 图片压缩 / 转换 / EXIF / OCR / 截图与统一捕获浮层 | `compress_images` / `convert_images` / `read·strip_image_exif` / `ocr_image` / `ocr_capture_overlay` / `capture_screen` / `open·commit·pin_capture_overlay` / `get·set_capture_shortcut` |
 | `recording.rs` / `recording_preview.rs` | 录屏快捷键、Web 分块缓存、Wayland 来源准备 / 区域裁剪 / 编码控制、完成结果交接、只读 Range 预览、保存与清理 | `get·set_recording_shortcut` / `prepare·start·pause·resume·stop·cancel_native_recording` / `begin·append·finish_recording_file` / `present_recording_result` / `recording_preview_url` / `save·discard_recording_file` / `default_recording_path` |
@@ -255,7 +255,7 @@ export function useTheme(
 
 ### 内置运行时
 
-- `runtime-manifest.json` 固定 Tesseract、tessdata、Aria2、yt-dlp、yt-dlp-ejs、QuickJS-ng 与 Linux GStreamer ABI 的版本和来源校验值。
+- `runtime-manifest.json` 固定 Tesseract、tessdata、yt-dlp、yt-dlp-ejs、QuickJS-ng 与 Linux GStreamer ABI 的版本和来源校验值；Aria2 runtime 由 `ataria2` 自己发布，不进入宿主 manifest。
 - CI 在五个发布目标编译前准备并 smoke-test 对应资产；`build.rs` 只在 release 构建中要求资产完整，并把文件生成为 `include_bytes!` 定义嵌入主程序。
 - `embedded_runtime.rs` 把各运行时释放到用户缓存的 `attool/runtime/<name>/<version>/`。文件按内容校验，经同目录临时文件原子落盘；损坏文件会自动修复，旧版本目录尽力清理。
 - 正式版只使用内置运行时；debug 可通过 `ATTOOL_*` 环境变量指定开发程序，缺省时允许使用系统 `PATH`。
@@ -345,10 +345,9 @@ export function useTheme(
 2. **release job（单 ubuntu-latest，`environment: prod`）** 仅在 tag push 时跑
 
    - `actions/download-artifact@v4 merge-multiple: true` 把 5 个 bundle artifact 合并到一个目录
-   - 按 `runtime-manifest.json` 下载固定版本的 `aria2-1.37.0-source.tar.gz`，并在发布前校验固定 SHA-256
-   - `find` 生成 `SHA256SUMS`（覆盖 10 个安装/更新制品和 aria2 源码包）
+   - `find` 生成 `SHA256SUMS`（覆盖 10 个安装/更新制品）
    - `node .github/scripts/sign-checksums.mjs SHA256SUMS`（读 `ATTOOL_UPDATE_SIGNING_PRIVATE_KEY` env）产 `SHA256SUMS.sig`
-   - `gh release create <tag> --title "AT Tool <tag>" --notes "" <all files>` 直接发布包含 13 个资产的正式 release
+   - `gh release create <tag> --title "AT Tool <tag>" --notes "" <all files>` 直接发布包含 12 个资产的正式 release
 
 ### 触发条件
 
@@ -430,3 +429,7 @@ Root 私钥保持离线，日常 Catalog 只使用 Root 授权的独立 Signing 
 ### 2026-11-16 视频应用自持完整解析运行时
 
 `atvideo` 的独立版和插件版共同持有四平台解析 service、专用 YouTube bridge 与固定 QuickJS runtime，不复用宿主或主图模板的 PSD sidecar。相比继续调用宿主命令或立即重写纯 Rust YouTube 提取器，该方案增加独立制品体积和 runtime 发布成本，但保证双制品行为一致，并允许宿主视频实现最终完整退场。
+
+### 2026-11-29 Aria2 仅保留独立应用入口
+
+生产替代版本完成安装、升级、回滚与数据接管验证后，平台删除内置 Aria2 UI、commands、SQLite owner、下载事件和 bundled runtime，只保留动态入口、Host activation、Native Service 桥接与旧根库 capability marker。相比保留隐藏回退或只读命令，完整退场避免双 owner 和重复 runtime，并确保停用或卸载后不会恢复旧实现。

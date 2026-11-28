@@ -18,10 +18,10 @@ describe('useLastTool', () => {
     expect(lastToolId.value).toBeNull();
   });
 
-  it('returns stored last tool id', () => {
+  it('maps the removed aria2 tool to the external application', () => {
     const { storage } = fakeStorage({ 'attool.lastTool': 'aria2' });
     const { lastToolId } = useLastTool(storage);
-    expect(lastToolId.value).toBe('aria2');
+    expect(lastToolId.value).toBe('plugin:com.attson.aria2');
   });
 
   it('maps the removed recording tool to the integrated image tool', () => {

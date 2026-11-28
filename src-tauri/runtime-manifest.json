@@ -12,12 +12,6 @@
       "jpn"
     ]
   },
-  "aria2": {
-    "version": "1.37.0",
-    "commit": "02f2d0d8472b3c38c29b4dba8c75ebd5fdd2899a",
-    "sourceSha256": "8e7021c6d5e8f8240c9cc19482e0c8589540836747744724d86bf8af5a21f0e8",
-    "windowsAssetSha256": "67d015301eef0b612191212d564c5bb0a14b5b9c4796b76454276a4d28d9b288"
-  },
   "ytDlp": {
     "version": "2026.10.21",
     "sha256": "cbf748d7d17cd37647c4b9f07b6c25f24384bfd4361407ee5ec519e753d22539",

@@ -10,7 +10,6 @@ const root = resolve('src-tauri/binaries/runtime', target);
 const windows = target.includes('windows');
 const tesseract = resolve(root, 'tesseract/bin', windows ? 'tesseract.exe' : 'tesseract');
 const tessdata = resolve(root, 'tesseract/tessdata');
-const aria2 = resolve(root, 'aria2/bin', windows ? 'aria2c.exe' : 'aria2c');
 const quickjs = resolve(root, 'quickjs/bin', windows ? 'qjs.exe' : 'qjs');
 
 assertCommand(tesseract, ['--version'], manifest.tesseract.version);
@@ -18,7 +17,6 @@ const languages = assertCommand(tesseract, ['--tessdata-dir', tessdata, '--list-
 for (const language of manifest.tessdata.languages) {
   if (!languages.split(/\r?\n/).includes(language)) throw new Error(`Tesseract does not list ${language}`);
 }
-assertCommand(aria2, ['--version'], manifest.aria2.version);
 const quickJsResult = spawnSync(quickjs, ['--help'], { encoding: 'utf8' });
 const quickJsOutput = `${quickJsResult.stdout || ''}\n${quickJsResult.stderr || ''}`;
 if (!quickJsOutput.includes(`QuickJS-ng version ${manifest.quickJs.version}`)) {

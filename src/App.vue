@@ -1,19 +1,11 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, onMounted, onUnmounted, ref } from 'vue';
 import {
-  NAlert,
-  NButton,
   NConfigProvider,
-  NInput,
-  NInputGroup,
-  NInputNumber,
   NMessageProvider,
-  NSelect,
   darkTheme
 } from 'naive-ui';
 import { darkOverrides, lightOverrides } from './theme';
-import { invoke } from '@tauri-apps/api/core';
-import { open } from '@tauri-apps/plugin-dialog';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import TemplateTool from './components/ecommerce/TemplateTool.vue';
@@ -22,21 +14,18 @@ import ShortcutErrorNotifier from './components/shell/ShortcutErrorNotifier.vue'
 import Dashboard from './components/shell/Dashboard.vue';
 import CommandPalette from './components/shell/CommandPalette.vue';
 import { useCommandPalette } from './composables/useCommandPalette';
-import Panel from './components/ui/Panel.vue';
-import TaskRow from './components/ui/TaskRow.vue';
 import { useSidebarState } from './composables/useSidebarState';
 import { useLastTool } from './composables/useLastTool';
 import { useTheme } from './composables/useTheme';
-import { useAria2Handoff } from './composables/useAria2Handoff';
 import { usePluginStore } from './composables/usePluginStore';
 import { builtinTools } from './builtinTools';
 import UpdateBanner from './components/shell/UpdateBanner.vue';
 import SettingsModal from './components/shell/SettingsModal.vue';
 import { useUpdater } from './composables/useUpdater';
 import { useUpdaterPrefs } from './composables/useUpdaterPrefs';
-import type { DownloadEventPayload, DownloadTask, StartDownloadRequest } from './types/download';
 import type { Tool } from './types/tool';
 import { createAppActivationCoordinator } from './components/plugins/appActivation';
+import { createBuiltinDownloadActivator } from './components/plugins/builtinDownloadActivation';
 import {
   publishRecordingResult,
   requestCaptureMode,
@@ -69,23 +58,6 @@ const isCapturePinWindow = currentWindow.label.startsWith('capture-pin-');
 const CaptureOverlay = defineAsyncComponent(() => import('./components/image/CaptureOverlay.vue'));
 const CapturePinWindow = defineAsyncComponent(() => import('./components/image/CapturePinWindow.vue'));
 
-const minSplitOptions = [
-  { label: '1M', value: '1M' },
-  { label: '4M', value: '4M' },
-  { label: '8M', value: '8M' },
-  { label: '16M', value: '16M' }
-];
-
-const url = ref('');
-const downloadDir = ref('');
-const fileName = ref('');
-const connections = ref(16);
-const split = ref(16);
-const minSplitSize = ref('1M');
-const tasks = ref<DownloadTask[]>([]);
-const submitting = ref(false);
-const choosingDir = ref(false);
-const notice = ref('');
 const { collapsed: sidebarCollapsed, toggle: toggleSidebar } = useSidebarState();
 const { lastToolId, remember: rememberLastTool } = useLastTool();
 const { theme, toggle: toggleTheme } = useTheme();
@@ -103,6 +75,7 @@ const appActivation = createAppActivationCoordinator({
   },
   navigate: (toolId) => selectTool(toolId)
 });
+const activateVideoDownload = createBuiltinDownloadActivator(appActivation.accept);
 const tools = computed<Tool[]>(() =>
   [...builtinTools, ...pluginStore.navigationTools.value]
 );
@@ -122,7 +95,6 @@ function onPaletteOpen(v: boolean) {
 function onPaletteQuery(v: string) {
   paletteQuery.value = v;
 }
-const aria2Handoff = useAria2Handoff();
 const { state: updaterState, check: updaterCheck, install: updaterInstall, relaunch: updaterRelaunch, dismiss: updaterDismiss } = useUpdater();
 const { autoCheck: updaterAutoCheck, setAutoCheck: updaterSetAutoCheck, skipVersion: updaterSkipVersion, shouldSkip: updaterShouldSkip } = useUpdaterPrefs();
 const settingsOpen = ref(false);
@@ -136,7 +108,6 @@ const initialToolId = (() => {
 })();
 const selectedToolId = ref<string | null>(initialToolId);
 
-let unlistenProgress: Promise<UnlistenFn> | undefined;
 let unlistenCaptureFail: Promise<UnlistenFn> | undefined;
 let unlistenRecordingCompleted: Promise<UnlistenFn> | undefined;
 
@@ -151,36 +122,6 @@ onMounted(() => {
     if (!selectedToolId.value && lastToolId.value?.startsWith('plugin:')) {
       selectTool(lastToolId.value);
     }
-  });
-
-  invoke<string>('get_default_download_dir')
-    .then((dir) => {
-      downloadDir.value = dir;
-    })
-    .catch(() => {
-      downloadDir.value = '';
-    });
-
-  invoke<DownloadTask[]>('list_download_tasks')
-    .then((records) => {
-      tasks.value = records;
-    })
-    .catch((error) => {
-      notice.value = String(error);
-    });
-
-  unlistenProgress = listen<DownloadEventPayload>('download-progress', (event) => {
-    const payload = event.payload;
-    tasks.value = tasks.value.map((task) =>
-      task.id === payload.id
-        ? {
-            ...task,
-            ...payload,
-            progress:
-              payload.progress > 0 || payload.status === 'completed' ? payload.progress : task.progress
-          }
-        : task
-    );
   });
 
   unlistenCaptureFail = listen<string>('capture-failed', (event) => {
@@ -218,7 +159,6 @@ function handleHotkey(event: KeyboardEvent) {
 }
 
 onUnmounted(() => {
-  unlistenProgress?.then((dispose) => dispose()).catch(() => undefined);
   unlistenCaptureFail?.then((dispose) => dispose()).catch(() => undefined);
   unlistenRecordingCompleted?.then((dispose) => dispose()).catch(() => undefined);
   window.removeEventListener('keydown', handleHotkey);
@@ -232,29 +172,11 @@ const selectedPlugin = computed(() => {
   return appId ? pluginStore.apps.value.find((app) => app.appId === appId) ?? null : null;
 });
 
-const taskSearch = ref('');
-const filteredTasks = computed(() => {
-  const q = taskSearch.value.trim().toLocaleLowerCase();
-  if (!q) return tasks.value;
-  return tasks.value.filter((t) => {
-    const haystack = [t.url, t.fileName ?? '', t.message ?? '', t.localPath ?? '']
-      .join('\n')
-      .toLocaleLowerCase();
-    return haystack.includes(q);
-  });
-});
-const hasCompleted = computed(() => tasks.value.some((t) => t.status === 'completed'));
-
 function selectTool(id: string) {
   const tool = tools.value.find((t) => t.id === id);
   if (!tool || tool.status !== 'ready') return;
   selectedToolId.value = id;
   rememberLastTool(id);
-  if (id === 'aria2') aria2Handoff.drainInto(url);
-}
-
-function handleDouyinNavigate(target: string) {
-  selectTool(target);
 }
 
 function goHome() {
@@ -283,167 +205,6 @@ async function runUpdateCheck(trigger: 'auto' | 'manual') {
 }
 function handleSettingsCheck() {
   runUpdateCheck('manual');
-}
-
-async function chooseDownloadDir() {
-  notice.value = '';
-  choosingDir.value = true;
-  try {
-    const selected = await open({
-      directory: true,
-      multiple: false,
-      defaultPath: downloadDir.value || undefined
-    });
-
-    if (typeof selected === 'string') {
-      downloadDir.value = selected;
-    }
-  } catch (error) {
-    notice.value = String(error);
-  } finally {
-    choosingDir.value = false;
-  }
-}
-
-function parseDownloadUrls(value: string) {
-  return value
-    .split(/[\n,]+/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
-async function startDownload() {
-  notice.value = '';
-
-  const urls = parseDownloadUrls(url.value);
-  const downloadPath = downloadDir.value.trim();
-  const sharedRequest = {
-    downloadDir: downloadPath,
-    connections: connections.value,
-    split: split.value,
-    minSplitSize: minSplitSize.value
-  };
-
-  if (urls.length === 0 || !downloadPath) {
-    notice.value = '请填写下载链接和保存目录。';
-    return;
-  }
-
-  submitting.value = true;
-  try {
-    const createdTasks: DownloadTask[] = [];
-    const singleFileName = urls.length === 1 ? fileName.value.trim() || undefined : undefined;
-
-    for (const itemUrl of urls) {
-      const request: StartDownloadRequest = {
-        ...sharedRequest,
-        url: itemUrl,
-        fileName: singleFileName
-      };
-      const response = await invoke<{ id: string }>('start_download', { request });
-      createdTasks.push({
-        id: response.id,
-        url: request.url,
-        downloadDir: request.downloadDir,
-        fileName: request.fileName,
-        status: 'queued',
-        progress: 0,
-        speed: null,
-        eta: null,
-        message: '任务已提交给 aria2',
-        createdAt: new Date().toLocaleTimeString(),
-        startedAt: null,
-        finishedAt: null,
-        localPath: null
-      });
-    }
-
-    tasks.value = [...createdTasks.reverse(), ...tasks.value];
-    url.value = '';
-    fileName.value = '';
-  } catch (error) {
-    notice.value = String(error);
-  } finally {
-    submitting.value = false;
-  }
-}
-
-async function cancelTask(id: string) {
-  notice.value = '';
-  try {
-    await invoke('cancel_download', { id });
-  } catch (error) {
-    notice.value = String(error);
-  }
-}
-
-async function openTaskFolder(id: string) {
-  notice.value = '';
-  try {
-    await invoke('open_download_folder', { id });
-  } catch (error) {
-    notice.value = String(error);
-  }
-}
-
-async function retryTask(task: DownloadTask) {
-  notice.value = '';
-  submitting.value = true;
-  try {
-    const request: StartDownloadRequest = {
-      url: task.url,
-      downloadDir: task.downloadDir,
-      fileName: task.fileName ?? undefined,
-      connections: connections.value,
-      split: split.value,
-      minSplitSize: minSplitSize.value
-    };
-    const response = await invoke<{ id: string }>('start_download', { request });
-    tasks.value = [
-      {
-        id: response.id,
-        url: request.url,
-        downloadDir: request.downloadDir,
-        fileName: request.fileName,
-        status: 'queued',
-        progress: 0,
-        speed: null,
-        eta: null,
-        message: '任务已重新提交给 aria2',
-        createdAt: new Date().toLocaleTimeString(),
-        startedAt: null,
-        finishedAt: null,
-        localPath: null
-      },
-      ...tasks.value
-    ];
-  } catch (error) {
-    notice.value = String(error);
-  } finally {
-    submitting.value = false;
-  }
-}
-
-async function deleteTask(id: string) {
-  notice.value = '';
-  try {
-    await invoke('delete_download_task', { id });
-    tasks.value = tasks.value.filter((t) => t.id !== id);
-  } catch (error) {
-    notice.value = String(error);
-  }
-}
-
-async function clearCompleted() {
-  notice.value = '';
-  try {
-    const count = await invoke<number>('clear_completed_downloads');
-    if (count > 0) {
-      tasks.value = tasks.value.filter((t) => t.status !== 'completed');
-    }
-  } catch (error) {
-    notice.value = String(error);
-  }
 }
 </script>
 
@@ -490,113 +251,12 @@ async function clearCompleted() {
           @open="selectTool"
         />
 
-        <template v-else-if="selectedTool.id === 'aria2'">
-          <div class="page">
-            <header class="page-header">
-              <h2>多线程下载工作台</h2>
-              <p>本机 aria2c 引擎，支持断点续传、分片、多连接和实时进度回传。</p>
-            </header>
-
-            <div class="aria2-grid">
-              <Panel title="新建下载">
-                <template #right><span>支持批量</span></template>
-                <form @submit.prevent="startDownload" class="form">
-                  <label class="field">
-                    <span class="lbl">资源链接（每行一个，或用逗号分隔）</span>
-                    <n-input
-                      v-model:value="url"
-                      type="textarea"
-                      placeholder="https://example.com/file-a.zip&#10;https://example.com/file-b.zip"
-                      :autosize="{ minRows: 5, maxRows: 10 }"
-                    />
-                  </label>
-
-                  <label class="field">
-                    <span class="lbl">保存目录</span>
-                    <n-input-group>
-                      <n-input v-model:value="downloadDir" placeholder="/Users/you/Downloads" />
-                      <n-button secondary :loading="choosingDir" @click="chooseDownloadDir">选择文件夹</n-button>
-                    </n-input-group>
-                  </label>
-
-                  <label class="field">
-                    <span class="lbl">文件名（仅单个链接时生效）</span>
-                    <n-input v-model:value="fileName" placeholder="archive.zip" />
-                  </label>
-
-                  <div class="row3">
-                    <label class="field">
-                      <span class="lbl">单服务器连接数</span>
-                      <n-input-number v-model:value="connections" :min="1" :max="16" style="width: 100%" />
-                    </label>
-                    <label class="field">
-                      <span class="lbl">分片数</span>
-                      <n-input-number v-model:value="split" :min="1" :max="64" style="width: 100%" />
-                    </label>
-                    <label class="field">
-                      <span class="lbl">最小分片大小</span>
-                      <n-select v-model:value="minSplitSize" :options="minSplitOptions" />
-                    </label>
-                  </div>
-
-                  <n-alert v-if="notice" type="error" :bordered="false" class="notice-alert">
-                    {{ notice }}
-                  </n-alert>
-
-                  <n-button type="primary" block attr-type="submit" :loading="submitting">
-                    {{ submitting ? '正在创建...' : '开始下载' }}
-                  </n-button>
-                </form>
-              </Panel>
-
-              <Panel title="任务队列">
-                <template #right>
-                  <div class="queue-header-right">
-                    <n-button
-                      v-if="hasCompleted"
-                      size="tiny"
-                      secondary
-                      @click="clearCompleted"
-                    >
-                      清理已完成
-                    </n-button>
-                    <span class="mono">实时</span>
-                  </div>
-                </template>
-
-                <div v-if="tasks.length > 0" class="queue-toolbar">
-                  <n-input
-                    v-model:value="taskSearch"
-                    placeholder="搜索 URL / 文件名 / 路径 / 备注"
-                    clearable
-                    size="small"
-                  />
-                </div>
-
-                <div v-if="tasks.length === 0" class="empty">还没有下载任务</div>
-                <div v-else-if="filteredTasks.length === 0" class="empty">没有匹配的任务</div>
-                <div v-else class="tasks">
-                  <TaskRow
-                    v-for="task in filteredTasks"
-                    :key="task.id"
-                    :task="task"
-                    @cancel="cancelTask"
-                    @open-folder="openTaskFolder"
-                    @retry="retryTask"
-                    @delete="deleteTask"
-                  />
-                </div>
-              </Panel>
-            </div>
-          </div>
-        </template>
-
         <template v-else-if="selectedTool.id === 'template'">
           <TemplateTool />
         </template>
 
         <template v-else-if="selectedTool.id === 'video-link'">
-          <DouyinTool @request-navigate="handleDouyinNavigate" />
+          <DouyinTool :activate-download="activateVideoDownload" />
         </template>
 
         <template v-else-if="selectedTool.id === 'image'">
@@ -651,50 +311,3 @@ async function clearCompleted() {
     </n-message-provider>
   </n-config-provider>
 </template>
-
-<style scoped>
-.page { display: grid; gap: 16px; }
-.page-header { display: grid; gap: 4px; }
-.page-header h2 {
-  margin: 0;
-  font-size: var(--fs-xl);
-  font-weight: 600;
-  letter-spacing: -0.012em;
-}
-.page-header p {
-  margin: 0;
-  color: var(--text-muted);
-  font-size: var(--fs-xs);
-}
-
-.aria2-grid {
-  display: grid;
-  grid-template-columns: 1.1fr 1fr;
-  gap: 16px;
-}
-@media (max-width: 1100px) {
-  .aria2-grid { grid-template-columns: 1fr; }
-}
-
-.form { display: grid; gap: 12px; }
-.field { display: grid; gap: 5px; }
-.field .lbl {
-  font-size: var(--fs-xxs);
-  color: var(--text-muted);
-}
-.row3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
-
-.notice-alert { margin-bottom: 4px; }
-
-.queue-header-right { display: flex; align-items: center; gap: 10px; }
-.queue-toolbar { margin-bottom: 8px; }
-.tasks { display: grid; gap: 6px; }
-.empty {
-  padding: 60px 20px;
-  text-align: center;
-  color: var(--text-muted);
-  border: 1px dashed var(--line-strong);
-  border-radius: var(--radius-md);
-  font-size: var(--fs-sm);
-}
-</style>

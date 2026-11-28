@@ -16,18 +16,19 @@ attool 是一个个人使用的桌面工具集合，运行在 Tauri 2 上。前�
 - 官方 Catalog 由 AT Tool 主仓维护并签名，平台可按当前 OS/架构远程安装和主动升级多个官方应用；新版本先进入 `pending`，健康检查与原子切换通过后成为 `current`，失败时保留或恢复上一可用版本。
 - HTTP 已完全外置为 `com.attson.http`：`athttp` 独立版和官方 Catalog 插件复用同一 UI、请求核心与 `${app_data_dir}/http/http.sqlite3`，由单一 Native/Data Service 提供请求、长连接和数据 API。平台只保留 Host API 2.x 桥接和 service supervisor，不再包含内置 HTTP UI、Store、Tauri commands 或 SQLite owner。
 - 剪贴板已完全外置为 `com.attson.clipboard`：`atclipboard` 独立版和官方 Catalog 插件复用同一 UI 与 `${app_data_dir}/clipboard`，由单一 background Native Service 持有历史、监听和快捷键。平台只保留 Host API 2.x、service supervisor、签名辅助窗口及通用系统剪贴板写入，不再包含内置剪贴板 UI、commands、SQLite owner 或固定历史/预览窗口。
+- Aria2 已完全外置为 `com.attson.aria2`：`ataria2` 独立版和官方 Catalog 插件复用同一 UI、`${app_data_dir}/aria2/aria2-tasks.sqlite3` 与固定 Aria2 runtime。平台只保留 Host API 2.x、service supervisor、包校验、动态入口、视频 activation 和旧根库 capability marker，不再包含内置下载 UI、commands、SQLite owner、事件或 aria2c runtime。
 - 视频链接抽取的 `com.attson.video` 独立版与签名插件复用同一 UI、`atvideo-service` 和独立 YouTube runtime，并可通过 Host activation 把链接交给动态 Aria2；生产 Publisher、五目标 Release、生产 Catalog、安装升级回滚与停启卸载重装生命周期均已验证，紧凑布局版 `0.1.0-alpha.2` 已进入 Catalog sequence 28。宿主内置视频入口及共享 runtime 在退场 PR 合入前继续保留。
 - 插件平台支持页面关闭后继续连接的 `background` Native Service，以及由 manifest 声明、宿主隔离承载的底部面板和居中对话框辅助窗口。后台连接首次失败或意外断开不会阻止平台启动，而会在应用仍启用时按有界退避自动恢复；停用、卸载和显式断开会停止恢复。应用入口和管理页会显示 `recovering` 等连接状态、稳定错误码与关联 ID。
 
-下面详列两个“重后端”内置工具与 HTTP、剪贴板独立应用，其余见汇总表。
+下面详列主要内置工具与 HTTP、剪贴板、Aria2 独立应用，其余见汇总表。
 
-### Aria2 下载（`id: aria2`）
+### Aria2 下载（独立应用 `com.attson.aria2`）
 
-- 使用正式包内置的 Aria2 1.37.0，支持单服务器多连接、文件分片、批量 URL 提交、实时进度回传；最终用户无需安装 `aria2c`
-- 任务状态：`queued | running | completed | failed | cancelled`
-- 进度通过 Tauri event `download-progress` 流式推送给前端；任务历史存 SQLite
-- Tauri 命令：`start_download` / `cancel_download` / `list_download_tasks` / `open_download_folder` 等
-- 该工具直接内嵌在 `App.vue`，是"表单 + 列表"形态的参考实现
+- 通过官方 Catalog 安装；启用后动态工具 ID 为 `plugin:com.attson.aria2`，停用或卸载后入口消失，平台不提供内置回退或自动安装。
+- `ataria2-service` 独占 `${app_data_dir}/aria2` 下的任务库、进程和取消句柄，提供批量 URL、分片、多连接、实时进度、取消、重试、打开目录、删除和历史清理。
+- 首次接管旧 `${app_data_dir}/aria2-tasks.sqlite3` 前要求宿主写入 `takeover-capability-v1`；宿主只检查旧库是否存在并幂等写 marker，不打开、迁移或改写 SQLite。
+- 内置视频工具通过固定 `com.attson.video → com.attson.aria2` 的 `download.urls` v1 activation 发送 URL；目标未安装、停用或不可用时在原页面显示稳定错误。
+- 历史 `attool.lastTool=aria2` 映射到动态应用 ID；应用不可用时留在首页。
 
 ### 主图模板（`id: template`）
 
@@ -57,7 +58,7 @@ attool 是一个个人使用的桌面工具集合，运行在 Tauri 2 上。前�
 
 | 工具（id） | 能力 | 后端 |
 |---|---|---|
-| 视频链接抽取（`douyin`） | 抖音 / B站 / 小红书 / YouTube 链接与文案解析；YouTube 使用内置 yt-dlp + EJS + QuickJS | `douyin/bilibili/xhs/youtube.rs` |
+| 视频链接抽取（`video-link`） | 抖音 / B站 / 小红书 / YouTube 链接与文案解析；YouTube 使用内置 yt-dlp + EJS + QuickJS | `douyin/bilibili/xhs/youtube.rs` |
 | 图片（`image`） | 统一捕获工作台（截图 / 录屏，截图选区支持标注与快捷 OCR）、压缩、格式转换、EXIF、OCR；OCR 内置 Tesseract 与中英日语言模型 | `imaging/`（含 xcap 截图）+ `recording.rs` |
 | 网络（`network`） | URL 分解、Ping、端口、DNS | `network/` |
 
@@ -91,7 +92,6 @@ attool 是一个个人使用的桌面工具集合，运行在 Tauri 2 上。前�
 正式包随主程序内置并按版本释放以下应用运行时，最终用户无需另行安装：
 
 - Tesseract 5.5.3，以及 `eng` / `chi_sim` / `chi_tra` / `jpn` 语言模型
-- Aria2 1.37.0
 - `psd-bridge` sidecar 自带的 Python、`psd-tools`、yt-dlp 2026.10.21 与 yt-dlp-ejs 0.8.0
 - QuickJS-ng 0.17.0，用于 yt-dlp 的 YouTube JavaScript challenge
 - Linux Wayland 录屏所需的 GStreamer 插件与 libvpx；GStreamer 1.0 ABI 由 Deb 依赖保证

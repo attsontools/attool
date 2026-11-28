@@ -15,10 +15,6 @@ pub fn tesseract() -> Result<MaterializedRuntime, String> {
     materialize(&cache_root(), &TESSERACT)
 }
 
-pub fn aria2() -> Result<MaterializedRuntime, String> {
-    materialize(&cache_root(), &ARIA2)
-}
-
 pub fn quickjs() -> Result<MaterializedRuntime, String> {
     materialize(&cache_root(), &QUICKJS)
 }

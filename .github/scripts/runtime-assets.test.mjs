@@ -12,8 +12,7 @@ describe('bundled runtime manifest', () => {
     expect(manifest.tesseract.vcpkgCommit).toMatch(/^[0-9a-f]{40}$/);
     expect(manifest.tessdata.commit).toMatch(/^[0-9a-f]{40}$/);
     expect(manifest.tessdata.languages).toEqual(['eng', 'chi_sim', 'chi_tra', 'jpn']);
-    expect(manifest.aria2.version).toBe('1.37.0');
-    expect(manifest.aria2.commit).toMatch(/^[0-9a-f]{40}$/);
+    expect(manifest).not.toHaveProperty('aria2');
     expect(manifest.ytDlp.version).toMatch(/^\d{4}\.\d{2}\.\d{2}$/);
     expect(manifest.ytDlp.ejs.sha256).toMatch(/^[0-9a-f]{64}$/);
     expect(manifest.ytDlp.wheelSha256).toMatch(/^[0-9a-f]{64}$/);
@@ -38,7 +37,9 @@ describe('bundled runtime manifest', () => {
 
     expect(rustBuild).toContain('bundled_tools.rs');
     expect(rustBuild).toContain('EmbeddedFile');
+    expect(rustBuild).not.toContain('"ARIA2"');
     expect(runtimeModule).toContain('include!(concat!(env!("OUT_DIR"), "/bundled_tools.rs"))');
+    expect(runtimeModule).not.toContain('pub fn aria2');
   });
 
   it('does not tell users to install bundled engines', () => {
@@ -75,9 +76,8 @@ describe('bundled runtime manifest', () => {
     expect(vcpkg.dependencies).toContain('tesseract');
     expect(vcpkg.dependencies).not.toContain('aria2');
     expect(workflow).toContain(`vcpkgGitCommitId: ${manifest.tesseract.vcpkgCommit}`);
-    expect(workflow).toContain('build-aria2.mjs');
-    expect(manifest.aria2.sourceSha256).toMatch(/^[0-9a-f]{64}$/);
-    expect(manifest.aria2.windowsAssetSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(workflow).not.toContain('build-aria2.mjs');
+    expect(workflow).not.toContain('ATTOOL_ARIA2_PATH');
     expect(workflow.match(/vcpkg: /g)).toHaveLength(5);
   });
 
@@ -87,10 +87,10 @@ describe('bundled runtime manifest', () => {
     expect(workflow).toContain('id: native-runtime-cache');
     expect(workflow).toContain('uses: actions/cache/restore@v4');
     expect(workflow).toContain('uses: actions/cache/save@v4');
-    expect(workflow).toContain("hashFiles('src-tauri/vcpkg.json', 'src-tauri/runtime-manifest.json', '.github/scripts/build-aria2.mjs')");
+    expect(workflow).toContain("hashFiles('src-tauri/vcpkg.json', 'src-tauri/runtime-manifest.json')");
     expect(workflow).toContain("steps.native-runtime-cache.outputs.cache-hit != 'true'");
     expect(workflow).toContain('${{ runner.temp }}/attool-vcpkg');
-    expect(workflow).toContain('${{ runner.temp }}/attool-native');
+    expect(workflow).not.toContain('${{ runner.temp }}/attool-native');
   });
 
   it('verifies the pinned yt-dlp source before installing the shared runtime', () => {
@@ -109,14 +109,17 @@ describe('bundled runtime manifest', () => {
     expect(smokeRuntime).toContain('expected !== undefined && !output.includes(expected)');
   });
 
-  it('ships third-party notices, corresponding aria2 source, and size budgets', () => {
+  it('ships third-party notices and size budgets without an aria2 source asset', () => {
     const workflow = readFileSync('.github/workflows/build.yml', 'utf8');
     const prepareRuntime = readFileSync('.github/scripts/prepare-runtime.mjs', 'utf8');
     const sizeCheck = readFileSync('.github/scripts/check-package-size.mjs', 'utf8');
+    const notices = readFileSync('src-tauri/THIRD_PARTY_NOTICES.md', 'utf8');
 
     expect(prepareRuntime).toContain('THIRD_PARTY_NOTICES.md');
-    expect(workflow).toContain('aria2-1.37.0-source.tar.gz');
-    expect(workflow).toContain('aria2.sourceSha256');
+    expect(prepareRuntime).not.toContain("resolve(output, 'aria2");
+    expect(workflow).not.toContain('aria2-1.37.0-source.tar.gz');
+    expect(workflow).not.toContain('aria2.sourceSha256');
+    expect(notices).not.toContain('| aria2 |');
     expect(sizeCheck).toContain("macos: 55");
     expect(sizeCheck).toContain("windows: 55");
     expect(sizeCheck).toContain("linux: 75");

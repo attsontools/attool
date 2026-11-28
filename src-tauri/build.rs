@@ -61,7 +61,6 @@ fn generate_bundled_tools(runtime_root: &Path) {
     let mut generated = String::new();
     let mut runtimes = vec![
         ("TESSERACT", "tesseract", executable_path("tesseract")),
-        ("ARIA2", "aria2", executable_path("aria2c")),
         ("QUICKJS", "quickjs", executable_path("qjs")),
         ("NOTICES", "notices", "THIRD_PARTY_NOTICES.md".to_string()),
     ];

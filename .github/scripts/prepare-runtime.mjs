@@ -15,27 +15,19 @@ const manifest = JSON.parse(readFileSync('src-tauri/runtime-manifest.json', 'utf
 const windows = target.includes('windows');
 const output = resolve('src-tauri/binaries/runtime', target);
 const tesseract = resolveProgram('ATTOOL_TESSERACT_PATH', windows ? 'tesseract.exe' : 'tesseract');
-const aria2 = resolveProgram('ATTOOL_ARIA2_PATH', windows ? 'aria2c.exe' : 'aria2c');
 
 assertVersion(tesseract, manifest.tesseract.version, 'Tesseract');
-assertVersion(aria2, manifest.aria2.version, 'aria2');
 
 rmSync(output, { recursive: true, force: true });
 const tesseractBin = resolve(output, 'tesseract/bin', windows ? 'tesseract.exe' : 'tesseract');
-const aria2Bin = resolve(output, 'aria2/bin', windows ? 'aria2c.exe' : 'aria2c');
 mkdirSync(resolve(output, 'tesseract/bin'), { recursive: true });
 mkdirSync(resolve(output, 'tesseract/tessdata'), { recursive: true });
-mkdirSync(resolve(output, 'aria2/bin'), { recursive: true });
 mkdirSync(resolve(output, 'quickjs/bin'), { recursive: true });
 copyFileSync(tesseract, tesseractBin);
-copyFileSync(aria2, aria2Bin);
 stageNativeDependencies(tesseract, resolve(output, 'tesseract/bin'));
-stageNativeDependencies(aria2, resolve(output, 'aria2/bin'));
 writeFileSync(resolve(output, 'tesseract/VERSION'), `${manifest.tesseract.version}\n`);
-writeFileSync(resolve(output, 'aria2/VERSION'), `${manifest.aria2.version}\n`);
 if (!windows) {
   chmodSync(tesseractBin, 0o755);
-  chmodSync(aria2Bin, 0o755);
 }
 
 const quickJsAsset = manifest.quickJs.assets[target];
@@ -84,7 +76,7 @@ stageLicenses(output);
 
 writeFileSync(
   resolve(output, 'manifest.json'),
-  `${JSON.stringify({ target, tesseract: manifest.tesseract.version, aria2: manifest.aria2.version, quickJs: manifest.quickJs.version, tessdata: manifest.tessdata, gstreamer: target.includes('linux') ? manifest.gstreamer : undefined }, null, 2)}\n`,
+  `${JSON.stringify({ target, tesseract: manifest.tesseract.version, quickJs: manifest.quickJs.version, tessdata: manifest.tessdata, gstreamer: target.includes('linux') ? manifest.gstreamer : undefined }, null, 2)}\n`,
 );
 console.log(`Bundled runtime ready: ${output}`);
 
@@ -252,10 +244,6 @@ function stageLicenses(runtimeOutput) {
   copyFileSync('src-tauri/licenses/yt-dlp-UNLICENSE.txt', resolve(licenses, 'yt-dlp-UNLICENSE.txt'));
   copyFileSync('src-tauri/licenses/QuickJS-ng-MIT.txt', resolve(licenses, 'QuickJS-ng-MIT.txt'));
   copyFileSync('src-tauri/licenses/libvpx-BSD-3-Clause.txt', resolve(licenses, 'libvpx-BSD-3-Clause.txt'));
-  const ariaLicenseDirectory = resolve(aria2, '..');
-  copyFileSync(resolve(ariaLicenseDirectory, 'aria2-COPYING'), resolve(licenses, 'aria2-GPL-2.0-or-later.txt'));
-  const ariaOpenSslLicense = resolve(ariaLicenseDirectory, 'aria2-LICENSE.OpenSSL');
-  if (existsSync(ariaOpenSslLicense)) copyFileSync(ariaOpenSslLicense, resolve(licenses, 'aria2-OpenSSL-license.txt'));
 
   const prefixValue = process.env.ATTOOL_NATIVE_RUNTIME_PREFIX;
   if (prefixValue) {

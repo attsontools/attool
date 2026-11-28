@@ -9,7 +9,8 @@ const LEGACY_ID_MAP: Record<string, string> = {
   codec: 'plugin:com.attson.codec',
   json: 'plugin:com.attson.json',
   time: 'plugin:com.attson.time',
-  http: 'plugin:com.attson.http'
+  http: 'plugin:com.attson.http',
+  aria2: 'plugin:com.attson.aria2'
 };
 
 export function useLastTool(storage: KVStorage = localStorage) {

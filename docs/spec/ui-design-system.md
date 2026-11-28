@@ -85,9 +85,9 @@
 ┌──────────┬────────────────────────────────────────────┐
 │  brand   │                                            │
 │  ⌘K      │                                            │
-│ ● Aria2  │   <slot />                                 │
+│ ● 应用管理 │   <slot />                                 │
 │ ○ 模板   │                                            │
-│ ○ 剪贴板  │                                            │
+│ ○ Aria2* │                                            │
 │ ○ ...    │                                            │
 │ v0.1 ☀ ‹ │                                            │
 └──────────┴────────────────────────────────────────────┘
@@ -108,8 +108,9 @@
 | 组件 | 用途 |
 |---|---|
 | `Panel` | 卡片容器（替代多数 NCard）。带 title slot + right slot + body slot；body 可加 `flush` 去 padding |
-| `TaskRow` | Aria2 任务行：标题 + url + 速度/ETA/% + 3px 进度条 + 取消/打开按钮 |
 | `Kbd` | 键盘快捷键标签（如 `⌘K`） |
+
+`Aria2*` 代表安装并启用后由 registry 动态生成的应用入口，不是宿主内置工具。
 
 ## Naive UI 主题策略
 
@@ -123,7 +124,7 @@
 - `Modal`（color）
 - `Slider`（fillColor / railColor / handleColor）
 
-少数复杂组件**不使用 Naive UI**（自写更可控）：sidebar / dashboard / panel / task-row / kbd / brand-mark / tool-icon / layer 系列。
+少数复杂组件**不使用 Naive UI**（自写更可控）：sidebar / dashboard / panel / kbd / brand-mark / tool-icon / layer 系列。
 
 ## 多工具通用 UI 模式
 

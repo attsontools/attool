@@ -5,8 +5,8 @@
 - 项目名称：AT Tool（仓库 `attool`）。
 - 项目定位：基于 Tauri 2 + Vue 3 的个人桌面工具箱，提供内置工具与可按需安装的隔离应用；HTTP 调试由官方独立应用提供。
 - 主要调用方：安装在 macOS、Windows、Linux 上的单个终端用户；前端通过 Tauri command 调用同进程 Rust 后端。
-- 核心业务对象：工具注册项、插件 registry/Catalog、下载任务、剪贴板历史、截图/录屏产物、主图模板、AI 会话、更新任务。
-- 关键状态流转：下载任务 `queued → running → completed|failed|cancelled`；更新器 `idle → checking → up-to-date|available|error → downloading → verifying → ready → applying`；插件安装 `download → verify → staging → health-check → activate → complete|rolled-back|error`。
+- 核心业务对象：工具注册项、插件 registry/Catalog、跨应用 activation、剪贴板历史、截图/录屏产物、主图模板、AI 会话、更新任务。
+- 关键状态流转：更新器 `idle → checking → up-to-date|available|error → downloading → verifying → ready → applying`；插件安装 `download → verify → staging → health-check → activate → complete|rolled-back|error`；跨应用 activation `accept → commit|discard → target delivery`。
 
 ## 关键约定
 
@@ -21,6 +21,7 @@
 - 不新增依赖，除非需求明确且现有能力不能完成；依赖或 native runtime 变化必须同时审查锁文件、打包体积和五平台构建影响。
 - 不把已弃用的“电商图片处理”前端功能加回；主图模板是该场景的现行入口。
 - 不把 HTTP 内置 UI、Store、旧 Tauri commands 或宿主 SQLite owner 加回；HTTP 业务属于 `attsontools/athttp`，平台只保留 Host API 2.x 与 service supervisor。
+- 不把 Aria2 内置 UI、下载 commands、宿主 SQLite owner、下载事件或 bundled runtime 加回；平台只保留动态入口、Host activation、Host API 2.x、service supervisor、包校验与旧库 capability marker。
 
 ## 高风险路径
 
@@ -63,7 +64,7 @@ AT Tool 前端、Rust 后端、sidecar、内置 runtime 和 apply 脚本随同�
 
 ### 架构边界
 
-- `App.vue` 只承担工具注册、路由壳和现存 Aria2 UI；新业务进入独立组件/composable/Rust module。
+- `App.vue` 只承担工具注册、路由壳和平台装配；新业务进入独立组件/composable/Rust module。
 - 内置前端 Store 与 Rust session/storage 各自拥有明确状态；独立应用状态不得复制回宿主。HTTP 数据只能由 Native/Data Service 持有。
 - OS 分支必须用 `cfg`/目标依赖隔离，并保留 macOS、Windows、Linux 的编译路径；Linux 同时考虑 X11 与 Wayland。
 

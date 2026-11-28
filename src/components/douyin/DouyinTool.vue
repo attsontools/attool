@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
-import { NButton, NInput } from 'naive-ui';
+import { NAlert, NButton, NInput } from 'naive-ui';
 import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { invoke } from '@tauri-apps/api/core';
 import Panel from '../ui/Panel.vue';
 import { extractLinks, platformName, type VideoPlatform } from '../../utils/platformDetect';
-import { useAria2Handoff } from '../../composables/useAria2Handoff';
+import type { BuiltinDownloadActivationResult } from '../plugins/builtinDownloadActivation';
 import type { DouyinVideoInfo } from '../../types/douyin';
 
 interface SubtitleTrack {
@@ -41,7 +41,9 @@ interface Entry {
   video: VideoState;
 }
 
-const emit = defineEmits<{ (e: 'requestNavigate', tool: string): void }>();
+const props = defineProps<{
+  activateDownload: (urls: string[]) => BuiltinDownloadActivationResult;
+}>();
 
 const raw = ref('');
 const entries = ref<Entry[]>([]);
@@ -49,7 +51,7 @@ const copyState = ref<Record<string, 'idle' | 'ok' | 'fail'>>({});
 const videoCopyState = ref<Record<string, 'idle' | 'ok' | 'fail'>>({});
 const allCopyState = ref<'idle' | 'ok' | 'fail'>('idle');
 const youtubeProxy = ref('');
-const handoff = useAria2Handoff();
+const downloadNotice = ref('');
 
 let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 let resolveRun = 0;
@@ -319,9 +321,13 @@ async function openLink(entry: Entry) {
   }
 }
 
+function downloadUrls(urls: string[]) {
+  const result = props.activateDownload(urls);
+  downloadNotice.value = result.ok ? '' : `${result.code}: ${result.message}`;
+}
+
 function downloadUrl(url: string) {
-  handoff.push(url);
-  emit('requestNavigate', 'aria2');
+  downloadUrls([url]);
 }
 
 function downloadVideo(entry: Entry) {
@@ -368,6 +374,10 @@ const hasYoutubeEntry = computed(() => entries.value.some((e) => e.platform === 
         识别抖音 / 小红书 / B 站 / YouTube 分享链接，抓取视频直链、封面、字幕，一键送入 Aria2 下载。
       </p>
     </header>
+
+    <n-alert v-if="downloadNotice" type="error" :bordered="false">
+      {{ downloadNotice }}
+    </n-alert>
 
     <Panel title="分享文案">
       <div class="form">
@@ -474,7 +484,7 @@ const hasYoutubeEntry = computed(() => entries.value.some((e) => e.platform === 
                   <n-button
                     size="tiny"
                     secondary
-                    @click="entry.video.info?.imageUrls?.forEach((u) => downloadUrl(u))"
+                    @click="downloadUrls(entry.video.info?.imageUrls ?? [])"
                   >
                     下载全部
                   </n-button>
